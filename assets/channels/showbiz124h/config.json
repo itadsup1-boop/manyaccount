@@ -1,0 +1,14 @@
+{
+  "frame_intro_name": "SHOWBIZ.png",
+  "text_y1": 0.7,
+  "text_y2": 0.8,
+  "text_w": 0.8,
+  "text_size": 50,
+  "text_color": "#ffffff",
+  "text_stroke": 0,
+  "text_font": "RobotoCondensed-Bold.ttf",
+  "frame_content_name": "24h  tham  my fr.png",
+  "text_x": 30,
+  "frame_intro_disabled": false,
+  "frame_content_disabled": true
+}

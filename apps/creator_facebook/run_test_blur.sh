@@ -1,0 +1,1 @@
+ffmpeg -y -i temp/downloads/fb_981742378180310_69cf94d4.mp4 -vf "scale=1080:1920:force_original_aspect_ratio=decrease,pad=1080:1920:(ow-iw)/2:0,delogo=x=683:y=231:w=280:h=85" -c:v libx264 -preset fast -c:a copy ~/Desktop/TEST_DELOGO.mp4

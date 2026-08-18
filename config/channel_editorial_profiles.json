@@ -1,0 +1,92 @@
+{
+  "Adsupnews": {
+    "voice_speed": 1.08,
+    "content_profile": {
+      "channel_name": "Adsupnews - tin nhanh đáng chú ý trong ngày",
+      "topic": "Tin xã hội, đời sống, pháp luật, kinh tế và sự kiện đang được quan tâm; mỗi video chỉ theo một sự việc cụ thể.",
+      "audience": "Người Việt 20-44 tuổi muốn hiểu nhanh chuyện gì xảy ra, ảnh hưởng tới ai và vì sao đáng quan tâm.",
+      "video_length": "22-28 giây; tổng hook và script khoảng 65-85 từ.",
+      "format_style": "0-2 giây nêu sự kiện và hệ quả; 2-6 giây đưa chi tiết bất thường; 6-20 giây giải thích 2-3 dữ kiện; cuối video chốt tác động.",
+      "hook_style": "8-12 từ, có nhân vật hoặc sự việc và động từ mạnh; không mở bằng lời chào, tên kênh, 'mới đây' hoặc 'đang gây xôn xao'.",
+      "source_preference": "Chỉ chọn tin có sự kiện cụ thể, hình ảnh thật, ít nhất hai dữ kiện kiểm chứng được và một tác động rõ.",
+      "comment_strategy": "Hỏi về cách xử lý, hệ quả hoặc trách nhiệm gắn trực tiếp với sự việc; không dùng câu hỏi chung chung.",
+      "avoid": "Không suy đoán, kết tội, câu bi kịch, lặp tiêu đề báo hoặc dùng ảnh minh họa không liên quan.",
+      "custom_instruction": "Cảnh đầu phải đúng nhân vật, địa điểm hoặc vật thể chính. Visual_description phải có tên riêng và hành động tìm được ảnh thật. Giọng đọc dứt khoát. Tin sai chủ đề hoặc không có payoff thì đặt topic_fit=false."
+    }
+  },
+  "taichinh24444h": {
+    "voice_speed": 1.02,
+    "content_profile": {
+      "channel_name": "taichinh24444h - tài chính và kinh tế dễ hiểu",
+      "topic": "Tài chính cá nhân, ngân sách, lãi suất, giá cả, thuế, bất động sản và chính sách kinh tế có tác động thực tế.",
+      "audience": "Người Việt 25-44 tuổi quan tâm thu nhập, chi tiêu, tiết kiệm, công việc và quyết định tài chính.",
+      "video_length": "23-30 giây; tổng hook và script khoảng 70-90 từ.",
+      "format_style": "0-2 giây hiện con số hoặc thay đổi lớn; 2-7 giây giải nghĩa; 7-21 giây nêu nguyên nhân và tác động; cuối video nói điều cần theo dõi.",
+      "hook_style": "Mở bằng con số, thay đổi giá hoặc nghịch lý cụ thể; không lạm dụng cụm 'ảnh hưởng tới ví tiền của bạn'.",
+      "source_preference": "Ưu tiên tin có số liệu, mốc thời gian, chính sách rõ và tác động tới người dân hoặc doanh nghiệp.",
+      "comment_strategy": "Hỏi một lựa chọn hoặc trải nghiệm cụ thể về chi tiêu, tiết kiệm, lãi suất hoặc giá cả.",
+      "avoid": "Không tư vấn mua bán, cam kết lời lỗ, tạo hoảng loạn, bịa số liệu hoặc biến mọi tin thành lời khuyên đầu tư.",
+      "custom_instruction": "Cảnh đầu phải hiện con số lớn hoặc đối tượng chịu tác động; ưu tiên biểu đồ đơn giản, tiền, ngân hàng, công trình hoặc hàng hóa đúng dữ kiện. Đọc chắc và ngắt sau con số. Tin PR hoặc không có tác động tài chính rõ thì đặt topic_fit=false."
+    }
+  },
+  "gbn.car.24h": {
+    "voice_speed": 1.07,
+    "content_profile": {
+      "channel_name": "gbn.car.24h - tin xe và quyết định mua xe",
+      "topic": "Giá xe, mẫu xe mới, trang bị, lỗi, chi phí sử dụng, quy định giao thông và thị trường ô tô.",
+      "audience": "Người 25-44 tuổi đang mua xe, sử dụng xe hoặc muốn cập nhật thông tin ô tô thực dụng.",
+      "video_length": "20-28 giây; tổng hook và script khoảng 65-85 từ.",
+      "format_style": "0-2 giây nêu giá, lỗi hoặc chi tiết gây phân vân; 2-7 giây xác định mẫu xe; phần giữa đưa hai điểm chính; cuối video chốt ai nên cân nhắc.",
+      "hook_style": "Gọi đúng tên xe và giá, lỗi hoặc trang bị nổi bật; không hỏi xe có đáng tiền khi chưa nêu mẫu xe hoặc tầm giá.",
+      "source_preference": "Ưu tiên bài có đúng mẫu xe, ảnh ngoại thất/nội thất, giá hoặc thông số đối chiếu được.",
+      "comment_strategy": "Đặt hai lựa chọn cùng tầm giá hoặc hỏi trang bị cụ thể người mua coi trọng.",
+      "avoid": "Không kết luận chất lượng, lỗi hay giá khi thiếu nguồn; không bôi xấu hãng hoặc đọc danh sách thông số dài.",
+      "custom_instruction": "Visual phải ghi rõ hãng, mẫu, phiên bản, bộ phận xe hoặc tình huống lái; ưu tiên cận cảnh chi tiết đang nói. Giọng đọc gọn, có năng lượng. Tin không giúp quyết định mua hoặc dùng xe thì đặt topic_fit=false."
+    }
+  },
+  "showbiz124h": {
+    "voice_speed": 1.08,
+    "content_profile": {
+      "channel_name": "showbiz124h - điểm nóng giải trí",
+      "topic": "Phát ngôn, sự kiện, sản phẩm, phản ứng và tranh luận liên quan trực tiếp tới nghệ sĩ hoặc chương trình giải trí.",
+      "audience": "Người 18-39 tuổi muốn biết nhanh nhân vật nào, chuyện gì xảy ra và vì sao cộng đồng tranh luận.",
+      "video_length": "20-27 giây; tổng hook và script khoảng 60-80 từ.",
+      "format_style": "0-2 giây gọi tên nhân vật và hành động; 2-6 giây nói chi tiết mới; phần giữa bổ sung bối cảnh và hai luồng phản ứng.",
+      "hook_style": "Gọi thẳng tên nghệ sĩ, phát ngôn hoặc hành động cụ thể; không nói cộng đồng xôn xao khi chưa nêu nguyên nhân.",
+      "source_preference": "Ưu tiên phát ngôn gốc, hình ảnh sự kiện, sản phẩm mới hoặc phản ứng công khai; bỏ qua đời tư suy đoán.",
+      "comment_strategy": "Hỏi người xem đánh giá đúng một phát ngôn, hành động hoặc lựa chọn; không kích động công kích.",
+      "avoid": "Không vu khống, gán quan hệ, kết luận động cơ, biến tin đồn thành sự thật hoặc dùng ảnh sai nhân vật.",
+      "custom_instruction": "Visual_description phải có tên nghệ sĩ, sự kiện/chương trình và hành động cụ thể. Giọng đọc sinh động nhưng không mỉa mai. Tin hoa hậu, tốt nghiệp hoặc đời sống chỉ được chọn khi có diễn biến giải trí mới; nếu không đặt topic_fit=false."
+    }
+  },
+  "tintucthammy24h": {
+    "voice_speed": 1.0,
+    "content_profile": {
+      "channel_name": "tintucthammy24h - thẩm mỹ, làm đẹp và cảnh báo sức khỏe",
+      "topic": "Thủ thuật thẩm mỹ, chăm sóc da, biến chứng, quy định cơ sở làm đẹp và sức khỏe liên quan trực tiếp tới làm đẹp.",
+      "audience": "Người 22-44 tuổi đang quan tâm hoặc cân nhắc dịch vụ thẩm mỹ, cần thông tin rủi ro dễ hiểu.",
+      "video_length": "22-30 giây; tổng hook và script khoảng 65-85 từ.",
+      "format_style": "0-2 giây nêu thủ thuật hoặc dấu hiệu rủi ro; 2-7 giây nói sai lầm; phần giữa giải thích hai lưu ý; cuối video nhắc cách kiểm tra an toàn.",
+      "hook_style": "Nói thẳng tên dịch vụ, bộ phận cơ thể hoặc dấu hiệu; không mở bằng 'làm đẹp không sai' hay 'đừng bỏ qua điều này'.",
+      "source_preference": "Chỉ chọn nội dung gắn trực tiếp với thẩm mỹ, da liễu, sức khỏe làm đẹp hoặc cơ sở dịch vụ; bỏ tin hoa hậu, thời trang, tốt nghiệp và đời tư.",
+      "comment_strategy": "Hỏi dịch vụ hoặc rủi ro người xem đang cân nhắc; không mời chẩn đoán qua bình luận.",
+      "avoid": "Không cam kết kết quả, chẩn đoán, nêu phác đồ, dùng hình trước-sau giả hoặc công kích khi chưa có kết luận.",
+      "custom_instruction": "Visual phải đúng thủ thuật, vùng cơ thể, dụng cụ hoặc dấu hiệu; tránh ảnh stock người mẫu. Giọng đọc bình tĩnh và nhấn từ khóa rủi ro. Bài không trực tiếp giúp hiểu về làm đẹp hoặc sức khỏe thẩm mỹ thì bắt buộc topic_fit=false."
+    }
+  },
+  "adsup_sport": {
+    "voice_speed": 1.1,
+    "content_profile": {
+      "channel_name": "adsup_sport - khoảnh khắc và tranh luận thể thao",
+      "topic": "Bóng đá và thể thao: diễn biến trận đấu, pha bóng, tỷ số, cầu thủ, đội tuyển và quyết định gây tranh luận.",
+      "audience": "Fan thể thao 18-44 tuổi thích nhịp nhanh, cảm xúc mạnh và tranh luận dựa trên tình huống thật.",
+      "video_length": "18-25 giây; tổng hook và script khoảng 55-75 từ.",
+      "format_style": "0-2 giây nêu tỷ số hoặc pha quyết định; 2-6 giây tua bối cảnh; phần giữa giải thích chuyển biến; cuối video hỏi đúng pha bóng.",
+      "hook_style": "Gọi tên cầu thủ, đội bóng, phút thi đấu hoặc pha bóng ngay lập tức; không nói fan tranh cãi khi chưa nêu tình huống.",
+      "source_preference": "Ưu tiên hành động rõ, kết quả bất ngờ, màn tỏa sáng hoặc quyết định trọng tài; bỏ lịch thi đấu và tin chuyển nhượng thiếu nguồn.",
+      "comment_strategy": "Hỏi lỗi thuộc về ai, quyết định có chính xác không hoặc người xem chọn cầu thủ/đội nào.",
+      "avoid": "Không bịa tỷ số, phút thi đấu, phát ngôn, kích động người hâm mộ hoặc dùng ảnh sai trận.",
+      "custom_instruction": "Visual_description phải có tên hai đội, cầu thủ và hành động cụ thể; ưu tiên hình đúng trận. Giọng đọc nhanh, có cao trào nhưng không la hét. Thiếu kết quả, tình huống hoặc nhân vật cụ thể thì đặt topic_fit=false."
+    }
+  }
+}

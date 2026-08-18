@@ -1,0 +1,13 @@
+{
+  "frame_intro_name": "FRAME CAR HUB.png",
+  "frame_content_name": "FRAME CAR HUB 1.png",
+  "text_y1": 0.7,
+  "text_y2": 0.8,
+  "text_w": 0.8,
+  "text_size": 50,
+  "text_color": "#ffffff",
+  "text_stroke": 0,
+  "text_font": "RobotoCondensed-Bold.ttf",
+  "text_x": 80,
+  "frame_content_disabled": true
+}

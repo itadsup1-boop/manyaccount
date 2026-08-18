@@ -1,0 +1,77 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.Python
+*.egg-info/
+.eggs/
+
+# Virtual environments
+.venv/
+venv/
+.venv_windows_bak/
+*/venv/
+*/.venv/
+
+# Node / Web
+node_modules/
+dist/
+build/
+.npm/
+
+# IDE & OS
+.idea/
+.vscode/
+.DS_Store
+*.iml
+*.swp
+
+# Secrets & Environment
+.env
+.env.*
+!.env.example
+config/credentials.json
+config/rapid_api.json
+config/local_machine.json
+*.pem
+*.key
+*.pickle
+config/token.pickle
+cookies.txt
+
+# Runtime State, Logs & Databases
+logs/
+shared/logs/
+*.log
+*.jsonl
+*.pid
+server_*.txt
+*.db
+*.sqlite
+*.sqlite3
+*.db-journal
+*.db-wal
+*.db-shm
+
+# Data & Profiles
+data/
+shared/data/
+shared/assets/temp_*/
+assets/temp_*/
+assets/ChromePortable/
+apps/**/temp/
+apps/**/temp_*/
+apps/**/data/
+apps/**/logs/
+apps/creator_facebook/data/fb_cookies/
+apps/telegram_bot/temp_frames/
+
+# Media & Generated Files
+*.mp4
+*.mov
+*.mp3
+*.wav
+*.zip
+*.tar
+*.gz
+temp/

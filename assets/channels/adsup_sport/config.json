@@ -1,0 +1,30 @@
+{
+  "frame_intro_name": "frame-sport.png",
+  "frame_content_name": "frame-sport.png",
+  "text_y1": 0.73,
+  "text_y2": 0.83,
+  "text_w": 0.8,
+  "text_size": 45,
+  "text_color": "#ffffff",
+  "text_stroke": 0,
+  "text_font": "RobotoCondensed-Bold.ttf",
+  "text_x": 50,
+  "frame_content_disabled": true,
+  "voice_speed": 1.1,
+  "content_profile": {
+    "channel_name": "adsup_sport - khoảnh khắc và tranh luận thể thao",
+    "topic": "Bóng đá và thể thao: diễn biến trận đấu, pha bóng, tỷ số, cầu thủ, đội tuyển và quyết định gây tranh luận.",
+    "audience": "Fan thể thao 18-44 tuổi thích nhịp nhanh, cảm xúc mạnh và tranh luận dựa trên tình huống thật.",
+    "content_promise": "Đưa ngay khoảnh khắc quyết định và giải thích vì sao nó thay đổi trận đấu hoặc tạo tranh luận.",
+    "primary_goal": "retention và comment",
+    "tone_style": "Năng lượng, dồn nhịp, giàu động từ; phân biệt rõ dữ kiện và nhận định.",
+    "video_length": "18-25 giây; tổng hook và script khoảng 55-75 từ.",
+    "format_style": "0-2 giây nêu tỷ số hoặc pha quyết định; 2-6 giây tua bối cảnh; 6-17 giây giải thích chuyển biến; cuối video hỏi về đúng pha bóng hoặc quyết định.",
+    "hook_style": "Gọi tên cầu thủ, đội bóng, phút thi đấu hoặc pha bóng ngay lập tức. Không mở bằng 'fan đang tranh cãi' nếu chưa nói tranh cãi về pha nào.",
+    "source_preference": "Ưu tiên khoảnh khắc có hành động rõ, kết quả bất ngờ, màn tỏa sáng hoặc quyết định trọng tài. Bỏ qua lịch thi đấu đơn thuần và tin chuyển nhượng thiếu nguồn.",
+    "comment_strategy": "Hỏi lỗi thuộc về ai, quyết định có chính xác không hoặc người xem chọn cầu thủ/đội nào.",
+    "avoid": "Không bịa tỷ số, phút thi đấu, phát ngôn hoặc kích động người hâm mộ. Không dùng ảnh sai trận, sai mùa giải.",
+    "winning_examples": "Mẫu hook: 'Phút 89, pha xử lý này đổi cả trận đấu'; 'Quyết định này của trọng tài có chính xác?'; 'Một sai lầm khiến đội nhà mất ba điểm'.",
+    "custom_instruction": "Visual_description phải có tên hai đội, cầu thủ và hành động cụ thể; ưu tiên hình đúng trận. Giọng đọc nhanh, có nhấn cao trào nhưng không la hét. Nếu thiếu kết quả, tình huống hoặc nhân vật thể thao cụ thể, đặt topic_fit=false."
+  }
+}

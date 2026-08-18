@@ -1,0 +1,71 @@
+{
+    "gbn.car.24h": {
+        "name": "car 24",
+        "title_frame_path": "FRAME CAR HUB.png",
+        "content_frame_path": "FRAME CAR HUB 1.png",
+        "logo_path": "-- Trống --",
+        "font_path": "Inter_18pt-Bold.ttf",
+        "sheet_type": "tong",
+        "text_y1": "0.702",
+        "text_size": "64",
+        "text_color": "white",
+        "text_x": "210"
+    },
+    "showbiz124h": {
+        "name": "showbiz 24h",
+        "title_frame_path": "SHOWBIZ.png",
+        "content_frame_path": "SHOWBIZ 1.png",
+        "logo_path": "-- Trống --",
+        "font_path": "Inter_18pt-Bold.ttf",
+        "sheet_type": "tong",
+        "text_y1": "0.694",
+        "text_size": "56",
+        "text_color": "white",
+        "text_x": "153"
+    },
+    "Adsupnews": {
+        "name": "Adsup New",
+        "title_frame_path": "frame-adsup.png",
+        "content_frame_path": "frame-adsup.png",
+        "logo_path": "-- Trống --",
+        "font_path": "Inter_18pt-Bold.ttf",
+        "sheet_type": "facebook",
+        "text_y1": "0.65",
+        "text_size": "50",
+        "text_color": "white"
+    },
+    "tintucthammy24h": {
+        "name": "thẩm mỹ 24h",
+        "title_frame_path": "24h  tham  my fr (1).png",
+        "content_frame_path": "24h  tham  my fr 1.png",
+        "logo_path": "-- Trống --",
+        "font_path": "-- Trống --",
+        "sheet_type": "tong",
+        "text_y1": "0.7",
+        "text_size": "50",
+        "text_color": "white"
+    },
+    "taichinh24444h": {
+        "name": "taichinh24444h",
+        "title_frame_path": "FR tai chinh .png",
+        "content_frame_path": "FR tai chinh 1.png",
+        "logo_path": "-- Trống --",
+        "font_path": "Inter_18pt-Bold.ttf",
+        "sheet_type": "tong",
+        "text_y1": "0.75",
+        "text_size": "40",
+        "text_color": "white"
+    },
+    "adsup_sport": {
+        "name": "adsup_sport",
+        "title_frame_path": "frame-sport.png",
+        "content_frame_path": "frame-sport.png",
+        "logo_path": "-- Trống --",
+        "font_path": "-- Trống --",
+        "sheet_type": "tong",
+        "text_y1": "0.734",
+        "text_size": "51",
+        "text_color": "white",
+        "text_x": "180"
+    }
+}
