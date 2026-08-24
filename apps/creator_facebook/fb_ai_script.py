@@ -15,8 +15,16 @@ import os
 import json
 import time
 import re
+import sys
 
-CONFIG_DIR = os.path.join(os.path.dirname(__file__), "config")
+PROJECT_ROOT = os.path.dirname(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+)
+sys.path.insert(0, PROJECT_ROOT)
+from shared.core.experiment_manager import apply_experiment_metadata
+from shared.core.prompt_builder import build_prompt, resolve_prompt_experiment
+
+CONFIG_DIR = os.path.join(PROJECT_ROOT, "config", "prompts")
 PROMPT_FILE = os.path.join(CONFIG_DIR, "prompt_script.txt")
 
 
@@ -28,7 +36,14 @@ def load_prompt() -> str:
     raise FileNotFoundError(f"Không tìm thấy prompt: {PROMPT_FILE}")
 
 
-def analyze_video_with_ai(video_path: str, caption: str, api_key: str) -> dict | None:
+def analyze_video_with_ai(
+    video_path: str,
+    caption: str,
+    api_key: str,
+    repair_instruction: str = "",
+    channel_id: str = "",
+    operator_instruction: str = "",
+) -> dict | None:
     """
     Gửi video + caption cho Gemini AI để phân tích.
     Trả về dict JSON với: hook, script_voice, title_tiktok, scenes...
@@ -68,18 +83,31 @@ def analyze_video_with_ai(video_path: str, caption: str, api_key: str) -> dict |
         print(f"      ✅ Video đã upload xong")
 
         # Bước 2: Gửi prompt + video + caption
-        prompt = load_prompt()
-
         user_message = f"""VIDEO GỐC:
 Caption/Tiêu đề gốc: {caption}
 
 Hãy xem video trên và phân tích nội dung, sau đó tạo kịch bản remake theo yêu cầu."""
+        experiment_assignment = resolve_prompt_experiment(
+            channel_id,
+            source_type="facebook",
+            content_key=f"{os.path.basename(video_path)}|{caption}",
+            task_input=user_message,
+        )
+        prompt = build_prompt(
+            load_prompt(),
+            channel_id,
+            source_type="facebook",
+            task_input=user_message,
+            repair_instruction=repair_instruction,
+            operator_profiles=(operator_instruction,) if operator_instruction else (),
+            experiment_assignment=experiment_assignment,
+        )
 
         model = genai.GenerativeModel("gemini-2.0-flash")
 
         print(f"      🤖 Gửi yêu cầu phân tích...")
         response = model.generate_content(
-            [video_file, prompt + "\n\n" + user_message],
+            [video_file, prompt],
             generation_config=genai.GenerationConfig(
                 temperature=0.7,
                 max_output_tokens=4096,
@@ -94,7 +122,10 @@ Hãy xem video trên và phân tích nội dung, sau đó tạo kịch bản rem
         raw_text = re.sub(r'\s*```$', '', raw_text)
         raw_text = raw_text.strip()
 
-        result = json.loads(raw_text)
+        result = apply_experiment_metadata(
+            json.loads(raw_text),
+            experiment_assignment,
+        )
 
         print(f"      ✅ AI trả về JSON thành công")
         print(f"         Title: {result.get('title_tiktok', '')[:60]}")

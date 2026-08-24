@@ -15,7 +15,9 @@ def save_to_sheet(script_url, link, title, script, combined_hints, original_vide
         "original_video": original_video,
         "title_tiktok": title_tiktok,
         "tiktok_id": tiktok_id, # Cột N
-        "file_path": file_path
+        "file_path": file_path,
+        "pipeline_status": "scripted",
+        "pipeline_stage": "scripted",
     }
 
     try:
@@ -39,11 +41,20 @@ def update_tiktok_info(script_url, row, file_path=None, link_tiktok=None, title_
         return True
     except: return False
 
-def update_final_result(script_url, row_idx, drive_link):
+def update_final_result(
+    script_url,
+    row_idx,
+    drive_link,
+    *,
+    pipeline_status="uploaded",
+    pipeline_stage="uploaded",
+):
     payload = {
         "action": "update_file_path",
         "row": int(row_idx),
-        "file_path": str(drive_link)
+        "file_path": str(drive_link),
+        "pipeline_status": str(pipeline_status),
+        "pipeline_stage": str(pipeline_stage),
     }
     result = safe_post_json(script_url, payload)
     return result.get("status") == "success" if result else False
@@ -81,7 +92,9 @@ def update_status_finish(script_url, row, link_tiktok):
         payload = {
             "action": "finish_upload",
             "row": int(row),
-            "link_tiktok": str(link_tiktok)
+            "link_tiktok": str(link_tiktok),
+            "pipeline_status": "published",
+            "pipeline_stage": "published",
         }
         res = requests.post(script_url, json=payload, timeout=20)
         return res.json().get("status") == "success"
@@ -203,6 +216,9 @@ def get_latest_row_by_id(sheet_url, tiktok_id):
                     "title_text": item.get("title_text", ""),
                     "content_text": content,
                     "tone": item.get("tone", "Trung tính"),
+                    "music_mood": item.get("music_mood"),
+                    "music_energy": item.get("music_energy", 2),
+                    "is_sensitive": item.get("is_sensitive", False),
                     "tiktok_id_sheet": sheet_id
                 }
             else:

@@ -6,6 +6,9 @@ from shared.services.supabase_api import SupabaseAPI
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 STATS_FILE = os.path.join(PROJECT_ROOT, "assets", "temp_downloads", "run_stats.json")
+FAILURE_STATS_FILE = os.path.join(
+    PROJECT_ROOT, "assets", "temp_downloads", "pipeline_failures.json"
+)
 MACHINE_FILE = os.path.join(PROJECT_ROOT, "config", "local_machine.json")
 
 class TeleReporter:
@@ -31,14 +34,46 @@ class TeleReporter:
             json.dump(stats, f, ensure_ascii=False, indent=4)
 
     @staticmethod
+    def log_pipeline_failure(tiktok_id, failure):
+        """Count structured failures without sending a Telegram message per job."""
+        os.makedirs(os.path.dirname(FAILURE_STATS_FILE), exist_ok=True)
+        payload = (
+            failure.to_dict() if hasattr(failure, "to_dict") else dict(failure or {})
+        )
+        error_code = str(payload.get("error_code") or "PIPELINE_FAILED")
+        stage = str(payload.get("stage") or "unknown")
+        key = f"{stage}:{error_code}"
+        stats = {}
+        if os.path.exists(FAILURE_STATS_FILE):
+            try:
+                with open(FAILURE_STATS_FILE, "r", encoding="utf-8") as file:
+                    stats = json.load(file)
+            except (OSError, json.JSONDecodeError):
+                stats = {}
+        channel_stats = stats.setdefault(str(tiktok_id or "unknown"), {})
+        channel_stats[key] = int(channel_stats.get(key, 0)) + 1
+        with open(FAILURE_STATS_FILE, "w", encoding="utf-8") as file:
+            json.dump(stats, file, ensure_ascii=False, indent=2)
+
+    @staticmethod
     def send_summary_report(schedule_time):
-        if not os.path.exists(STATS_FILE):
+        if not os.path.exists(STATS_FILE) and not os.path.exists(FAILURE_STATS_FILE):
             return
 
-        try:
-            with open(STATS_FILE, "r", encoding="utf-8") as f:
-                stats = json.load(f)
-        except: return
+        stats = {}
+        if os.path.exists(STATS_FILE):
+            try:
+                with open(STATS_FILE, "r", encoding="utf-8") as f:
+                    stats = json.load(f)
+            except (OSError, json.JSONDecodeError):
+                stats = {}
+        failures = {}
+        if os.path.exists(FAILURE_STATS_FILE):
+            try:
+                with open(FAILURE_STATS_FILE, "r", encoding="utf-8") as file:
+                    failures = json.load(file)
+            except (OSError, json.JSONDecodeError):
+                failures = {}
 
         settings = SupabaseAPI.get_system_config("app_settings") or {}
         token = settings.get("tele_token")
@@ -69,6 +104,12 @@ class TeleReporter:
 
         msg += "-"*30 + "\n"
         msg += f"🎉 <b>TỔNG CỘNG: {total_videos} VIDEO</b>"
+        if failures:
+            msg += "\n\n🔴 <b>LỖI PIPELINE</b>\n"
+            for channel_id, failure_counts in failures.items():
+                msg += f"👤 <b>{channel_id}</b>\n"
+                for key, count in failure_counts.items():
+                    msg += f" ├ {key}: {count}\n"
 
         url = f"https://api.telegram.org/bot{token}/sendMessage"
 
@@ -97,8 +138,11 @@ class TeleReporter:
                 os.remove(STATS_FILE)
             except:
                 pass
-
-import requests
+        if send_success and os.path.exists(FAILURE_STATS_FILE):
+            try:
+                os.remove(FAILURE_STATS_FILE)
+            except OSError:
+                pass
 
 def test_telegram_connection(bot_token, chat_ids):
     """
@@ -137,12 +181,7 @@ def test_telegram_connection(bot_token, chat_ids):
 
 # ================= TEST THỰC TẾ =================
 if __name__ == "__main__":
-    # BƯỚC 1: Dán Bot Token của bạn vào đây (Lấy từ @BotFather)
-    TOKEN = "8649037286:AAEZ8NGI7p4qmpQEcG8Q7AwiNOlRwKOvbRY"
-
-    # BƯỚC 2: Dán Chat ID của bạn vào đây (Lấy từ @userinfobot)
-    # Ví dụ: "1801644744" hoặc nhiều người: "1801644744, 987654321"
-    CHAT_ID = "1801644744"
-
-    # Chạy hàm test
-    test_telegram_connection(TOKEN, CHAT_ID)
+    print(
+        "Dùng test_telegram_connection(bot_token, chat_ids) từ giao diện cấu hình; "
+        "không lưu token/chat ID trong mã nguồn."
+    )

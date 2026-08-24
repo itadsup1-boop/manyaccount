@@ -15,10 +15,15 @@ import json
 import time
 import re
 import shutil
+import sys
 from playwright.sync_api import sync_playwright
 
 # apps/creator_facebook/chatgpt_automator.py → creator_facebook → apps → mannyAccount (project root)
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, PROJECT_ROOT)
+from shared.core.experiment_manager import apply_experiment_metadata
+from shared.core.prompt_builder import build_prompt, resolve_prompt_experiment
+
 APP_DIR = PROJECT_ROOT
 CHATGPT_PROFILE_BASE = os.path.join(PROJECT_ROOT, "data", "chrome_profiles", "chatgpt")
 CHROME_PROFILE = os.path.join(CHATGPT_PROFILE_BASE, "chrome_chatgpt")
@@ -353,7 +358,16 @@ def login_chatgpt_interactive(is_tele_bot: bool = False, profile_id: str | None 
         context.close()
 
 
-def analyze_video_with_chatgpt(video_path: str, caption: str, is_tele_bot: bool = False, extra_content: str = "", profile_id: str | None = None) -> dict | None:
+def analyze_video_with_chatgpt(
+    video_path: str,
+    caption: str,
+    is_tele_bot: bool = False,
+    extra_content: str = "",
+    profile_id: str | None = None,
+    repair_instruction: str = "",
+    source_type: str = "facebook",
+    experiment_content_key: str = "",
+) -> dict | None:
     """
     Tự động:
     1. Mở ChatGPT (dùng Chrome profile đã login)
@@ -380,11 +394,8 @@ def analyze_video_with_chatgpt(video_path: str, caption: str, is_tele_bot: bool 
     extra_instruction = ""
     if extra_content:
         extra_instruction = (
-            f"\n[PROFILE/CHỈ ĐẠO NỘI DUNG RIÊNG CHO NGUỒN FACEBOOK]:\n"
-            f"{extra_content}\n\n"
-            f"YÊU CẦU: Dùng phần trên làm ràng buộc ưu tiên khi chọn góc khai thác, hook, giọng văn, format, cảm xúc chính và điều cần tránh. "
-            f"Nếu phần trên là thông điệp cụ thể thì hãy lấy làm trọng tâm kịch bản. Nếu là profile kênh/nguồn thì dùng để điều chỉnh phong cách, không được viết một kiểu chung cho mọi nguồn. "
-            f"Vẫn phải bám sát hình ảnh và bối cảnh thật của video gốc, không bịa tình tiết.\n"
+            "\n[CHỈ ĐẠO OPERATOR]: Phần chỉ đạo riêng đã được PromptBuilder "
+            "chèn vào HỒ SƠ KÊNH và được ưu tiên sau định vị trung tâm.\n"
         )
     else:
         extra_instruction = "\n[CHỈ ĐẠO]: Hãy bám sát vào hình ảnh và nội dung của video gốc để viết content.\n"
@@ -400,12 +411,28 @@ def analyze_video_with_chatgpt(video_path: str, caption: str, is_tele_bot: bool 
             "- TUYỆT ĐỐI KHÔNG sử dụng emoji, icon hay ký tự đặc biệt trang trí (ví dụ: 🔥, 😊, 📌).\n"
         )
         
-    full_prompt = (
-        f"{prompt_text}\n\n"
-        f"VIDEO GỐC:\n"
-        f"Caption/Tiêu đề gốc: {caption}\n"
+    task_input = (
+        f"VIDEO GỐC\nCaption/Tiêu đề gốc: {caption}\n"
         f"{extra_instruction}\n"
-        f"Hãy phân tích video được đính kèm và xuất đúng định dạng JSON."
+        "Hãy phân tích video đính kèm và chỉ bám hình ảnh, âm thanh, caption."
+    )
+    experiment_assignment = resolve_prompt_experiment(
+        clean_id,
+        source_type=source_type,
+        content_key=(
+            experiment_content_key
+            or f"{os.path.basename(video_path)}|{caption}"
+        ),
+        task_input=task_input,
+    )
+    full_prompt = build_prompt(
+        prompt_text,
+        clean_id,
+        source_type=source_type,
+        task_input=task_input,
+        repair_instruction=repair_instruction,
+        operator_profiles=(extra_content,) if extra_content else (),
+        experiment_assignment=experiment_assignment,
     )
 
     profile_label = get_chatgpt_profile_label(clean_id, is_tele_bot=is_tele_bot)
@@ -480,7 +507,10 @@ def analyze_video_with_chatgpt(video_path: str, caption: str, is_tele_bot: bool 
                 return None
 
             print("      📥 Đọc kết quả...")
-            result = extract_json_response(raw_text)
+            result = apply_experiment_metadata(
+                extract_json_response(raw_text),
+                experiment_assignment,
+            )
 
             print("      ✅ Nhận JSON thành công từ ChatGPT!")
             print(f"         Hook: {result.get('hook', '')[:60]}...")

@@ -1,20 +1,25 @@
 import os
+import sys
 import json
 import subprocess
-import random
-import glob
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
+
+from shared.services.music_selector import build_ducked_mix_filter, select_music
+from shared.core.beat_timeline import plan_beat_timeline
+from shared.core.video_encoding import (
+    CLEAN_METADATA_ARGS,
+    build_color_filter,
+    final_output_args,
+    resolve_color_grade,
+)
+from shared.core.safe_zone import plan_text_layout
+from shared.services.audio_director import plan_audio_cues
+
 CHANNELS_DIR = os.path.join(PROJECT_ROOT, "assets", "channels")
-BGM_DIR = os.path.join(PROJECT_ROOT, "assets", "bgm")
 SFX_DIR = os.path.join(PROJECT_ROOT, "assets", "sfx")
-
-
-def _get_random_sfx():
-    if not os.path.exists(SFX_DIR):
-        return None
-    files = glob.glob(os.path.join(SFX_DIR, "*.mp3")) + glob.glob(os.path.join(SFX_DIR, "*.wav"))
-    return random.choice(files) if files else None
 
 def _get_supabase_client():
     env_file = os.path.join(PROJECT_ROOT, ".env")
@@ -130,14 +135,22 @@ def get_channel_config(id_tiktok: str) -> dict:
     config.update(custom_config)
     return config
 
-def _get_random_bgm(tone_name):
-    if not os.path.exists(BGM_DIR): return None
-    safe_tone = tone_name.lower().replace(" ", "_").replace("à", "a").replace("á", "a").replace("ẹ", "e").replace("ể", "e").replace("ồ", "o").replace("ộ", "o").replace("ị", "i").replace("í", "i").replace("ũ", "u").capitalize()
-    files = glob.glob(os.path.join(BGM_DIR, f"{safe_tone}_*.mp3")) + glob.glob(os.path.join(BGM_DIR, f"{safe_tone}_*.wav"))
-    if not files: files = glob.glob(os.path.join(BGM_DIR, "*.mp3")) + glob.glob(os.path.join(BGM_DIR, "*.wav"))
-    return random.choice(files) if files else None
-
-def create_article_video(id_tiktok: str, image_paths: list, hook_voice_path: str, script_voice_path: str, output_path: str, hook_text: str = "", appended_video_path: str = None, tone: str = "Trung tính", script_text: str = ""):
+def create_article_video(
+    id_tiktok: str,
+    image_paths: list,
+    hook_voice_path: str,
+    script_voice_path: str,
+    output_path: str,
+    hook_text: str = "",
+    appended_video_path: str = None,
+    tone: str = "Trung tính",
+    script_text: str = "",
+    music_mood: str | None = None,
+    music_energy: int = 2,
+    is_sensitive: bool = False,
+    beats: list | None = None,
+    subtitle_style: str = "keyword_highlight",
+):
     """
     Dựng video từ mảng ảnh tĩnh và file âm thanh (hook + script).
     ✅ V2: Crossfade transition, nhạc nền, encode chất lượng cao, hiệu ứng đa dạng.
@@ -198,18 +211,45 @@ def create_article_video(id_tiktok: str, image_paths: list, hook_voice_path: str
     except ImportError:
         valid_images = image_paths
         
-    image_paths = valid_images
-    num_imgs = len(image_paths)
+    source_images = valid_images
+    num_imgs = len(source_images)
     
     if num_imgs == 0:
         print("   ❌ Không còn ảnh nào hợp lệ sau khi chuẩn hoá, huỷ dựng video.")
         return
 
-    # ═══ CROSSFADE: Tính thời lượng mỗi ảnh có tính overlap ═══
-    CROSSFADE_DUR = 0.5  # Thời gian fade giữa 2 ảnh (giây)
-    # Tổng thời gian = N*img_dur - (N-1)*crossfade → img_dur = (audio_dur + (N-1)*crossfade) / N
-    img_dur = (audio_dur + (num_imgs - 1) * CROSSFADE_DUR) / num_imgs
-    img_dur = max(img_dur, 1.5)  # Tối thiểu 1.5 giây/ảnh
+    timeline = plan_beat_timeline(
+        beats,
+        total_duration=audio_dur,
+        hook_duration=hook_dur,
+        media_count=num_imgs,
+        hook_text=hook_text,
+    )
+    segments = list(timeline.segments)
+    image_paths = [source_images[item.media_index] for item in segments]
+    num_imgs = len(image_paths)
+    transition_durations = [
+        0.35 if segments[index + 1].transition == "fade" else 0.08
+        for index in range(max(0, num_imgs - 1))
+    ]
+    input_durations = [
+        segment.duration + (
+            transition_durations[index] if index < len(transition_durations) else 0.0
+        )
+        for index, segment in enumerate(segments)
+    ]
+    hook_text = timeline.first_frame_text or hook_text
+    color_grade = resolve_color_grade(
+        id_tiktok,
+        tone=tone,
+        is_sensitive=is_sensitive,
+    )
+    color_filter = build_color_filter(color_grade)
+    print(
+        f"   🧭 Beat timeline: {len(segments)} beats / {audio_dur:.2f}s | "
+        f"first frame: {hook_text}"
+    )
+    print(f"   🎨 Color grade: {color_grade.name}")
 
     # ═══ TẠO SUBTITLE TỪ SCRIPT VOICE BẰNG FASTER-WHISPER (ASS KARAOKE) ═══
     ass_path = None
@@ -219,16 +259,38 @@ def create_article_video(id_tiktok: str, image_paths: list, hook_voice_path: str
         print(f"   🤖 Đang nhận diện giọng nói (Whisper) tạo Subtitle ASS...")
         import sys
         sys.path.insert(0, PROJECT_ROOT)
-        from shared.modules.subtitle_renderer import generate_text_ass, generate_word_ass
+        from shared.modules.subtitle_renderer import (
+            generate_text_ass,
+            generate_word_ass,
+            get_subtitle_preset,
+        )
+        subtitle_preset = get_subtitle_preset(id_tiktok, {
+            "font_size": cfg.get("sub_font_size"),
+            "margin_v": cfg.get("sub_margin_v"),
+            "hex_color": cfg.get("sub_color"),
+        })
+        keywords = [
+            value
+            for segment in segments
+            for value in segment.must_show
+            if value
+        ]
+        if subtitle_style == "normal":
+            keywords = []
         ass_out = output_path.replace(".mp4", "_body.ass")
         ass_path = generate_word_ass(
             script_voice_path, 
             ass_out, 
             time_offset=hook_dur, 
-            words_per_line=4,
-            font_size=cfg.get("sub_font_size", 70),
-            margin_v=cfg.get("sub_margin_v", 150),
-            hex_color=cfg.get("sub_color", "#00ffff")
+            words_per_line=subtitle_preset["max_words"],
+            font_size=subtitle_preset["font_size"],
+            margin_v=subtitle_preset["margin_v"],
+            hex_color=subtitle_preset["hex_color"],
+            highlight_color=subtitle_preset["highlight_color"],
+            keywords=keywords,
+            font_name=subtitle_preset["font_name"],
+            margin_l=subtitle_preset["margin_l"],
+            margin_r=subtitle_preset["margin_r"],
         )
         if not ass_path and script_text:
             print("   ⚠️ Whisper không tạo được subtitle, dùng script_voice text để tạo karaoke gần đúng...")
@@ -237,10 +299,15 @@ def create_article_video(id_tiktok: str, image_paths: list, hook_voice_path: str
                 ass_out,
                 duration=script_dur,
                 time_offset=hook_dur,
-                words_per_line=4,
-                font_size=cfg.get("sub_font_size", 70),
-                margin_v=cfg.get("sub_margin_v", 150),
-                hex_color=cfg.get("sub_color", "#00ffff")
+                words_per_line=subtitle_preset["max_words"],
+                font_size=subtitle_preset["font_size"],
+                margin_v=subtitle_preset["margin_v"],
+                hex_color=subtitle_preset["hex_color"],
+                highlight_color=subtitle_preset["highlight_color"],
+                keywords=keywords,
+                font_name=subtitle_preset["font_name"],
+                margin_l=subtitle_preset["margin_l"],
+                margin_r=subtitle_preset["margin_r"],
             )
         if ass_path:
             print(f"   ✅ Đã tạo phụ đề ASS: {os.path.basename(ass_path)}")
@@ -248,17 +315,16 @@ def create_article_video(id_tiktok: str, image_paths: list, hook_voice_path: str
         print(f"   ⚠️ Lỗi tạo phụ đề: {e}")
         ass_path = None
 
-    print(f"   📸 Mỗi ảnh hiển thị: {img_dur:.2f} giây (crossfade {CROSSFADE_DUR}s)")
+    print("   📸 Thời lượng cảnh lấy từ duration_hint/role của từng beat.")
     
     # 2. Xây dựng inputs và filter_complex cho từng ảnh
     inputs = []
     filter_complex_parts = []
     
-    # Danh sách hiệu ứng đa dạng: pan
-    EFFECTS = ["pan_left", "pan_right", "pan_up", "pan_down", "pan_up_left", "pan_down_right"]
-    
     for idx, img in enumerate(image_paths):
-        inputs.extend(["-loop", "1", "-t", f"{img_dur:.3f}", "-i", os.path.abspath(img)])
+        segment = segments[idx]
+        input_duration = input_durations[idx]
+        inputs.extend(["-loop", "1", "-t", f"{input_duration:.3f}", "-i", os.path.abspath(img)])
         
         bg_raw = f"[bg_raw{idx}]"
         fg_raw = f"[fg_raw{idx}]"
@@ -267,56 +333,58 @@ def create_article_video(id_tiktok: str, image_paths: list, hook_voice_path: str
         overlay_pad = f"[overlayed{idx}]"
         v_seg = f"[v_seg{idx}]"
         
-        # Color Grading ngẫu nhiên nhẹ
-        contrast = round(random.uniform(0.98, 1.02), 3)
-        saturation = round(random.uniform(0.98, 1.02), 3)
-        brightness = round(random.uniform(-0.02, 0.02), 3)
-        
         filter_complex_parts.append(
             f"[{idx}:v]crop='iw*(1-0.3*gt(iw/ih,1.2))':'ih':'(iw-ow)/2':'0'[cropped{idx}];"
             f"[cropped{idx}]split=2{bg_raw}{fg_raw};"
             f"{bg_raw}scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,boxblur=10:2{bg};"
-            f"{fg_raw}scale=1080:1920:force_original_aspect_ratio=decrease,eq=contrast={contrast}:saturation={saturation}:brightness={brightness}{fg};"
+            f"{fg_raw}scale=1080:1920:force_original_aspect_ratio=decrease,{color_filter}{fg};"
             f"{bg}{fg}overlay=(W-w)/2:(H-h)/2-50,setsar=1{overlay_pad}"
         )
         
-        # Ảnh đầu tiên dùng pan_up_left để tạo visual hook mạnh thay vì zoom_in (FFmpeg crop không cho w/h động)
-        effect = "pan_up_left" if idx == 0 else random.choice(EFFECTS)
-        num_frames = max(1, int(img_dur * 25))
+        effect = segment.motion
+        num_frames = max(1, int(input_duration * 30))
         
         # Pan: scale lên lớn hơn rồi crop di chuyển
         expr_x = "'(iw-1080)/2'"
         expr_y = "'(ih-1920)/2'"
         
-        if "left" in effect:
+        if effect == "pan_left":
             expr_x = f"'(iw-1080)*(1-n/{num_frames})'"
-        elif "right" in effect:
+        elif effect == "pan_right":
             expr_x = f"'(iw-1080)*(n/{num_frames})'"
-            
-        if "up" in effect:
-            expr_y = f"'(ih-1920)*(1-n/{num_frames})'"
-        elif "down" in effect:
-            expr_y = f"'(ih-1920)*(n/{num_frames})'"
+
+        scale_filter = "scale=1242:2208"
+        if effect == "slow_push_in":
+            scale_filter = (
+                f"scale=w='1134+108*n/{num_frames}':"
+                f"h='2016+192*n/{num_frames}':eval=frame"
+            )
+        elif effect == "slow_pull_out":
+            scale_filter = (
+                f"scale=w='1242-108*n/{num_frames}':"
+                f"h='2208-192*n/{num_frames}':eval=frame"
+            )
+        elif effect == "static":
+            scale_filter = "scale=1134:2016"
             
         filter_complex_parts.append(
-            f"{overlay_pad}scale=1242:2208,crop=1080:1920:x={expr_x}:y={expr_y}{v_seg}"
+            f"{overlay_pad}{scale_filter},"
+            f"crop=1080:1920:x={expr_x}:y={expr_y}{v_seg}"
         )
 
     # ═══ CROSSFADE TRANSITIONS giữa các ảnh ═══
     if num_imgs == 1:
         filter_complex_parts.append(f"[v_seg0]null[v_scaled]")
     else:
-        # Ghép xfade liên tiếp: seg0 xfade seg1 → tmp0, tmp0 xfade seg2 → tmp1, ...
-        offset = img_dur - CROSSFADE_DUR
-        xfade_transitions = ["fade", "fadeblack", "slideleft", "slideright", "slideup", "slidedown"]
-        
         prev = "[v_seg0]"
         for i in range(1, num_imgs):
-            transition = random.choice(xfade_transitions)
-            cur_offset = offset * i  # Thời điểm bắt đầu crossfade
+            transition = "fade"
+            transition_duration = transition_durations[i - 1]
+            cur_offset = segments[i].start
             out_label = f"[v_scaled]" if i == num_imgs - 1 else f"[xf{i}]"
             filter_complex_parts.append(
-                f"{prev}[v_seg{i}]xfade=transition={transition}:duration={CROSSFADE_DUR}:offset={cur_offset:.3f}{out_label}"
+                f"{prev}[v_seg{i}]xfade=transition={transition}:"
+                f"duration={transition_duration:.3f}:offset={cur_offset:.3f}{out_label}"
             )
             prev = out_label
     
@@ -336,44 +404,61 @@ def create_article_video(id_tiktok: str, image_paths: list, hook_voice_path: str
         filter_complex_parts.append(f"[{audio_idx}:a]acopy[a_voice]")
         curr_idx = num_imgs + 1
     
-    # Nhạc nền (BGM) mix dưới voice
-    bgm_path = _get_random_bgm(tone)
-    if bgm_path:
-        inputs.extend(["-stream_loop", "-1", "-i", bgm_path])
+    # Chọn đúng một BGM cho toàn video, theo mood biên tập và lịch sử của kênh.
+    music = select_music(
+        music_mood,
+        tone=tone,
+        energy=music_energy,
+        is_sensitive=is_sensitive,
+        channel_id=id_tiktok,
+    )
+    if music:
+        inputs.extend(["-stream_loop", "-1", "-i", music.path])
         bgm_idx = curr_idx
-        # Trim BGM theo độ dài audio, giảm volume xuống 0.06 (amix sẽ giảm tiếp), fade out 3 giây cuối
         filter_complex_parts.append(
-            f"[{bgm_idx}:a]atrim=0:{audio_dur:.3f},afade=t=in:st=0:d=2,afade=t=out:st={max(0, audio_dur-3):.3f}:d=3,volume=0.06[a_bgm];"
-            f"[a_voice][a_bgm]amix=inputs=2:duration=first:dropout_transition=2[a_mix];"
-            f"[a_mix]loudnorm=I=-14:LRA=11:TP=-1.5[a_merged]"
+            build_ducked_mix_filter(
+                "a_voice",
+                f"{bgm_idx}:a",
+                audio_dur,
+                music,
+                output_label="a_merged",
+                label_prefix="article_music",
+            )
         )
         audio_map = "[a_merged]"
         curr_idx += 1
-        print(f"   🎵 Nhạc nền: {os.path.basename(bgm_path)}")
+        print(
+            f"   🎵 Nhạc nền: {os.path.basename(music.path)} | "
+            f"mood={music.mood} | energy={music.energy} | bed={music.bed_lufs:.1f} LUFS"
+        )
+        if music.license_status != "approved":
+            print("   ⚠️ BGM hiện tại chưa có metadata giấy phép approved trong catalog.json")
     else:
-        filter_complex_parts.append(f"[a_voice]loudnorm=I=-14:LRA=11:TP=-1.5[a_merged]"); audio_map = "[a_merged]"
+        filter_complex_parts.append("[a_voice]loudnorm=I=-14:LRA=9:TP=-1.5[a_merged]")
+        audio_map = "[a_merged]"
+        print(f"   ⚠️ Không có BGM phù hợp cho mood={music_mood or tone}; giữ voice-only an toàn")
 
-    # ═══ SFX: Tiếng whoosh tại ~50% điểm chuyển cảnh ═══
+    # ═══ SFX: Chỉ ở beat reveal/con số/bước ngoặt được AudioDirector chọn ═══
     sfx_labels = []
-    for i in range(1, num_imgs):
-        if random.random() < 0.5:
-            sfx_file = _get_random_sfx()
-            if sfx_file:
-                delay_ms = int((i * (img_dur - CROSSFADE_DUR) + hook_dur) * 1000)
-                inputs.extend(["-i", sfx_file])
-                label = f"sfx{i}"
-                filter_complex_parts.append(
-                    f"[{curr_idx}:a]adelay={delay_ms}|{delay_ms},volume=0.15[{label}]"
-                )
-                sfx_labels.append(label)
-                curr_idx += 1
+    audio_cues = plan_audio_cues(timeline, is_sensitive=is_sensitive, sfx_dir=SFX_DIR)
+    for cue_index, cue in enumerate(audio_cues):
+        delay_ms = int(cue.timestamp * 1000)
+        inputs.extend(["-i", cue.asset_path])
+        label = f"sfx{cue_index}"
+        filter_complex_parts.append(
+            f"[{curr_idx}:a]adelay={delay_ms}|{delay_ms},"
+            f"volume={cue.gain:.2f}[{label}]"
+        )
+        sfx_labels.append(label)
+        curr_idx += 1
     if sfx_labels:
         amix_in = "[a_merged]" + "".join(f"[{l}]" for l in sfx_labels)
         filter_complex_parts.append(
-            f"{amix_in}amix=inputs={1 + len(sfx_labels)}:duration=first:dropout_transition=2[a_final]"
+            f"{amix_in}amix=inputs={1 + len(sfx_labels)}:duration=first:"
+            f"dropout_transition=0:normalize=0,alimiter=limit=0.84[a_final]"
         )
         audio_map = "[a_final]"
-        print(f"   🔊 SFX: {len(sfx_labels)} tiếng chuyển cảnh")
+        print(f"   🔊 AudioDirector: {len(sfx_labels)} SFX có chủ đích")
 
     out_pad = "[v_scaled]"
     
@@ -411,8 +496,7 @@ def create_article_video(id_tiktok: str, image_paths: list, hook_voice_path: str
         out_pad = "[v_final]"
         curr_idx += 1
         
-    # ═══ Hook Text: CHỈ HIỆN 5 GIÂY ĐẦU (không xuyên suốt) ═══
-    import textwrap
+    # ═══ Hook Text: chỉ hiện đúng thời lượng hook thật (không xuyên suốt) ═══
     font_name = cfg.get("text_font", "RobotoCondensed-Bold.ttf")
     font_path = os.path.join(PROJECT_ROOT, "assets", "font", font_name)
     has_font = os.path.exists(font_path)
@@ -422,29 +506,31 @@ def create_article_video(id_tiktok: str, image_paths: list, hook_voice_path: str
         safe_text = str(hook_text).replace("'", "").replace(":", "\\:").replace("%", "\\%").strip()
         font_size = int(cfg.get("text_size", 65))
         max_width_px = int(1080 * float(cfg.get("text_w", 0.75)))
-        avg_char_width = font_size * 0.55
-        max_chars = int(max_width_px / avg_char_width)
-        wrapped_lines = textwrap.wrap(safe_text, width=max_chars)
-
-        start_y = int(1920 * float(cfg.get("text_y1", 0.73)))
+        preferred_y = int(1920 * float(cfg.get("text_y1", 0.73)))
         text_color = cfg.get("text_color", "#ffffff")
         stroke = int(cfg.get("text_stroke", 3))
-        line_spacing = int(font_size * 1.2)
         
         # Chỉ hiển thị text trong khoảng hook (0 → hook_dur giây)
         hook_show_dur = hook_dur if hook_dur > 0 else 5.0
         
         # Calculate left margin to align left based on the max_width_px + text_x offset
         text_x_offset = int(cfg.get("text_x", 0))
-        margin_x = int((1080 - max_width_px) / 2) + text_x_offset
+        preferred_x = int((1080 - max_width_px) / 2) + text_x_offset
+        layout = plan_text_layout(
+            safe_text,
+            font_size=font_size,
+            preferred_x=preferred_x,
+            preferred_y=preferred_y,
+            max_width=max_width_px,
+        )
         
-        for i, line in enumerate(wrapped_lines):
-            y_pos = start_y + (i * line_spacing)
+        for i, line in enumerate(layout.lines):
+            y_pos = layout.y + (i * layout.line_spacing)
             draw_filter = (
                 f"drawtext=fontfile='{font_path}':text='{line}':"
                 f"fontsize={font_size}:fontcolor={text_color}:bordercolor=black:borderw={stroke}:"
                 f"shadowcolor=black:shadowx=3:shadowy=3:"
-                f"x={margin_x}:y={y_pos}:"
+                f"x={layout.x}:y={y_pos}:"
                 f"enable='between(t,0,{hook_show_dur:.2f})'"
             )
             filter_complex_parts.append(f"{out_pad}{draw_filter}[v_text{i}]")
@@ -465,13 +551,12 @@ def create_article_video(id_tiktok: str, image_paths: list, hook_voice_path: str
     if appended_video_path and os.path.exists(appended_video_path):
         temp_main_path = output_path.replace(".mp4", "_main.mp4")
 
-    # ═══ ENCODE CHẤT LƯỢNG CAO: preset medium, crf 18 ═══
+    # ═══ ENCODE CHUẨN DÙNG CHUNG: H.264 High + AAC 48 kHz stereo ═══
     cmd = ["ffmpeg", "-y"] + inputs + [
         "-filter_complex", filter_complex,
         "-map", f"{out_pad}",
         "-map", f"{audio_map}",
-        "-c:v", "libx264", "-pix_fmt", "yuv420p", "-r", "30", "-video_track_timescale", "90000", "-preset", "medium", "-crf", "18", "-threads", "0",
-        "-c:a", "aac", "-b:a", "192k", "-ar", "44100", "-ac", "2",
+        *final_output_args(),
         "-t", str(audio_dur + 0.2),
         "-shortest",
         temp_main_path
@@ -498,7 +583,14 @@ def create_article_video(id_tiktok: str, image_paths: list, hook_voice_path: str
             except: pass
             
             # Sửa lỗi PTS (thời gian) không bắt đầu từ 0 của video livestream/m3u8
-            filter_v = "[0:v]setpts=PTS-STARTPTS,scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,boxblur=10:2[bg_blur];[0:v]setpts=PTS-STARTPTS,scale=1080:1920:force_original_aspect_ratio=decrease[fg];[bg_blur][fg]overlay=(W-w)/2:(H-h)/2[vout]"
+            filter_v = (
+                "[0:v]setpts=PTS-STARTPTS,scale=1080:1920:"
+                "force_original_aspect_ratio=increase,crop=1080:1920,"
+                "boxblur=10:2[bg_blur];"
+                "[0:v]setpts=PTS-STARTPTS,scale=1080:1920:"
+                f"force_original_aspect_ratio=decrease,{color_filter}[fg];"
+                "[bg_blur][fg]overlay=(W-w)/2:(H-h)/2[vout]"
+            )
             
             if has_audio:
                 filter_v += ";[0:a]asetpts=PTS-STARTPTS[aout]"
@@ -507,14 +599,13 @@ def create_article_video(id_tiktok: str, image_paths: list, hook_voice_path: str
                 
             cmd_app = ["ffmpeg", "-y", "-i", appended_video_path]
             if not has_audio:
-                cmd_app += ["-f", "lavfi", "-i", "anullsrc=channel_layout=stereo:sample_rate=44100"]
+                cmd_app += ["-f", "lavfi", "-i", "anullsrc=channel_layout=stereo:sample_rate=48000"]
                 
             cmd_app += [
                 "-filter_complex", filter_v,
                 "-map", "[vout]",
                 "-map", "[aout]",
-                "-c:v", "libx264", "-pix_fmt", "yuv420p", "-r", "30", "-video_track_timescale", "90000", "-preset", "medium", "-crf", "18",
-                "-c:a", "aac", "-b:a", "192k", "-ar", "44100", "-ac", "2",
+                *final_output_args(),
                 "-t", "15",  # Giới hạn video chèn thêm tối đa 15 giây để tránh quá dài
                 "-shortest", temp_appended
             ]
@@ -526,7 +617,11 @@ def create_article_video(id_tiktok: str, image_paths: list, hook_voice_path: str
                 f.write(f"file '{os.path.basename(temp_main_path)}'\n")
                 f.write(f"file '{os.path.basename(temp_appended)}'\n")
                 
-            cmd_concat = ["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", concat_txt, "-c", "copy", output_path]
+            cmd_concat = [
+                "ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", concat_txt,
+                "-c", "copy", "-movflags", "+faststart", *CLEAN_METADATA_ARGS,
+                output_path,
+            ]
             subprocess.run(cmd_concat, check=True, cwd=os.path.dirname(output_path), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             
             try:

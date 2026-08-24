@@ -8,7 +8,8 @@ from playwright.sync_api import sync_playwright
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, PROJECT_ROOT)
-from shared.core.channel_editorial import load_channel_editorial
+from shared.core.experiment_manager import apply_experiment_metadata
+from shared.core.prompt_builder import build_prompt, resolve_prompt_experiment
 
 PROMPT_FILE = os.path.join(PROJECT_ROOT, "config", "prompts", "prompt_article.txt")
 
@@ -37,87 +38,6 @@ Yêu cầu trả về chuẩn định dạng JSON, TUYỆT ĐỐI không có vă
   "title_tiktok": "Tiêu đề để đăng lên TikTok (có hashtag)",
   "image_prompts": ["mô tả ảnh 1", "mô tả ảnh 2"]
 }"""
-
-CONTENT_PROFILE_FIELDS = [
-    ("Tên kênh", "channel_name"),
-    ("Chủ đề chính", "topic"),
-    ("Tệp người xem", "audience"),
-    ("Lời hứa nội dung", "content_promise"),
-    ("Mục tiêu chính", "primary_goal"),
-    ("Giọng văn/phong cách", "tone_style"),
-    ("Độ dài video mong muốn", "video_length"),
-    ("Format lặp lại", "format_style"),
-    ("Kiểu hook phù hợp", "hook_style"),
-    ("Ưu tiên chọn nguồn/video", "source_preference"),
-    ("Cách kéo bình luận", "comment_strategy"),
-    ("Điều cần tránh", "avoid"),
-    ("Ví dụ từng hiệu quả", "winning_examples"),
-    ("Chỉ đạo tùy biến thêm", "custom_instruction"),
-]
-
-
-def merge_content_profiles(*profiles):
-    merged = {}
-    for profile in profiles:
-        if not isinstance(profile, dict):
-            continue
-        for _label, key in CONTENT_PROFILE_FIELDS:
-            value = profile.get(key)
-            if str(value or "").strip():
-                merged[key] = value
-    return merged
-
-
-def load_tiktok_synced_content_profile(id_tiktok: str) -> dict:
-    clean_id = str(id_tiktok or "").replace("@", "").strip()
-    if not clean_id:
-        return {}
-    try:
-        from shared.services.supabase_api import SupabaseAPI
-        profiles = SupabaseAPI.get_tiktok_content_profiles()
-        synced = profiles.get(clean_id, {})
-        return synced if isinstance(synced, dict) else {}
-    except Exception:
-        return {}
-
-
-def format_channel_content_profile(profile: dict) -> str:
-    lines = []
-    for label, key in CONTENT_PROFILE_FIELDS:
-        value = str(profile.get(key, "")).strip()
-        if value:
-            lines.append(f"- {label}: {value}")
-
-    if not lines:
-        return ""
-
-    return (
-        "HỒ SƠ KÊNH TIKTOK\n"
-        "Bắt buộc dùng hồ sơ này để chọn góc khai thác, hook, giọng văn, độ dài và mức độ tranh luận.\n"
-        + "\n".join(lines)
-    )
-
-
-def load_channel_content_profile(id_tiktok: str) -> str:
-    config_path = os.path.join(PROJECT_ROOT, "assets", "channels", id_tiktok, "config.json")
-    local_profile = {}
-
-    if os.path.exists(config_path):
-        try:
-            with open(config_path, "r", encoding="utf-8") as f:
-                config = json.load(f)
-            profile = config.get("content_profile") or {}
-            if isinstance(profile, dict):
-                local_profile = profile
-        except Exception:
-            local_profile = {}
-
-    synced_profile = load_tiktok_synced_content_profile(id_tiktok)
-    editorial_profile = load_channel_editorial(id_tiktok).get("content_profile", {})
-    # Hồ sơ biên tập riêng không nằm trong config hình ảnh nên không bị Storage ghi đè.
-    return format_channel_content_profile(
-        merge_content_profiles(synced_profile, local_profile, editorial_profile)
-    )
 
 def wait_for_login_finish(context):
     try:
@@ -156,21 +76,34 @@ def login_chatgpt_interactive(id_tiktok: str):
         wait_for_login_finish(context)
         context.close()
 
-def analyze_article_with_chatgpt(article_url: str, id_tiktok: str) -> dict | None:
+def analyze_article_with_chatgpt(
+    article_url: str,
+    id_tiktok: str,
+    repair_instruction: str = "",
+) -> dict | None:
     profile_dir = get_chrome_profile_dir(id_tiktok)
     if not os.path.exists(profile_dir):
         print(f"      ❌ CHƯA LOGIN CHATGPT CHO KÊNH {id_tiktok}!")
         return None
 
-    prompt_text = load_prompt()
-    channel_profile = load_channel_content_profile(id_tiktok)
-    profile_block = f"{channel_profile}\n\n" if channel_profile else ""
-    full_prompt = (
-        f"👉 ĐƯỜNG DẪN BÀI BÁO CẦN PHÂN TÍCH: {article_url}\n\n"
-        f"{profile_block}"
-        f"Hãy click hoặc truy cập vào đường dẫn trên, đọc nội dung bài báo và thực hiện theo yêu cầu dưới đây:\n\n"
-        f"{prompt_text}\n\n"
-        f"Hãy phân tích và BẮT BUỘC xuất đúng định dạng JSON, có thêm trường \"id_tiktok\": \"{id_tiktok}\"."
+    task_input = (
+        f"ĐƯỜNG DẪN BÀI BÁO: {article_url}\n"
+        "Hãy truy cập, đọc bài và chỉ dùng dữ kiện có trong nguồn. "
+        f"Bắt buộc thêm \"id_tiktok\": \"{id_tiktok}\" vào JSON."
+    )
+    experiment_assignment = resolve_prompt_experiment(
+        id_tiktok,
+        source_type="article",
+        content_key=article_url,
+        task_input=task_input,
+    )
+    full_prompt = build_prompt(
+        load_prompt(),
+        id_tiktok,
+        source_type="article",
+        task_input=task_input,
+        repair_instruction=repair_instruction,
+        experiment_assignment=experiment_assignment,
     )
 
     print(f"      🤖 Mở ChatGPT (Automator) cho kênh {id_tiktok}...")
@@ -354,6 +287,7 @@ def analyze_article_with_chatgpt(article_url: str, id_tiktok: str) -> dict | Non
                     result[key] = default_val
 
             result["id_tiktok"] = id_tiktok  # Ép cứng lại đề phòng AI quên
+            result = apply_experiment_metadata(result, experiment_assignment)
 
             print("      ✅ Nhận JSON thành công từ ChatGPT UI!")
             print(f"         Hook: {result.get('hook', '')[:60]}...")

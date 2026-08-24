@@ -72,8 +72,8 @@ def compress_video_if_needed(input_path, limit_mb=20):
 
 # --- PHẦN 1: CRAWLER (LẤY LINK VIDEO) ---
 
-def get_videos_via_rapidapi(channel_url, limit=5):
-    """Sử dụng RapidAPI quét danh sách video nếu yt-dlp thất bại"""
+def get_video_candidates_via_rapidapi(channel_url, limit=5):
+    """Sử dụng RapidAPI lấy URL và metadata nhẹ nếu yt-dlp thất bại."""
     config = load_rapid_config()
     try:
         if "@" in channel_url:
@@ -90,7 +90,7 @@ def get_videos_via_rapidapi(channel_url, limit=5):
             "x-rapidapi-host": "tiktok-video-no-watermark2.p.rapidapi.com"
         }
 
-        video_links = []
+        candidates = []
         try:
              url = "https://tiktok-video-no-watermark2.p.rapidapi.com/user/posts"
              response = requests.get(url, headers=headers, params={"unique_id": username, "count": limit}, timeout=20)
@@ -102,17 +102,38 @@ def get_videos_via_rapidapi(channel_url, limit=5):
                      for item in items[:limit]:
                          vid_id = item.get("video_id")
                          if vid_id:
-                             video_links.append(f"https://www.tiktok.com/@{username}/video/{vid_id}")
-                 if video_links:
-                     return video_links
+                             stats = item.get("stats") or {}
+                             candidates.append({
+                                 "url": f"https://www.tiktok.com/@{username}/video/{vid_id}",
+                                 "video_id": str(vid_id),
+                                 "title": item.get("title") or item.get("desc") or "",
+                                 "caption": item.get("title") or item.get("desc") or "",
+                                 "thumbnail": item.get("cover") or item.get("origin_cover"),
+                                 "duration": item.get("duration"),
+                                 "timestamp": item.get("create_time"),
+                                 "view_count": item.get("play_count") or stats.get("play_count"),
+                                 "like_count": item.get("digg_count") or stats.get("digg_count"),
+                                 "comment_count": item.get("comment_count") or stats.get("comment_count"),
+                                 "position": len(candidates),
+                             })
+                 if candidates:
+                     return candidates
              else:
                  print(f"   ⚠️ Key '{key[:8]}...' trả về status code {response.status_code} khi quét.")
         except Exception as e:
              print(f"⚠️ Lỗi quét video qua RapidAPI với key '{key[:8]}...': {e}")
     return []
 
-def get_channel_videos(channel_url, limit=5):
-    """Hàm tổng hợp lấy link video"""
+def get_videos_via_rapidapi(channel_url, limit=5):
+    """Backward-compatible URL-only RapidAPI API."""
+    return [
+        item["url"]
+        for item in get_video_candidates_via_rapidapi(channel_url, limit)
+    ]
+
+
+def get_channel_video_candidates(channel_url, limit=5):
+    """Hàm tổng hợp lấy video kèm metadata cho SourceRanker."""
     print(f"🔍 Đang quét kênh: {channel_url}")
 
     ydl_opts = {
@@ -120,7 +141,7 @@ def get_channel_videos(channel_url, limit=5):
         'ignoreerrors': True,
         'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
     }
-    video_links = []
+    candidates = []
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(channel_url, download=False)
@@ -128,15 +149,37 @@ def get_channel_videos(channel_url, limit=5):
                 for e in info['entries']:
                     if e:
                         v_url = e.get('url') or e.get('webpage_url')
-                        if v_url: video_links.append(v_url)
+                        if v_url:
+                            candidates.append({
+                                "url": v_url,
+                                "video_id": str(e.get("id") or ""),
+                                "title": e.get("title") or "",
+                                "caption": e.get("description") or e.get("title") or "",
+                                "description": e.get("description") or "",
+                                "thumbnail": e.get("thumbnail"),
+                                "duration": e.get("duration"),
+                                "timestamp": e.get("timestamp"),
+                                "view_count": e.get("view_count"),
+                                "like_count": e.get("like_count"),
+                                "comment_count": e.get("comment_count"),
+                                "position": len(candidates),
+                            })
     except Exception as e:
         print(f"⚠️ yt-dlp Error: {e}")
 
-    if not video_links:
+    if not candidates:
         print("   ↳ yt-dlp thất bại, chuyển sang RapidAPI...")
-        video_links = get_videos_via_rapidapi(channel_url, limit)
+        candidates = get_video_candidates_via_rapidapi(channel_url, limit)
 
-    return [v for v in video_links if v]
+    return [item for item in candidates if item.get("url")]
+
+
+def get_channel_videos(channel_url, limit=5):
+    """Backward-compatible URL-only API."""
+    return [
+        item["url"]
+        for item in get_channel_video_candidates(channel_url, limit)
+    ]
 
 # --- PHẦN 2: DOWNLOADER (TẢI FILE) ---
 

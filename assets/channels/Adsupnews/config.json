@@ -9,22 +9,5 @@
   "text_stroke": 0,
   "text_font": "RobotoCondensed-Bold.ttf",
   "text_x": 10,
-  "frame_content_disabled": true,
-  "voice_speed": 1.08,
-  "content_profile": {
-    "channel_name": "Adsupnews - tin nhanh đáng chú ý trong ngày",
-    "topic": "Tin xã hội, đời sống, pháp luật, kinh tế và sự kiện đang được quan tâm; mỗi video chỉ theo một sự việc cụ thể.",
-    "audience": "Người Việt 20-44 tuổi muốn hiểu nhanh chuyện gì xảy ra, ảnh hưởng tới ai và vì sao đáng quan tâm.",
-    "content_promise": "Trong dưới 30 giây, nói rõ sự kiện, chi tiết đắt nhất và hệ quả gần với người xem.",
-    "primary_goal": "retention và share",
-    "tone_style": "Nhanh, rõ, trung lập; câu ngắn như lời nói, nhấn vào dữ kiện thật thay vì giật gân.",
-    "video_length": "22-28 giây; tổng hook và script khoảng 65-85 từ.",
-    "format_style": "0-2 giây nêu sự kiện và hệ quả; 2-6 giây đưa chi tiết bất thường; 6-20 giây giải thích 2-3 dữ kiện; 20-28 giây chốt tác động và hỏi một câu cụ thể.",
-    "hook_style": "8-12 từ, phải có nhân vật hoặc sự việc và động từ mạnh. Không mở bằng lời chào, tên kênh, 'mới đây', 'câu chuyện này' hay 'đang gây xôn xao'.",
-    "source_preference": "Chỉ chọn tin có sự kiện cụ thể, hình ảnh thật, ít nhất hai dữ kiện kiểm chứng được và một tác động rõ. Bỏ qua bài tổng hợp chung chung, PR hoặc thiếu điểm mới.",
-    "comment_strategy": "Hỏi về cách xử lý, hệ quả hoặc trách nhiệm liên quan trực tiếp tới sự việc; không dùng câu 'Theo bạn thì sao?' chung chung.",
-    "avoid": "Không suy đoán, kết tội, câu bi kịch hoặc lặp lại tiêu đề báo. Không nhồi quá ba con số và không dùng ảnh minh họa không liên quan.",
-    "winning_examples": "Mẫu hook: 'Hà Nội vừa chốt thay đổi ảnh hưởng hàng nghìn hộ'; 'Chi tiết này khiến vụ việc chuyển hướng'; 'Ba phút chậm trễ đã tạo ra hậu quả gì?'.",
-    "custom_instruction": "Cảnh đầu phải mô tả đúng nhân vật, địa điểm hoặc vật thể chính. Mỗi visual_description phải chứa tên riêng hoặc hành động có thể tìm ảnh thật. Giọng đọc dứt khoát, ngắt câu rõ, không đọc như văn bản báo chí. Nếu tin không đúng chủ đề hoặc không có payoff, đặt topic_fit=false."
-  }
+  "frame_content_disabled": true
 }

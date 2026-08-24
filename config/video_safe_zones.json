@@ -1,0 +1,36 @@
+{
+  "version": 1,
+  "default_platform": "tiktok_9_16",
+  "platforms": {
+    "tiktok_9_16": {
+      "canvas": {"width": 1080, "height": 1920},
+      "content_safe": {"left": 60, "top": 150, "right": 900, "bottom": 1500},
+      "hook": {"left": 60, "top": 220, "right": 900, "bottom": 1320, "max_lines": 2},
+      "subtitle": {
+        "min_margin_left": 40,
+        "min_margin_right": 100,
+        "min_margin_bottom": 320,
+        "max_margin_bottom": 760,
+        "min_font_size": 46,
+        "max_font_size": 76,
+        "max_lines": 2,
+        "max_words": 7
+      },
+      "subtitle_long": {
+        "margin_left": 110,
+        "margin_right": 180,
+        "margin_bottom": 460,
+        "font_size": 58,
+        "max_lines": 2,
+        "max_words": 6,
+        "word_threshold": 95
+      },
+      "logo": {"left": 40, "top": 150, "right": 850, "bottom": 1400},
+      "reserved": {
+        "top_system": {"left": 0, "top": 0, "right": 1080, "bottom": 140},
+        "right_controls": {"left": 900, "top": 300, "right": 1080, "bottom": 1580},
+        "bottom_caption": {"left": 0, "top": 1500, "right": 1080, "bottom": 1920}
+      }
+    }
+  }
+}

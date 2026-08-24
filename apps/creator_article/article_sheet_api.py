@@ -34,6 +34,8 @@ def save_article_to_sheet(ai_result: dict, article_url: str, id_tiktok: str) -> 
         "tiktok_id": id_tiktok,                                      # ID TikTok (Col N)
         "quality_score": ai_result.get("quality_score", ""),
         "skip_reason": ai_result.get("skip_reason", ""),
+        "pipeline_status": "uploaded",
+        "pipeline_stage": "uploaded",
     }
 
     print(f"      📊 Ghi Sheet '{sheet_name}': id_tiktok→N, hook→B+E, voice→C, image_prompts→G")
@@ -54,6 +56,8 @@ def update_article_drive_link(row: int, drive_link: str, sheet_name: str = "tổ
         "sheet_name": sheet_name,
         "row": int(row),
         "drive_link": drive_link,
+        "pipeline_status": "uploaded",
+        "pipeline_stage": "uploaded",
     }
     result = safe_post_json(SHEET_URL, payload)
     return result.get("status") == "success" if result else False

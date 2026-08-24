@@ -22,6 +22,9 @@ for d in [FRAME_DIR, LOGO_DIR, FONT_DIR]:
 from shared.services.supabase_api import SupabaseAPI
 from shared.core.context import AccountContext
 from shared.core.worker import handle_tts_and_update_sheet
+from shared.core.pipeline_state import PipelineLifecycle, PipelineStageError
+from shared.core.quality_log import append_quality_event
+from shared.core.video_qa import run_video_qa
 
 try:
     from modules.video_handler import download_tiktok_video
@@ -154,6 +157,8 @@ class AutoCloneWorkerPage:
         vid_url = task.get('url')
         clone_channel_url = task.get('clone_channel_url')
         task_id = task.get('id') # Lấy ID của task để làm tên thư mục
+        lifecycle = PipelineLifecycle("tiktok_auto_clone", str(task_id or vid_url))
+        qa_result = None
 
         # 1. Khởi tạo môi trường
         ctx = AccountContext(tiktok_id)
@@ -213,7 +218,13 @@ class AutoCloneWorkerPage:
                 row_data = get_latest_row_by_id(sheet_url, clean_tid)
                 if row_data: break
                 time.sleep(3)
-            if not row_data: raise Exception("Không tìm thấy dữ liệu trên Sheet.")
+            if not row_data:
+                raise PipelineStageError(
+                    "scripted", "SCRIPT_GENERATION_FAILED",
+                    "Không tìm thấy dữ liệu kịch bản trên Sheet.",
+                )
+            lifecycle.advance("scripted")
+            lifecycle.advance("validated")
 
             self.log("🗣️ [5/6] Đang tạo Voice TTS (Sử dụng module Core)...")
             link_ct, local_content = handle_tts_and_update_sheet(
@@ -226,7 +237,11 @@ class AutoCloneWorkerPage:
                     api_key=tts_api_key, text=row_data["title_text"], voice_id=tts_voice_id,
                     row_idx=row_data['row'], sheet_url=sheet_url, is_title=True, save_dir=task_temp_dir
                 )
-            if not local_content: raise Exception("Lỗi tạo Voice Content.")
+            if not local_content:
+                raise PipelineStageError(
+                    "voiced", "TTS_FAILED", "Lỗi tạo Voice Content.",
+                )
+            lifecycle.advance("voiced")
 
             self.log("🎬 [6/6] Đang Render & Edit Video...")
             assets_conf = render_settings.get("assets", {})
@@ -256,13 +271,56 @@ class AutoCloneWorkerPage:
                 temp_dir=task_temp_dir,
                 title_frame_path=t_frame_path,
                 content_frame_path=c_frame_path,
-                target_channel_url=clone_channel_url
+                target_channel_url=clone_channel_url,
+                tone=row_data.get("tone", "Trung tính"),
+                music_mood=row_data.get("music_mood"),
+                music_energy=row_data.get("music_energy", 2),
+                is_sensitive=row_data.get("is_sensitive", False),
             )
-            if not final_path: raise Exception("Lỗi ghép Render Video.")
+            if not final_path or not os.path.exists(final_path):
+                raise PipelineStageError(
+                    "rendered", "RENDER_FAILED", "Lỗi ghép Render Video.",
+                )
+            lifecycle.advance("rendered")
+
+            qa_result = run_video_qa(
+                final_path,
+                watermark_detected=bool(
+                    task.get("watermark_detected")
+                    or paths.get("watermark_detected")
+                ),
+            )
+            if not qa_result.passed:
+                raise PipelineStageError(
+                    "qa_passed",
+                    qa_result.error_code or "VIDEO_QA_FAILED",
+                    "VideoQA chặn upload: "
+                    + ", ".join(qa_result.blocking_errors),
+                )
+            lifecycle.advance("qa_passed")
+            append_quality_event(
+                "tiktok_auto_clone", clean_tid, 0, "qa_passed",
+                stage="qa_passed", item_id=str(task_id or vid_url),
+                qa=qa_result.to_dict(),
+            )
 
             self.log("☁️ Đang Upload lên Google Drive...")
-            drv_link = upload_video_to_drive(final_path, folder_id=folder_id)
-            if not drv_link: raise Exception("Lỗi Upload Drive.")
+            try:
+                drv_link = upload_video_to_drive(final_path, folder_id=folder_id)
+            except Exception as error:
+                raise PipelineStageError(
+                    "uploaded", "UPLOAD_FAILED", f"Lỗi Upload Drive: {error}",
+                ) from error
+            if not drv_link:
+                raise PipelineStageError(
+                    "uploaded", "UPLOAD_FAILED", "Google Drive trả về link rỗng.",
+                )
+            lifecycle.advance("uploaded")
+            append_quality_event(
+                "tiktok_auto_clone", clean_tid, 0, "uploaded",
+                stage="uploaded", item_id=str(task_id or vid_url),
+                qa=qa_result.to_dict(),
+            )
 
             if update_final_result(sheet_url, row_data['row'], drv_link):
                 try:
@@ -278,8 +336,24 @@ class AutoCloneWorkerPage:
                 raise Exception("Lỗi ghi link Drive lên Sheet.")
 
         except Exception as e:
+            failure = lifecycle.fail_from_exception(e)
+            append_quality_event(
+                "tiktok_auto_clone", str(tiktok_id or ""), 0, "failed",
+                stage=failure.stage, item_id=str(task_id or vid_url),
+                error_code=failure.error_code,
+                retryable=failure.retryable,
+                message=failure.message,
+                qa=qa_result.to_dict() if qa_result else None,
+            )
+            try:
+                TeleReporter.log_pipeline_failure(tiktok_id, failure)
+            except Exception as report_error:
+                self.log(f"⚠️ Không ghi được failure stats: {report_error}")
             self.log(f"❌ Chi tiết lỗi Task: {traceback.format_exc()}")
-            ctx.logger.error(f"Task Lỗi: {e}")
+            ctx.logger.error(
+                f"Task lỗi {failure.error_code} ({failure.stage}): "
+                f"{failure.message}"
+            )
             return False
 
         finally:

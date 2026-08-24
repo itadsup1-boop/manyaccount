@@ -1,14 +1,33 @@
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, Response
 import os
 import json
+import sys
 from dotenv import load_dotenv
 
 # Load env file from the parent directory
-ENV_FILE = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), ".env")
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
+sys.path.insert(0, PROJECT_ROOT)
+from shared.core.prompt_builder import (
+    DEFAULT_CONTENT_PROFILE,
+    extract_operator_overrides,
+    get_content_profile,
+    merge_content_profiles,
+)
+from shared.core.performance_dashboard import (
+    dashboard_compat_stats,
+    load_performance_dashboard,
+)
+from shared.core.quality_log import DEFAULT_QUALITY_LOG_PATH
+from shared.services.performance_store import DEFAULT_PERFORMANCE_DB
+
+ENV_FILE = os.path.join(PROJECT_ROOT, ".env")
 load_dotenv(ENV_FILE)
+
+PERFORMANCE_DB_PATH = os.getenv("PERFORMANCE_DB_PATH", DEFAULT_PERFORMANCE_DB)
+QUALITY_LOG_PATH = os.getenv("QUALITY_LOG_PATH", DEFAULT_QUALITY_LOG_PATH)
 
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
@@ -32,15 +51,73 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+def _running_process_count() -> int:
+    process_names = (
+        "pipeline_process",
+        "fb_pipeline_process",
+        "tiktok_process",
+        "clone_worker_process",
+    )
+    return sum(
+        process is not None and process.poll() is None
+        for name in process_names
+        if (process := globals().get(name)) is not None
+    )
+
+
+def _load_dashboard(**filters):
+    try:
+        return load_performance_dashboard(
+            db_path=PERFORMANCE_DB_PATH,
+            quality_log_path=QUALITY_LOG_PATH,
+            **filters,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@app.get("/api/dashboard/performance")
+def get_dashboard_performance(
+    start_date: str = "",
+    end_date: str = "",
+    channel_id: str = "",
+    measurement_window: str = "",
+    min_samples: int = Query(default=30, ge=1, le=1000),
+):
+    return _load_dashboard(
+        start_date=start_date,
+        end_date=end_date,
+        channel_id=channel_id,
+        measurement_window=measurement_window,
+        min_samples=min_samples,
+    )
+
+
+@app.get("/api/dashboard/pipeline-errors")
+def get_dashboard_pipeline_errors(
+    start_date: str = "",
+    end_date: str = "",
+    channel_id: str = "",
+):
+    dashboard = _load_dashboard(
+        start_date=start_date,
+        end_date=end_date,
+        channel_id=channel_id,
+    )
+    return {
+        "generated_at": dashboard["generated_at"],
+        "filters": dashboard["filters"],
+        "pipeline": dashboard["pipeline"],
+    }
+
+
 @app.get("/api/dashboard/stats")
 def get_dashboard_stats():
-    return {
-        "active_tools": 3,
-        "articles_processed": 142,
-        "facebook_posts": 45,
-        "tiktok_uploads": 12,
-        "system_health": "Good"
-    }
+    dashboard = _load_dashboard()
+    return dashboard_compat_stats(
+        dashboard,
+        active_tools=_running_process_count(),
+    )
 
 @app.get("/api/article/sources")
 def get_article_sources():
@@ -88,95 +165,15 @@ import threading
 pipeline_process = None
 pipeline_logs = ["[Hệ thống] Sẵn sàng khởi động Tool Tin Tức..."]
 
-CONTENT_PROFILE_FIELDS = [
-    "channel_name",
-    "topic",
-    "audience",
-    "content_promise",
-    "primary_goal",
-    "tone_style",
-    "video_length",
-    "format_style",
-    "hook_style",
-    "source_preference",
-    "comment_strategy",
-    "avoid",
-    "winning_examples",
-    "custom_instruction",
-]
-
-DEFAULT_CONTENT_PROFILE = {
-    "channel_name": "",
-    "topic": "",
-    "audience": "",
-    "content_promise": "",
-    "primary_goal": "view",
-    "tone_style": "",
-    "video_length": "30-45s",
-    "format_style": "",
-    "hook_style": "",
-    "source_preference": "",
-    "comment_strategy": "",
-    "avoid": "",
-    "winning_examples": "",
-    "custom_instruction": "",
-}
-
-CHANNEL_CONTENT_PROFILE_DEFAULTS = {
-    "Adsupnews": {
-        "channel_name": "Adsup News - kênh tin tức tổng hợp nhanh, sắc, dễ bàn luận",
-        "topic": "Tin tức tổng hợp đa lĩnh vực từ Facebook, báo và mạng xã hội: xã hội, pháp luật, đời sống, kinh tế, showbiz, thể thao, công nghệ, sức khỏe và các câu chuyện đang được quan tâm.",
-        "audience": "Người Việt 18-45 dùng TikTok/Facebook để nắm tin nhanh; thích nội dung rõ bối cảnh, có tác động thực tế, có chi tiết đáng bàn luận và dễ chia sẻ; không thích đọc lại caption dài hoặc tin chung chung.",
-        "content_promise": "Mỗi video giúp người xem hiểu nhanh: chuyện gì đang xảy ra, vì sao đáng chú ý, chi tiết nào đắt nhất, tác động tới ai và câu hỏi còn bỏ ngỏ.",
-        "primary_goal": "view",
-        "tone_style": "Tin nhanh kiểu TikTok: câu ngắn, nhịp dồn, rõ bối cảnh, trung lập nhưng có góc nhìn biên tập; tạo tò mò bằng chi tiết thật, không giật tít sai sự thật.",
-        "video_length": "45-60s",
-        "format_style": "Cấu trúc mặc định: 1 câu hook mạnh trong 3 giây đầu -> bối cảnh cực ngắn -> 2-3 dữ kiện quan trọng -> vì sao chuyện này đáng chú ý -> kết bằng câu hỏi quan điểm hoặc hệ quả gần người xem.",
-        "hook_style": "Hook phải nêu thẳng sự kiện/nhân vật/tác động chính, ưu tiên chi tiết bất thường, điểm gây tranh luận hoặc hệ quả thực tế. Tránh mở đầu mờ như 'mới đây', 'được biết', 'câu chuyện đang gây xôn xao' nếu chưa nói rõ xôn xao vì điều gì.",
-        "source_preference": "Ưu tiên video có hình ảnh rõ, sự kiện cụ thể, nguồn/caption có dữ kiện kiểm chứng được, có mâu thuẫn, cảm xúc, tác động xã hội hoặc chi tiết khiến người xem muốn xem tiếp. Bỏ qua video chỉ mang tính PR, recap nhạt, thiếu nhân vật/sự kiện trung tâm hoặc không có điểm mới.",
-        "comment_strategy": "Kết tự nhiên bằng một câu hỏi mở, không dẫn dắt quá đà: hỏi quan điểm, hỏi người xem đứng về luồng ý kiến nào, hoặc hỏi tác động gần đời sống. Ví dụ: 'Bạn nghĩ điểm đáng chú ý nhất là gì?', 'Nếu là bạn, bạn sẽ xử lý thế nào?', 'Theo bạn bên nào cần lên tiếng rõ hơn?'.",
-        "avoid": "Không bịa chi tiết, không khẳng định tin chưa kiểm chứng, không kết tội khi chưa có kết luận, không dùng từ kích động/thù ghét, không khai thác bi kịch quá đà, không copy nguyên caption, không nhồi số liệu, không viết như báo giấy dài dòng.",
-        "winning_examples": "Tham chiếu chất lượng theo nhóm kênh tin tức TikTok kiểu Theanh28: hook nhanh, có nhân vật/sự kiện rõ, chọn đúng chi tiết khiến người xem muốn bàn luận. Mẫu hook: 'Chi tiết này mới là điểm khiến nhiều người tranh luận...'; 'Không chỉ là một đoạn clip, vụ này đáng chú ý vì...'; 'Nếu thông tin này được xác nhận, người bị ảnh hưởng nhiều nhất có thể là...'; 'Từ một tình huống nhỏ, câu chuyện đang mở ra 3 vấn đề lớn...'.",
-        "custom_instruction": "Đóng vai biên tập viên tin tức ngắn. Trước khi viết, tự đánh giá video có đáng làm không; chỉ chọn khi có sự kiện cụ thể, hình ảnh rõ, thông tin đủ bám và có lý do để người xem quan tâm. Script_voice phải nói như người dẫn tin TikTok/Facebook: mỗi câu một ý, nhịp nhanh, không lê thê. Hook/on-screen text tối đa khoảng 12-18 từ, ưu tiên rõ ý hơn chơi chữ. Với thông tin chưa chắc chắn, dùng 'theo caption/nguồn/đoạn clip cho thấy' thay vì khẳng định tuyệt đối. Luôn giữ cân bằng giữa hấp dẫn và an toàn pháp lý."
-    }
-}
-
-
-def normalize_content_profile(profile):
-    normalized = dict(DEFAULT_CONTENT_PROFILE)
-    if isinstance(profile, str):
-        if profile.strip():
-            normalized["custom_instruction"] = profile.strip()
-        return normalized
-    if isinstance(profile, dict):
-        for key in CONTENT_PROFILE_FIELDS:
-            value = profile.get(key)
-            if value is not None:
-                normalized[key] = value
-    return normalized
-
-
-def merge_content_profiles(*profiles):
-    merged = dict(DEFAULT_CONTENT_PROFILE)
-    for profile in profiles:
-        if not profile:
-            continue
-        normalized = normalize_content_profile(profile)
-        for key, value in normalized.items():
-            if str(value or "").strip():
-                merged[key] = value
-    return merged
-
-
 def get_synced_content_profile(channel_id: str):
+    """Profile trung tâm cộng override đã lưu, không có default viết cứng tại Hub."""
     clean_id = str(channel_id or "").replace("@", "").strip()
-    preset = CHANNEL_CONTENT_PROFILE_DEFAULTS.get(clean_id, {})
     synced = {}
     try:
         synced = get_tiktok_content_profiles().get(clean_id, {})
     except Exception:
         synced = {}
-    return merge_content_profiles(preset, synced)
+    return get_content_profile(clean_id, synced, include_runtime=False)
 
 
 def read_logs(process):
@@ -532,7 +529,7 @@ def get_tiktok_content_profiles():
 
 def save_tiktok_content_profile(tiktok_id: str, content_profile):
     profiles = get_tiktok_content_profiles()
-    profiles[tiktok_id] = content_profile or {}
+    profiles[tiktok_id] = extract_operator_overrides(tiktok_id, content_profile)
     existing = supabase_client.table("system_configs").select("config_name").eq("config_name", TIKTOK_CONTENT_PROFILES_CONFIG_KEY).execute()
     payload = {"config_value": profiles}
     if existing.data:
@@ -544,8 +541,13 @@ def attach_tiktok_content_profiles(accounts):
     profiles = get_tiktok_content_profiles()
     for account in accounts or []:
         tiktok_id = account.get("tiktok_id")
-        if tiktok_id and not account.get("content_profile") and tiktok_id in profiles:
-            account["content_profile"] = profiles[tiktok_id]
+        if tiktok_id:
+            account["content_profile"] = get_content_profile(
+                tiktok_id,
+                profiles.get(tiktok_id, {}),
+                account.get("content_profile", {}),
+                include_runtime=False,
+            )
     return accounts
 
 tiktok_process = None
@@ -658,7 +660,10 @@ async def save_channel_config(channel_id: str, request: Request):
         data = await request.json()
         content_profile = data.get("content_profile")
         if content_profile is not None and str(channel_id or "").strip():
-            data["content_profile"] = normalize_content_profile(content_profile)
+            data["content_profile"] = extract_operator_overrides(
+                channel_id,
+                content_profile,
+            )
             if supabase_client:
                 save_tiktok_content_profile(channel_id, data["content_profile"])
         with open(config_path, "w", encoding="utf-8") as f:

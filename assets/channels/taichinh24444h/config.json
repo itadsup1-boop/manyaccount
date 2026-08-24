@@ -9,22 +9,5 @@
   "text_stroke": 0,
   "text_font": "RobotoCondensed-Bold.ttf",
   "text_x": 70,
-  "frame_content_disabled": true,
-  "voice_speed": 1.02,
-  "content_profile": {
-    "channel_name": "taichinh24444h - tài chính và kinh tế dễ hiểu",
-    "topic": "Tài chính cá nhân, ngân sách, lãi suất, giá cả, thuế, bất động sản và chính sách kinh tế có tác động thực tế.",
-    "audience": "Người Việt 25-44 tuổi quan tâm thu nhập, chi tiêu, tiết kiệm, công việc và các quyết định tài chính.",
-    "content_promise": "Biến một con số kinh tế thành câu trả lời dễ hiểu: vì sao xảy ra, ai chịu tác động và cần theo dõi điều gì.",
-    "primary_goal": "retention và save",
-    "tone_style": "Điềm tĩnh, đáng tin, phân tích ngắn; nhấn rõ con số nhưng không hô hào hoặc dự đoán chắc chắn.",
-    "video_length": "23-30 giây; tổng hook và script khoảng 70-90 từ.",
-    "format_style": "0-2 giây hiện con số hoặc thay đổi lớn; 2-7 giây giải nghĩa; 7-21 giây nêu nguyên nhân và tác động; phần cuối nói điều cần theo dõi và đặt câu hỏi trải nghiệm.",
-    "hook_style": "Mở thẳng bằng con số, thay đổi giá hoặc nghịch lý cụ thể. Tránh lạm dụng 'ảnh hưởng tới ví tiền của bạn', 'tin này nghe xa' và câu hỏi mơ hồ.",
-    "source_preference": "Ưu tiên tin có số liệu, mốc thời gian, chính sách rõ và tác động tới người dân hoặc doanh nghiệp. Bỏ qua nhận định thị trường không có dữ kiện.",
-    "comment_strategy": "Hỏi một lựa chọn hoặc trải nghiệm cụ thể như khoản chi nào tăng rõ nhất, người xem đang gửi tiết kiệm hay chờ lãi suất.",
-    "avoid": "Không tư vấn mua bán, cam kết lời lỗ, tạo hoảng loạn hoặc bịa số liệu. Không biến mọi chủ đề thành lời khuyên đầu tư.",
-    "winning_examples": "Mẫu hook: '470 nghìn tỷ đang dư, vì sao chưa thể chi?'; 'Lãi suất giảm, người gửi tiền mất bao nhiêu?'; 'Giá nhà tăng nhưng giao dịch lại giảm vì đâu?'.",
-    "custom_instruction": "Cảnh đầu phải hiển thị con số lớn hoặc đối tượng chịu tác động; các cảnh sau ưu tiên biểu đồ đơn giản, tiền, ngân hàng, công trình hoặc hàng hóa đúng dữ kiện. Đọc chắc, ngắt sau con số, không đều đều. Nếu bài chỉ là tin doanh nghiệp PR hoặc không có tác động tài chính rõ, đặt topic_fit=false."
-  }
+  "frame_content_disabled": true
 }

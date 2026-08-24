@@ -4,7 +4,6 @@ import sys
 import time
 import json
 import shutil
-from datetime import datetime
 import concurrent.futures
 import threading
 from urllib.parse import urlsplit, urlunsplit
@@ -21,6 +20,17 @@ from article_ffmpeg import create_article_video
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 from shared.services.tts_api import create_voice_full_pipeline
 from shared.core.channel_editorial import get_channel_voice_speed
+from shared.core.content_repair import (
+    prepare_content_with_single_repair,
+    summarize_validation,
+)
+from shared.core.prompt_builder import get_content_profile
+from shared.core.evidence_guard import guard_evidence, summarize_evidence
+from shared.core.rights_guard import guard_source_rights
+from shared.core.source_ranker import rank_candidates, should_process_candidate
+from shared.core.pipeline_state import PipelineLifecycle, PipelineStageError
+from shared.core.quality_log import append_quality_event
+from shared.core.video_qa import run_video_qa
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 ENV_FILE = os.path.join(PROJECT_ROOT, ".env")
@@ -171,19 +181,25 @@ def _mark_link_local_processed(url: str, source: str = "pipeline"):
     except Exception as e:
         print(f"⚠️ Lỗi lưu local processed links: {e}")
 
-def _append_quality_log(pipeline: str, source_name: str, quality_score: int, status: str, reason: str = ""):
+def _append_quality_log(
+    pipeline: str,
+    source_name: str,
+    quality_score: int,
+    status: str,
+    reason: str = "",
+    **metadata,
+):
     """Ghi 1 dòng JSON vào quality_log.jsonl để Telegram bot đọc báo cáo."""
     try:
-        entry = json.dumps({
-            "ts": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            "pl": pipeline,
-            "src": source_name,
-            "score": quality_score,
-            "st": status,
-            "reason": reason,
-        }, ensure_ascii=False)
-        with open(QUALITY_LOG_PATH, "a", encoding="utf-8") as f:
-            f.write(entry + "\n")
+        append_quality_event(
+            pipeline,
+            source_name,
+            quality_score,
+            status,
+            reason,
+            log_path=QUALITY_LOG_PATH,
+            **metadata,
+        )
     except Exception:
         pass
 
@@ -232,39 +248,89 @@ class ArticlePipelineCore:
             
             print(f"\n[KÊNH {id_tiktok}] 📡 Quét danh mục: {category_url}")
             
-            # Lấy 20 bài báo mới nhất
-            links = self.cat_crawler.get_latest_articles(category_url, max_links=20)
-            if not links:
+            # Lấy metadata nhẹ của 20 bài để xếp hạng trước khi crawl/AI.
+            candidates = self.cat_crawler.get_latest_article_candidates(
+                category_url,
+                max_links=20,
+            )
+            if not candidates:
                 print(f"[KÊNH {id_tiktok}] ⚠️ Không tìm thấy bài báo nào trong danh mục.")
                 continue
-                
-            links_to_process = []
+
+            batch_urls = []
+            handled_urls = set()
+            eligible_candidates = []
             normalized_last_article_url = _normalize_article_url(last_article_url)
-            for link in links:
+            for candidate in candidates:
+                link = candidate.get("url", "")
                 normalized_link = _normalize_article_url(link)
                 if normalized_link and normalized_link == normalized_last_article_url:
                     break
+                if not normalized_link:
+                    continue
+                batch_urls.append(normalized_link)
                 if self._is_article_processed(normalized_link):
                     print(f"[KÊNH {id_tiktok}] ⏭️ Bỏ qua link đã tồn tại: {normalized_link}")
+                    handled_urls.add(normalized_link)
                     continue
-                reserved_link = _reserve_article_link(normalized_link)
-                if not reserved_link:
-                    print(f"[KÊNH {id_tiktok}] ⏭️ Bỏ qua link đang được luồng khác xử lý: {normalized_link}")
+                eligible_candidates.append(candidate)
+
+            editorial_profile = get_content_profile(id_tiktok)
+            ranked_candidates = rank_candidates(
+                eligible_candidates,
+                editorial_profile,
+                source_type="article",
+            )
+            links_to_process = []
+            for candidate in ranked_candidates:
+                link = candidate.get("url", "")
+                source_rank = candidate.get("source_rank", {})
+                if not should_process_candidate(candidate):
+                    print(
+                        f"[KÊNH {id_tiktok}] ⏭️ SourceRanker loại bài "
+                        f"{source_rank.get('total_score', 0)}/100: {link}"
+                    )
+                    handled_urls.add(_normalize_article_url(link))
                     continue
-                links_to_process.append((link, reserved_link))
+                rights = guard_source_rights(candidate, source)
+                if not rights.passed:
+                    print(
+                        f"[KÊNH {id_tiktok}] ⛔ RightsGuard chặn nguồn: "
+                        f"{' '.join(rights.errors)}"
+                    )
+                    handled_urls.add(_normalize_article_url(link))
+                    continue
+                if rights.requires_review:
+                    print(
+                        f"[KÊNH {id_tiktok}] ⚠️ RightsGuard: "
+                        f"{' '.join(rights.warnings)}"
+                    )
+                links_to_process.append(candidate)
                 
-            if not links_to_process:
-                print(f"[KÊNH {id_tiktok}] ✅ Không có bài báo mới (Đã làm đến bài mới nhất rồi).")
-                continue
-                
-            # Đảo ngược danh sách để xử lý bài cũ nhất trước, bài mới nhất sau cùng
-            # Để nếu có lỗi giữa chừng, lần sau chạy lại không bị bỏ sót.
-            links_to_process.reverse()
+            if links_to_process:
+                print(
+                    f"[KÊNH {id_tiktok}] 🔥 SourceRanker chọn "
+                    f"{len(links_to_process)} bài; xử lý điểm cao trước."
+                )
+            else:
+                print(f"[KÊNH {id_tiktok}] ✅ Không còn bài cần sản xuất trong batch.")
             
-            print(f"[KÊNH {id_tiktok}] 🔥 Tìm thấy {len(links_to_process)} bài báo mới chưa làm! Sẽ xử lý lần lượt...")
-            
-            for article_url, processed_url in links_to_process:
+            for candidate in links_to_process:
+                article_url = candidate["url"]
+                source_rank = candidate.get("source_rank", {})
+                processed_url = _reserve_article_link(article_url)
+                if not processed_url:
+                    print(
+                        f"[KÊNH {id_tiktok}] ⏭️ Bỏ qua link đang được "
+                        f"luồng khác xử lý: {_normalize_article_url(article_url)}"
+                    )
+                    continue
                 print(f"\n[KÊNH {id_tiktok}] 🕷️ Đang xử lý: {article_url}")
+                print(
+                    f"[KÊNH {id_tiktok}] 🧭 SourceRanker: "
+                    f"{source_rank.get('total_score', 0)}/100 "
+                    f"({source_rank.get('status', 'unscored')})"
+                )
                 try:
                     if self._is_article_processed(processed_url):
                         print(f"[KÊNH {id_tiktok}] ⏭️ Link vừa được lưu bởi tiến trình khác, bỏ qua: {processed_url}")
@@ -276,15 +342,36 @@ class ArticlePipelineCore:
                         print(f"[KÊNH {id_tiktok}] ❌ Xử lý thất bại bài {article_url}. Dừng xử lý danh mục này để tránh lọt bài.")
                         break # Break để lần sau chạy lại từ bài này
                     else:
-                        # Cập nhật DB (processed_links & last_article_url) ngay khi xử lý thành công 1 bài
+                        # Lưu chống trùng ngay; checkpoint danh mục cập nhật sau cả batch.
                         try:
                             self._mark_article_processed(processed_url)
-                            supabase_client.table("article_sources").update({"last_article_url": processed_url}).eq("id", sid).execute()
-                            print(f"[KÊNH {id_tiktok}] ✅ Đã lưu link đã làm và cập nhật mốc bài báo: {processed_url}")
+                            handled_urls.add(processed_url)
+                            print(f"[KÊNH {id_tiktok}] ✅ Đã lưu link đã xử lý: {processed_url}")
                         except Exception as e:
                             print(f"[KÊNH {id_tiktok}] ⚠️ Lỗi cập nhật DB: {e}")
                 finally:
                     _release_article_link(processed_url)
+
+            batch_fully_handled = batch_urls and all(
+                url in handled_urls for url in batch_urls
+            )
+            if batch_fully_handled:
+                safe_checkpoint = batch_urls[0]
+                try:
+                    supabase_client.table("article_sources").update({
+                        "last_article_url": safe_checkpoint,
+                    }).eq("id", sid).execute()
+                    print(
+                        f"[KÊNH {id_tiktok}] ☁️ Batch hoàn tất, cập nhật "
+                        f"last_article_url an toàn: {safe_checkpoint}"
+                    )
+                except Exception as e:
+                    print(f"[KÊNH {id_tiktok}] ⚠️ Lỗi cập nhật checkpoint: {e}")
+            elif batch_urls:
+                print(
+                    f"[KÊNH {id_tiktok}] 📥 Giữ nguyên last_article_url vì "
+                    f"batch còn bài chưa xử lý."
+                )
                         
             print(f"[KÊNH {id_tiktok}] 🏁 Hoàn thành danh mục: {category_url}. Chuyển sang danh mục tiếp theo...")
             
@@ -297,18 +384,63 @@ class ArticlePipelineCore:
             return True
 
         job_dir = os.path.join(self.temp_dir, f"article_{int(time.time())}_{id_tiktok}")
+        lifecycle = PipelineLifecycle("article", article_url)
+        quality_score = 0
+        qa_result = None
         try:
             # 1. Cào nội dung & Ảnh của bài báo
             article_data = self.art_crawler.crawl(article_url, job_dir)
             if not article_data:
-                print(f"   [KÊNH {id_tiktok}] ❌ Không cào được nội dung bài báo.")
-                return False
+                raise PipelineStageError(
+                    "selected", "ARTICLE_CRAWL_FAILED",
+                    "Không cào được nội dung bài báo.",
+                )
                 
             # 2. Gửi nội dung cho AI phân tích qua ChatGPT
             ai_result = analyze_article_with_chatgpt(article_url, id_tiktok)
             if not ai_result:
-                print(f"   [KÊNH {id_tiktok}] ❌ AI phân tích thất bại.")
-                return False
+                raise PipelineStageError(
+                    "scripted", "SCRIPT_GENERATION_FAILED",
+                    "AI phân tích thất bại.",
+                )
+            lifecycle.advance("scripted")
+
+            editorial_profile = get_content_profile(id_tiktok)
+            prepared_content = prepare_content_with_single_repair(
+                ai_result,
+                source_type="article",
+                channel_id=id_tiktok,
+                source_url=article_url,
+                profile=editorial_profile,
+                repair_callback=lambda instruction: analyze_article_with_chatgpt(
+                    article_url,
+                    id_tiktok,
+                    repair_instruction=instruction,
+                ),
+            )
+            ai_result = prepared_content.content
+            if prepared_content.repair_attempts:
+                repair_status = "đạt" if prepared_content.repaired else "chưa đạt"
+                print(
+                    f"   [KÊNH {id_tiktok}] 🔧 Đã sửa kịch bản 1 lần: "
+                    f"{repair_status}."
+                )
+
+            should_make_video = ai_result.get("should_make_video", True)
+            if str(should_make_video).lower() == "false" or not should_make_video:
+                skip_reason = ai_result.get("skip_reason", "")
+                print(
+                    f"   [KÊNH {id_tiktok}] ⏭️ AI đánh giá không nên làm "
+                    f"video này. {skip_reason}"
+                )
+                _append_quality_log(
+                    "article",
+                    id_tiktok,
+                    int(ai_result.get("quality_score", 0)),
+                    "skip",
+                    skip_reason,
+                )
+                return True
 
             topic_fit = ai_result.get("topic_fit", True)
             if str(topic_fit).lower() == "false" or not topic_fit:
@@ -316,6 +448,54 @@ class ArticlePipelineCore:
                 print(f"   [KÊNH {id_tiktok}] ⏭️ Bài không đúng định vị kênh → bỏ qua. {topic_fit_reason}")
                 _append_quality_log("article", id_tiktok, int(ai_result.get("quality_score", 0)), "skip", topic_fit_reason)
                 return True
+
+            if not prepared_content.report.passed:
+                validation_reason = summarize_validation(prepared_content.report)
+                print(
+                    f"   [KÊNH {id_tiktok}] ⏭️ ContentValidator không đạt "
+                    f"→ bỏ qua. {validation_reason}"
+                )
+                _append_quality_log(
+                    "article",
+                    id_tiktok,
+                    int(ai_result.get("quality_score", 0)),
+                    "skip",
+                    validation_reason,
+                )
+                return True
+            print(
+                f"   [KÊNH {id_tiktok}] ✅ ContentValidator: "
+                f"{prepared_content.report.content_score}/100"
+            )
+
+            evidence_report = guard_evidence(
+                ai_result,
+                source_type="article",
+                source_url=article_url,
+                source_text=" ".join(
+                    str(value or "")
+                    for value in (article_data.get("title"), article_data.get("content"))
+                ),
+                profile=editorial_profile,
+            )
+            if not evidence_report.passed:
+                evidence_reason = summarize_evidence(evidence_report)
+                print(
+                    f"   [KÊNH {id_tiktok}] ⏭️ EvidenceGuard không đạt "
+                    f"→ bỏ qua. {evidence_reason}"
+                )
+                _append_quality_log(
+                    "article",
+                    id_tiktok,
+                    int(ai_result.get("quality_score", 0)),
+                    "skip",
+                    evidence_reason,
+                )
+                return True
+            print(
+                f"   [KÊNH {id_tiktok}] ✅ EvidenceGuard: "
+                f"{evidence_report.score}/100"
+            )
 
             # Quality gate: bỏ qua bài báo chất lượng thấp (trả True để advance checkpoint)
             quality_score = int(ai_result.get("quality_score", 5))
@@ -326,7 +506,11 @@ class ArticlePipelineCore:
                 _append_quality_log("article", id_tiktok, quality_score, "skip", skip_reason)
                 return True
             print(f"   [KÊNH {id_tiktok}] ✅ Quality score: {quality_score}/10")
-            _append_quality_log("article", id_tiktok, quality_score, "done")
+            lifecycle.advance("validated")
+            _append_quality_log(
+                "article", id_tiktok, quality_score, "validated",
+                stage="validated", item_id=article_url,
+            )
 
             # 3. Gom ảnh gốc & Tìm thêm ảnh
             # Giữ ảnh lead vì thường là ảnh đúng nhân vật/sự kiện nhất.
@@ -349,8 +533,10 @@ class ArticlePipelineCore:
                     downloaded_imgs.extend(extra_imgs)
             
             if not downloaded_imgs:
-                print(f"   [KÊNH {id_tiktok}] ❌ Không tìm được ảnh nào (cả từ bài báo lẫn DuckDuckGo). Bỏ qua bài này.")
-                return False
+                raise PipelineStageError(
+                    "rendered", "MEDIA_ASSETS_MISSING",
+                    "Không tìm được ảnh phù hợp để dựng video.",
+                )
             
             print(f"   [KÊNH {id_tiktok}] 📸 Tổng số ảnh để làm video: {len(downloaded_imgs)}, Số video: {len(downloaded_videos)}")
             
@@ -360,8 +546,16 @@ class ArticlePipelineCore:
             script_text = ai_result.get('script_voice', '')
             
             tone = ai_result.get("tone", "Trung tính")
+            music_mood = ai_result.get("music_mood")
+            music_energy = ai_result.get("music_energy", 2)
+            is_sensitive = ai_result.get("is_sensitive", False)
             channel_voice_id = VOICE_PROFILE_ID
-            channel_voice_speed = get_channel_voice_speed(id_tiktok)
+            channel_voice_speed = get_channel_voice_speed(
+                id_tiktok,
+                story_type=ai_result.get("story_type", ""),
+                tone=tone,
+                is_sensitive=bool(is_sensitive),
+            )
             try:
                 channel_dir = os.path.join(PROJECT_ROOT, "assets", "channels", id_tiktok)
                 voice_cfg_path = os.path.join(channel_dir, "voice_config.json")
@@ -397,36 +591,96 @@ class ArticlePipelineCore:
                         script_text, job_dir, "script_voice.wav", channel_voice_id, speed=channel_voice_speed
                     )
             except Exception as e:
-                print(f"   [KÊNH {id_tiktok}] ⚠️ Lỗi sinh Voice: {e}")
-                return False
+                raise PipelineStageError(
+                    "voiced", "TTS_FAILED", f"Lỗi sinh voice: {e}",
+                ) from e
                 
             # 5. Dựng Video
             if not downloaded_imgs or (not voice_hook_path and not voice_script_path):
-                print(f"   [KÊNH {id_tiktok}] ⚠️ Thiếu ảnh hoặc voice, hủy dựng video.")
-                return False
+                raise PipelineStageError(
+                    "voiced", "TTS_FAILED", "Thiếu ảnh hoặc voice để dựng video.",
+                )
+            lifecycle.advance("voiced")
                 
             print(f"   [KÊNH {id_tiktok}] 🎬 Đang dựng FFmpeg...")
             output_video_path = os.path.join(job_dir, f"final_{id_tiktok}_{int(time.time())}.mp4")
             
             # Nếu có video gốc từ báo, truyền video đầu tiên vào (nếu có nhiều lấy 1)
             appended_video_path = downloaded_videos[0] if downloaded_videos else None
-            create_article_video(id_tiktok, downloaded_imgs, voice_hook_path, voice_script_path, output_video_path, hook_text, appended_video_path, tone, script_text=script_text)
+            try:
+                create_article_video(
+                    id_tiktok=id_tiktok,
+                    image_paths=downloaded_imgs,
+                    hook_voice_path=voice_hook_path,
+                    script_voice_path=voice_script_path,
+                    output_path=output_video_path,
+                    hook_text=hook_text,
+                    appended_video_path=appended_video_path,
+                    tone=tone,
+                    script_text=script_text,
+                    music_mood=music_mood,
+                    music_energy=music_energy,
+                    is_sensitive=is_sensitive,
+                    beats=ai_result.get("beats"),
+                    subtitle_style=ai_result.get(
+                        "subtitle_style", "keyword_highlight",
+                    ),
+                )
+            except Exception as error:
+                raise PipelineStageError(
+                    "rendered", "RENDER_FAILED", f"Render FFmpeg lỗi: {error}",
+                ) from error
+
+            if not os.path.exists(output_video_path):
+                raise PipelineStageError(
+                    "rendered", "RENDER_FAILED",
+                    "Render FFmpeg không tạo ra file MP4.",
+                )
+            lifecycle.advance("rendered")
+
+            subtitle_ass_path = output_video_path.replace(".mp4", "_body.ass")
+            qa_result = run_video_qa(
+                output_video_path,
+                subtitle_ass_path=(
+                    subtitle_ass_path if os.path.exists(subtitle_ass_path) else ""
+                ),
+                watermark_detected=bool(article_data.get("watermark_detected")),
+            )
+            if not qa_result.passed:
+                raise PipelineStageError(
+                    "qa_passed",
+                    qa_result.error_code or "VIDEO_QA_FAILED",
+                    "VideoQA chặn upload: " + ", ".join(qa_result.blocking_errors),
+                )
+            lifecycle.advance("qa_passed")
+            _append_quality_log(
+                "article", id_tiktok, quality_score, "qa_passed",
+                stage="qa_passed", item_id=article_url,
+                qa=qa_result.to_dict(),
+            )
             
             # 6. Upload & Lưu Google Sheet
             drive_link = None
-            if os.path.exists(output_video_path):
-                print(f"   [KÊNH {id_tiktok}] ☁️ Đang upload Google Drive...")
-                try:
-                    from shared.modules.upload_drive import upload_video_to_drive
-                    gdrive_folder_id = ENV.get("DRIVE_FOLDER_ID", ENV.get("GDRIVE_FOLDER_ID", "1VgkkbUJ82kxzWXJH8cfn7UFMMFBKQkzS"))
-                    drive_link = upload_video_to_drive(output_video_path, gdrive_folder_id)
-                    print(f"   [KÊNH {id_tiktok}] ✅ Upload xong: {drive_link}")
-                except Exception as e:
-                    print(f"   [KÊNH {id_tiktok}] ⚠️ Lỗi upload Drive: {e}")
-                    return False
-            else:
-                print(f"   [KÊNH {id_tiktok}] ⚠️ Render FFmpeg thất bại, không ra file mp4.")
-                return False
+            print(f"   [KÊNH {id_tiktok}] ☁️ Đang upload Google Drive...")
+            try:
+                from shared.modules.upload_drive import upload_video_to_drive
+                gdrive_folder_id = ENV.get("DRIVE_FOLDER_ID", ENV.get("GDRIVE_FOLDER_ID", "1VgkkbUJ82kxzWXJH8cfn7UFMMFBKQkzS"))
+                drive_link = upload_video_to_drive(output_video_path, gdrive_folder_id)
+            except Exception as error:
+                raise PipelineStageError(
+                    "uploaded", "UPLOAD_FAILED", f"Lỗi upload Drive: {error}",
+                ) from error
+            if not drive_link:
+                raise PipelineStageError(
+                    "uploaded", "UPLOAD_FAILED", "Google Drive trả về link rỗng.",
+                )
+            lifecycle.advance("uploaded")
+            _append_quality_log(
+                "article", id_tiktok, quality_score, "uploaded",
+                stage="uploaded", item_id=article_url,
+                qa=qa_result.to_dict(),
+            )
+            print(f"   [KÊNH {id_tiktok}] ✅ Upload xong: {drive_link}")
                 
             if drive_link:
                 print(f"   [KÊNH {id_tiktok}] 📊 Ghi Sheet...")
@@ -440,8 +694,25 @@ class ArticlePipelineCore:
                     except Exception as e:
                         print(f"   [KÊNH {id_tiktok}] ⚠️ Lỗi ghi link Drive: {e}")
                 return True
-            return False
+            raise PipelineStageError(
+                "uploaded", "UPLOAD_FAILED", "Không có link Drive sau upload.",
+            )
 
+        except Exception as error:
+            failure = lifecycle.fail_from_exception(error)
+            _append_quality_log(
+                "article", id_tiktok, quality_score, "failed",
+                stage=failure.stage, item_id=article_url,
+                error_code=failure.error_code,
+                retryable=failure.retryable,
+                message=failure.message,
+                qa=qa_result.to_dict() if qa_result else None,
+            )
+            print(
+                f"   [KÊNH {id_tiktok}] ❌ {failure.error_code} "
+                f"({failure.stage}): {failure.message}"
+            )
+            return False
         finally:
             self._cleanup_job(job_dir)
 

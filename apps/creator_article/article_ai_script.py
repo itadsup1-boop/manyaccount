@@ -4,7 +4,14 @@ import sys
 import json
 import re
 
-CONFIG_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "config")
+PROJECT_ROOT = os.path.dirname(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+)
+sys.path.insert(0, PROJECT_ROOT)
+from shared.core.experiment_manager import apply_experiment_metadata
+from shared.core.prompt_builder import build_prompt, resolve_prompt_experiment
+
+CONFIG_DIR = os.path.join(PROJECT_ROOT, "config", "prompts")
 PROMPT_FILE = os.path.join(CONFIG_DIR, "prompt_article.txt")
 
 def load_prompt() -> str:
@@ -23,7 +30,12 @@ Yêu cầu trả về chuẩn định dạng JSON, TUYỆT ĐỐI không có vă
 }
 Chú ý: Biến image_prompts là mảng chứa các câu tiếng Việt miêu tả các bức ảnh để công cụ tự động lên mạng tìm ảnh minh họa."""
 
-def analyze_article_with_ai(article_text: str, id_tiktok: str, api_key: str) -> dict | None:
+def analyze_article_with_ai(
+    article_text: str,
+    id_tiktok: str,
+    api_key: str,
+    repair_instruction: str = "",
+) -> dict | None:
     try:
         import google.generativeai as genai
     except ImportError:
@@ -36,18 +48,30 @@ def analyze_article_with_ai(article_text: str, id_tiktok: str, api_key: str) -> 
 
     genai.configure(api_key=api_key)
     
-    prompt = load_prompt()
     user_message = f"""BÀI BÁO:
 {article_text}
 
 Hãy xử lý và BẮT BUỘC trả về JSON, và BẮT BUỘC thêm trường "id_tiktok": "{id_tiktok}" vào trong JSON kết quả của bạn!"""
+    experiment_assignment = resolve_prompt_experiment(
+        id_tiktok,
+        source_type="article",
+        task_input=user_message,
+    )
+    prompt = build_prompt(
+        load_prompt(),
+        id_tiktok,
+        source_type="article",
+        task_input=user_message,
+        repair_instruction=repair_instruction,
+        experiment_assignment=experiment_assignment,
+    )
 
     model = genai.GenerativeModel("gemini-2.0-flash")
 
     print(f"      🤖 Gửi bài báo cho AI xử lý...")
     try:
         response = model.generate_content(
-            [prompt + "\n\n" + user_message],
+            [prompt],
             generation_config=genai.GenerationConfig(
                 temperature=0.7,
                 max_output_tokens=2048,
@@ -59,7 +83,10 @@ Hãy xử lý và BẮT BUỘC trả về JSON, và BẮT BUỘC thêm trường
         raw_text = re.sub(r'\s*```$', '', raw_text)
         raw_text = raw_text.strip()
 
-        result = json.loads(raw_text)
+        result = apply_experiment_metadata(
+            json.loads(raw_text),
+            experiment_assignment,
+        )
         
         # Ép cứng id_tiktok nếu AI quên
         result["id_tiktok"] = id_tiktok

@@ -1,6 +1,8 @@
+import re
+from urllib.parse import urljoin
+
 import requests
 from bs4 import BeautifulSoup
-from urllib.parse import urljoin
 
 class CategoryCrawler:
     def __init__(self):
@@ -8,15 +10,15 @@ class CategoryCrawler:
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
         }
 
-    def get_latest_articles(self, category_url: str, max_links=5) -> list:
+    def get_latest_article_candidates(self, category_url: str, max_links=5) -> list:
+        """Return article URLs with free listing metadata for pre-AI ranking."""
         print(f"📡 Đang quét danh mục: {category_url}")
         try:
             res = requests.get(category_url, headers=self.headers, timeout=15)
             res.raise_for_status()
             soup = BeautifulSoup(res.text, "html.parser")
             
-            article_links = []
-            import re
+            candidates_by_url = {}
             
             # Ưu tiên tìm trong thẻ <article> (chuẩn báo chí)
             containers = soup.find_all("article")
@@ -60,15 +62,47 @@ class CategoryCrawler:
                         is_article = True
                         
                     if is_article:
-                        if full_url not in article_links:
-                            article_links.append(full_url)
+                        title = " ".join(a_tag.get_text(" ", strip=True).split())
+                        if not title:
+                            title = str(a_tag.get("title") or "").strip()
+                        if not title and a_tag.find("img"):
+                            title = str(a_tag.find("img").get("alt") or "").strip()
+                        context_node = a_tag.find_parent(["article", "li", "div"])
+                        context_node = context_node or element
+                        container_text = " ".join(
+                            context_node.get_text(" ", strip=True).split()
+                        )
+                        description = container_text[:500] if container_text != title else ""
+                        has_image = bool(a_tag.find("img") or element.find("img"))
+                        existing = candidates_by_url.get(full_url)
+                        if existing:
+                            if len(title) > len(existing.get("title", "")):
+                                existing["title"] = title
+                            if len(description) > len(existing.get("description", "")):
+                                existing["description"] = description
+                            existing["has_image"] = existing.get("has_image") or has_image
+                            continue
+                        candidates_by_url[full_url] = {
+                            "url": full_url,
+                            "title": title,
+                            "description": description,
+                            "has_image": has_image,
+                            "position": len(candidates_by_url),
+                        }
                         
             # Lấy số bài báo mới nhất theo yêu cầu
-            return article_links[:max_links]
+            return list(candidates_by_url.values())[:max_links]
             
         except Exception as e:
             print(f"❌ Lỗi quét danh mục {category_url}: {e}")
             return []
+
+    def get_latest_articles(self, category_url: str, max_links=5) -> list:
+        """Backward-compatible URL-only API."""
+        return [
+            item["url"]
+            for item in self.get_latest_article_candidates(category_url, max_links)
+        ]
 
 if __name__ == "__main__":
     crawler = CategoryCrawler()

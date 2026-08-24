@@ -4,11 +4,24 @@ import requests
 import shutil
 import json
 import ffmpeg
-import random
 import logging
-import textwrap
 import uuid
+import subprocess
 from datetime import datetime
+
+from shared.services.music_selector import build_ducked_mix_filter, select_music
+from shared.core.beat_timeline import plan_beat_timeline
+from shared.services.audio_director import plan_audio_cues
+from shared.core.video_encoding import (
+    final_output_args,
+    resolve_color_grade,
+)
+from shared.core.safe_zone import plan_text_layout
+from shared.modules.subtitle_renderer import (
+    generate_text_ass,
+    generate_word_ass,
+    get_subtitle_preset,
+)
 
 # ==============================================================================
 # 0. SETUP MÔI TRƯỜNG
@@ -74,14 +87,6 @@ def get_media_duration(file_path):
         probe = ffmpeg.probe(file_path)
         return float(probe['format']['duration'])
     except: return 0.0
-
-def wrap_text_ffmpeg(text, font_size, max_width_px):
-    if not text: return []
-    avg_char_width = font_size * 0.55
-    if avg_char_width <= 0: avg_char_width = 10
-    max_chars_per_line = int(max_width_px / avg_char_width)
-    if max_chars_per_line < 1: max_chars_per_line = 1
-    return textwrap.wrap(text, width=max_chars_per_line)
 
 def normalize_url(url):
     if not url: return ""
@@ -158,8 +163,7 @@ def render_segment_to_file(video_filename, audio_filename, output_filename, sett
         if s_start < 0: s_start = 0.0
         
     if total_video_duration > 0 and s_start >= total_video_duration:
-        print(f"⚠️ Cảnh báo: Thời gian bắt đầu ({s_start}s) lớn hơn tổng độ dài video ({total_video_duration}s). Tự động trả về 0s.")
-        s_start = 0.0
+        s_start = s_start % total_video_duration
 
     raw_end = settings.get("source_end", "auto")
     real_end = None
@@ -172,9 +176,19 @@ def render_segment_to_file(video_filename, audio_filename, output_filename, sett
         if real_end <= s_start: 
             real_end = None
 
-    if audio_filename == video_filename:
+    audio_start = max(0.0, float(settings.get("audio_start", 0) or 0))
+    audio_end_raw = settings.get("audio_end")
+    audio_end = float(audio_end_raw) if audio_end_raw is not None else None
+    duration_override = float(settings.get("duration_override", 0) or 0)
+
+    if duration_override > 0:
+        duration_audio = duration_override
+        real_end = s_start + duration_override
+    elif audio_filename == video_filename:
         duration_audio = (real_end - s_start) if real_end else (total_video_duration - s_start)
         if duration_audio <= 0: duration_audio = 5.0
+    elif audio_end is not None and audio_end > audio_start:
+        duration_audio = audio_end - audio_start
     else:
         duration_audio = get_media_duration(audio_filename)
 
@@ -187,13 +201,10 @@ def render_segment_to_file(video_filename, audio_filename, output_filename, sett
                 if os.path.exists(f): font_file_clean = f; break
 
     zoom = float(settings.get("zoom_factor", 1.0))
-
-    video_speed = random.uniform(0.95, 1.05)
-    k1_distort = random.uniform(-0.03, 0.03)
-    k2_distort = random.uniform(-0.03, 0.03)
-    contrast_val = random.uniform(1.0, 1.1)
-    brightness_val = random.uniform(-0.02, 0.02)
-    saturation_val = random.uniform(0.9, 1.2)
+    raw_grade = dict(settings.get("_color_grade") or {})
+    if raw_grade.get("name") and not raw_grade.get("grading_preset"):
+        raw_grade["grading_preset"] = raw_grade["name"]
+    color_grade = resolve_color_grade(video_style=raw_grade)
 
     v_in = ffmpeg.input(video_filename).video
     a_in = ffmpeg.input(audio_filename).audio
@@ -204,6 +215,11 @@ def render_segment_to_file(video_filename, audio_filename, output_filename, sett
         else:
             a_in = a_in.filter('atrim', start=s_start)
         a_in = a_in.filter('asetpts', 'PTS-STARTPTS')
+    elif audio_start > 0 or audio_end is not None:
+        trim_kwargs = {"start": audio_start}
+        if audio_end is not None and audio_end > audio_start:
+            trim_kwargs["end"] = audio_end
+        a_in = a_in.filter("atrim", **trim_kwargs).filter("asetpts", "PTS-STARTPTS")
 
     if real_end:
         v = v_in.filter('trim', start=s_start, end=real_end)
@@ -248,8 +264,6 @@ def render_segment_to_file(video_filename, audio_filename, output_filename, sett
     except Exception as _le:
         print(f"   ⚠️ Lỗi auto-blur logo: {_le}")
 
-    v = v.filter('setpts', f'PTS/{video_speed}')
-
     target_w = 1080
     scaled_w = int(target_w * zoom)
     if scaled_w % 2 != 0: scaled_w += 1
@@ -280,14 +294,36 @@ def render_segment_to_file(video_filename, audio_filename, output_filename, sett
         bg = v_bg.filter('scale', 1080, 1920, force_original_aspect_ratio='increase').filter('crop', 1080, 1920).filter('boxblur', luma_radius=40, luma_power=2)
         
         v_main = v_main.filter('scale', width=scaled_w, height=-2)
-        v_main = v_main.filter('lenscorrection', k1=k1_distort, k2=k2_distort)
-        v_main = v_main.filter('eq', contrast=contrast_val, brightness=brightness_val, saturation=saturation_val)
+        v_main = v_main.filter(
+            'eq',
+            contrast=color_grade.contrast,
+            brightness=color_grade.brightness,
+            saturation=color_grade.saturation,
+        )
+        if color_grade.sharpen > 0:
+            v_main = v_main.filter(
+                'unsharp',
+                luma_msize_x=5,
+                luma_msize_y=5,
+                luma_amount=color_grade.sharpen,
+            )
         
         v = ffmpeg.overlay(bg, v_main, x=x_expr, y=y_expr, shortest=1)
     else:
         v = v.filter('scale', width=scaled_w, height=-2)
-        v = v.filter('lenscorrection', k1=k1_distort, k2=k2_distort)
-        v = v.filter('eq', contrast=contrast_val, brightness=brightness_val, saturation=saturation_val)
+        v = v.filter(
+            'eq',
+            contrast=color_grade.contrast,
+            brightness=color_grade.brightness,
+            saturation=color_grade.saturation,
+        )
+        if color_grade.sharpen > 0:
+            v = v.filter(
+                'unsharp',
+                luma_msize_x=5,
+                luma_msize_y=5,
+                luma_amount=color_grade.sharpen,
+            )
         bg = ffmpeg.input(f'color=c=black:s=1080x1920:d={duration_audio}', f='lavfi')
         v = ffmpeg.overlay(bg, v, x=x_expr, y=y_expr, shortest=1)
 
@@ -314,44 +350,51 @@ def render_segment_to_file(video_filename, audio_filename, output_filename, sett
         y_start_pct = float(text_settings.get("box_y_start", 0.7))
         max_text_width = int(1080 * box_w_pct)
         safe_text = str(text_content).replace("'", "").replace(":", "").replace("%", "").strip().upper()
-        wrapped_lines = wrap_text_ffmpeg(safe_text, f_size, max_text_width)
+        layout = plan_text_layout(
+            safe_text,
+            font_size=f_size,
+            preferred_y=int(1920 * y_start_pct),
+            max_width=max_text_width,
+        )
 
-        start_y_px = 1920 * y_start_pct
-        line_spacing_px = f_size * 1.2
-
-        for i, line in enumerate(wrapped_lines):
-            current_line_y = start_y_px + (i * line_spacing_px)
+        for i, line in enumerate(layout.lines):
+            current_line_y = layout.y + (i * layout.line_spacing)
             v = v.drawtext(
                 text=line, fontfile=font_file_clean, fontsize=f_size,
                 fontcolor=t_color, borderw=border_w, bordercolor="black",
                 shadowcolor="black", shadowx=2, shadowy=2,
-                x='(w-text_w)/2', y=str(current_line_y), fix_bounds=True
+                x=str(layout.x), y=str(current_line_y), fix_bounds=True
             )
-    # Map audio
-    import glob
-    def _get_random_bgm(tone_name):
-        bgm_dir = os.path.join(PROJECT_ROOT, "assets", "bgm")
-        if not os.path.exists(bgm_dir): return None
-        safe_tone = tone_name.lower().replace(" ", "_").replace("à", "a").replace("á", "a").replace("ẹ", "e").replace("ể", "e").replace("ồ", "o").replace("ộ", "o").replace("ị", "i").replace("í", "i").replace("ũ", "u").capitalize()
-        files = glob.glob(os.path.join(bgm_dir, f"{safe_tone}_*.mp3")) + glob.glob(os.path.join(bgm_dir, f"{safe_tone}_*.wav"))
-        if not files:
-            files = glob.glob(os.path.join(bgm_dir, "*.mp3")) + glob.glob(os.path.join(bgm_dir, "*.wav"))
-        return random.choice(files) if files else None
-
-    bgm_path = _get_random_bgm(tone)
-    if bgm_path:
-        bgm_in = ffmpeg.input(bgm_path, stream_loop=-1)
-        a_main = a_in.filter('volume', volume=1.0)
-        a_bgm = bgm_in.filter('volume', volume=0.06)
-        a_out = ffmpeg.filter([a_main, a_bgm], 'amix', inputs=2, duration='first', dropout_transition=2)
-        a_out = a_out.filter('loudnorm', I=-14, LRA=11, TP=-1.5)
-    else:
-        a_out = a_in.filter('volume', volume=1.0).filter('loudnorm', I=-14, LRA=11, TP=-1.5)
+    # Intermediate giữ audio lossless. Loudness, BGM và SFX chỉ xử lý một lần
+    # trong lần encode final sau khi concat.
+    a_out = (
+        a_in
+        .filter('aresample', 48000)
+        .filter('aformat', sample_rates=48000, channel_layouts='stereo')
+    )
 
     try:
         (
             ffmpeg
-            .output(v, a_out, output_filename, t=duration_audio, r=30, vcodec='libx264', acodec='aac', pix_fmt='yuv420p', preset='ultrafast')
+            .output(
+                v,
+                a_out,
+                output_filename,
+                t=duration_audio,
+                r=30,
+                fps_mode='cfr',
+                vcodec='libx264',
+                preset='fast',
+                crf=0,
+                pix_fmt='yuv420p',
+                g=60,
+                keyint_min=60,
+                acodec='flac',
+                ar=48000,
+                ac=2,
+                format='matroska',
+                map_metadata=-1,
+            )
             .overwrite_output()
             .run(capture_stdout=True, capture_stderr=True)
         )
@@ -372,6 +415,12 @@ def create_video_from_source_video(
         override_config=None,
         temp_dir=None,
         tone="Trung tính",
+        music_mood=None,
+        music_energy=2,
+        is_sensitive=False,
+        beats=None,
+        script_text="",
+        subtitle_style="keyword_highlight",
         **kwargs
 ):
     unique_session_id = str(uuid.uuid4())[:8]
@@ -401,7 +450,39 @@ def create_video_from_source_video(
         if title_audio_url:
             if download_or_copy_file(title_audio_url, os.path.join(working_dir, p_aud_title_name)):
                 has_intro = True
+        intro_duration = get_media_duration(
+            os.path.join(working_dir, p_aud_title_name)
+        ) if has_intro else 0.0
+        body_duration = get_media_duration(os.path.join(working_dir, p_aud_main_name))
+        timeline = plan_beat_timeline(
+            beats,
+            total_duration=max(0.1, intro_duration + body_duration),
+            hook_duration=intro_duration,
+            media_count=1,
+            hook_text=title_tiktok or content_text or "",
+        )
+        title_tiktok = timeline.first_frame_text or title_tiktok
+        print(
+            f"🧭 Beat timeline: {len(timeline.segments)} beats / "
+            f"{timeline.total_duration:.2f}s | first frame: {title_tiktok}"
+        )
         cfg = load_render_config(target_channel_url, target_tiktok_id=tiktok_id)
+        music = select_music(
+            music_mood,
+            tone=tone,
+            energy=music_energy,
+            is_sensitive=is_sensitive,
+            channel_id=tiktok_id,
+        )
+        if music:
+            print(
+                f"🎵 BGM đã chọn: {os.path.basename(music.path)} | "
+                f"mood={music.mood} | energy={music.energy} | bed={music.bed_lufs:.1f} LUFS"
+            )
+            if music.license_status != "approved":
+                print("⚠️ BGM hiện tại chưa có metadata giấy phép approved trong catalog.json")
+        else:
+            print(f"⚠️ Không có BGM phù hợp cho mood={music_mood or tone}; giữ voice-only an toàn")
 
         if override_config and isinstance(override_config, dict):
             sections = ["title_settings", "content_settings", "text_overlay_settings", "text_content_settings", "assets"]
@@ -409,6 +490,14 @@ def create_video_from_source_video(
                 if section in override_config:
                     if section not in cfg: cfg[section] = {}
                     cfg[section].update(override_config[section])
+        color_grade = resolve_color_grade(
+            tiktok_id or "",
+            tone=tone,
+            is_sensitive=is_sensitive,
+        )
+        cfg["title_settings"]["_color_grade"] = color_grade.to_dict()
+        cfg["content_settings"]["_color_grade"] = color_grade.to_dict()
+        print(f"🎨 Color grade: {color_grade.name}")
         assets = cfg.get("assets", {})
 
         def find_asset_src(arg, key, default_folder):
@@ -480,56 +569,204 @@ def create_video_from_source_video(
         edit_mode = cfg.get("edit_mode", "Có Frame Full (Tiktok)")
         if override_config and "edit_mode" in override_config:
             edit_mode = override_config["edit_mode"]
+        uses_original_audio = edit_mode == "Frame Intro + Gốc (Giống FB)"
 
         segs = []
-        if edit_mode == "Frame Intro + Gốc (Giống FB)":
+        if uses_original_audio:
             if has_intro:
-                out = f"seg1_{unique_session_id}.mp4"
+                out = f"seg1_{unique_session_id}.mkv"
                 if render_segment_to_file(p_vid_name, p_aud_title_name, out, cfg["title_settings"], cfg["text_overlay_settings"], title_tiktok, local_t_frame_name, local_t_logo_name, title_logo_settings, working_dir, tone):
                     segs.append(out)
             
             # Tính thời gian đoạn gốc
-            intro_duration = get_media_duration(os.path.join(working_dir, p_aud_title_name)) if has_intro else 0
             intro_start = float(cfg["title_settings"].get("source_start", 0))
             
             content_settings_goc = cfg["content_settings"].copy()
             content_settings_goc["source_start"] = intro_start + intro_duration
             
-            out2 = f"seg2_{unique_session_id}.mp4"
+            out2 = f"seg2_{unique_session_id}.mkv"
             if render_segment_to_file(p_vid_name, p_vid_name, out2, content_settings_goc, {}, None, None, None, {}, working_dir, tone, blur_background=True):
                 segs.append(out2)
             else:
                 raise Exception("Render Content Gốc Failed")
         else:
             if has_intro:
-                out = f"seg1_{unique_session_id}.mp4"
+                out = f"seg1_{unique_session_id}.mkv"
                 if render_segment_to_file(p_vid_name, p_aud_title_name, out, cfg["title_settings"], cfg["text_overlay_settings"], title_tiktok, local_t_frame_name, local_t_logo_name, title_logo_settings, working_dir, tone):
                     segs.append(out)
-            out2 = f"seg2_{unique_session_id}.mp4"
             if not os.path.exists(p_aud_main_name): raise Exception("Mất file aud_main.mp3")
-            if render_segment_to_file(p_vid_name, p_aud_main_name, out2, cfg["content_settings"], cfg["text_content_settings"], content_text, local_c_frame_name, local_c_logo_name, content_logo_settings, working_dir, tone):
-                segs.append(out2)
-            else:
-                raise Exception("Render Content Failed")
+            base_source_start = float(cfg["content_settings"].get("source_start", 0) or 0)
+            body_segments = []
+            for segment in timeline.segments:
+                body_start = max(intro_duration, segment.start)
+                body_end = min(timeline.total_duration, segment.end)
+                if body_end - body_start <= 0.05:
+                    continue
+                body_segments.append((segment, body_start, body_end))
+
+            for beat_index, (segment, body_start, body_end) in enumerate(body_segments):
+                relative_start = max(0.0, body_start - intro_duration)
+                relative_end = max(relative_start, body_end - intro_duration)
+                beat_settings = cfg["content_settings"].copy()
+                beat_settings.update({
+                    "source_start": base_source_start + relative_start,
+                    "source_end": base_source_start + relative_end,
+                    "audio_start": relative_start,
+                    "audio_end": relative_end,
+                    "duration_override": relative_end - relative_start,
+                    "motion": segment.motion,
+                    "transition": segment.transition,
+                })
+                beat_text = segment.on_screen_text or (
+                    content_text if timeline.used_fallback and beat_index == 0 else ""
+                )
+                out2 = f"seg_body_{beat_index}_{unique_session_id}.mkv"
+                if render_segment_to_file(
+                    p_vid_name,
+                    p_aud_main_name,
+                    out2,
+                    beat_settings,
+                    cfg["text_content_settings"],
+                    beat_text,
+                    local_c_frame_name,
+                    local_c_logo_name,
+                    content_logo_settings,
+                    working_dir,
+                    tone,
+                ):
+                    segs.append(out2)
+                else:
+                    raise Exception(f"Render Content Beat #{beat_index + 1} Failed")
 
         concat_list_file = f"list_{unique_session_id}.txt"
-        concat_out_file = f"concat_{unique_session_id}.mp4"
+        concat_out_file = f"concat_{unique_session_id}.mkv"
 
+        if not segs:
+            raise Exception("Không có segment hợp lệ để concat")
         with open(concat_list_file, "w", encoding="utf-8") as f:
             for s in segs: f.write(f"file '{s}'\n")
 
-        try:
-            (
-                ffmpeg
-                .input(concat_list_file, format='concat', safe=0)
-                .output(concat_out_file, vcodec='libx264', acodec='aac')
-                .overwrite_output()
-                .run(capture_stdout=True, capture_stderr=True)
-            )
-        except ffmpeg.Error as e:
-            raise Exception("Concat Failed")
+        concat_cmd = [
+            "ffmpeg", "-y", "-f", "concat", "-safe", "0",
+            "-i", concat_list_file, "-c", "copy", concat_out_file,
+        ]
+        concat_result = subprocess.run(concat_cmd, capture_output=True, text=True)
+        if concat_result.returncode != 0:
+            raise Exception(f"Concat lossless thất bại: {concat_result.stderr[-500:]}")
 
-        shutil.move(concat_out_file, final_path)
+        subtitle_path = None
+        if not uses_original_audio and script_text and body_duration > 0:
+            subtitle_preset = get_subtitle_preset(tiktok_id)
+            keywords = [
+                value
+                for segment in timeline.segments
+                for value in segment.must_show
+                if value
+            ]
+            if subtitle_style == "normal":
+                keywords = []
+            subtitle_path = f"subtitle_{unique_session_id}.ass"
+            subtitle_path = generate_word_ass(
+                p_aud_main_name,
+                subtitle_path,
+                time_offset=intro_duration,
+                words_per_line=subtitle_preset["max_words"],
+                font_size=subtitle_preset["font_size"],
+                margin_v=subtitle_preset["margin_v"],
+                hex_color=subtitle_preset["hex_color"],
+                highlight_color=subtitle_preset["highlight_color"],
+                keywords=keywords,
+                font_name=subtitle_preset["font_name"],
+                margin_l=subtitle_preset["margin_l"],
+                margin_r=subtitle_preset["margin_r"],
+            )
+            if not subtitle_path:
+                subtitle_path = generate_text_ass(
+                    script_text,
+                    f"subtitle_{unique_session_id}.ass",
+                    duration=body_duration,
+                    time_offset=intro_duration,
+                    words_per_line=subtitle_preset["max_words"],
+                    font_size=subtitle_preset["font_size"],
+                    margin_v=subtitle_preset["margin_v"],
+                    hex_color=subtitle_preset["hex_color"],
+                    highlight_color=subtitle_preset["highlight_color"],
+                    keywords=keywords,
+                    font_name=subtitle_preset["font_name"],
+                    margin_l=subtitle_preset["margin_l"],
+                    margin_r=subtitle_preset["margin_r"],
+                )
+        audio_cues = [] if uses_original_audio else plan_audio_cues(
+            timeline,
+            is_sensitive=is_sensitive,
+            sfx_dir=os.path.join(ASSETS_DIR, "sfx"),
+        )
+        duration = get_media_duration(concat_out_file)
+        final_inputs = ["ffmpeg", "-y", "-i", concat_out_file]
+        final_filters = []
+        video_map = "0:v:0"
+
+        if subtitle_path and os.path.exists(subtitle_path):
+            safe_ass_path = os.path.abspath(subtitle_path).replace("\\", "/").replace(":", "\\:")
+            safe_fonts_dir = working_dir.replace("\\", "/").replace(":", "\\:")
+            final_filters.append(
+                f"[0:v]subtitles='{safe_ass_path}':fontsdir='{safe_fonts_dir}'[v_final]"
+            )
+            video_map = "[v_final]"
+
+        input_index = 1
+        if music:
+            final_inputs += ["-stream_loop", "-1", "-i", music.path]
+            final_filters.append(build_ducked_mix_filter(
+                "0:a",
+                f"{input_index}:a",
+                duration,
+                music,
+                output_label="a_base",
+                label_prefix="remix_music",
+            ))
+            input_index += 1
+        else:
+            final_filters.append("[0:a]loudnorm=I=-14:LRA=9:TP=-1.5[a_base]")
+
+        sfx_labels = []
+        for cue_index, cue in enumerate(audio_cues):
+            final_inputs += ["-i", cue.asset_path]
+            label = f"remix_sfx{cue_index}"
+            delay_ms = int(cue.timestamp * 1000)
+            final_filters.append(
+                f"[{input_index}:a]adelay={delay_ms}|{delay_ms},"
+                f"volume={cue.gain:.2f}[{label}]"
+            )
+            sfx_labels.append(label)
+            input_index += 1
+
+        audio_map = "[a_base]"
+        if sfx_labels:
+            final_filters.append(
+                f"[a_base]{''.join(f'[{label}]' for label in sfx_labels)}"
+                f"amix=inputs={1 + len(sfx_labels)}:duration=first:"
+                f"normalize=0,alimiter=limit=0.84[a_mixed]"
+            )
+            audio_map = "[a_mixed]"
+            print(f"🔊 AudioDirector: {len(sfx_labels)} SFX có chủ đích")
+
+        final_filters.append(
+            f"{audio_map}aresample=48000,"
+            "aformat=sample_fmts=fltp:sample_rates=48000:"
+            "channel_layouts=stereo[a_final]"
+        )
+        final_cmd = final_inputs + [
+            "-filter_complex", ";".join(final_filters),
+            "-map", video_map,
+            "-map", "[a_final]",
+            *final_output_args(),
+            "-t", f"{duration:.3f}",
+            final_path,
+        ]
+        final_result = subprocess.run(final_cmd, capture_output=True, text=True)
+        if final_result.returncode != 0:
+            raise Exception(f"Final encode thất bại: {final_result.stderr[-700:]}")
 
         if os.path.exists(final_path):
             print(f"✅ DONE: {final_path}")

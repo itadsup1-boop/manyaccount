@@ -10,9 +10,10 @@ import ToolTikTok from './pages/ToolTikTok';
 export default function App() {
   return (
     <Router>
+      <a className="skip-link" href="#main-content">Bỏ qua điều hướng</a>
       <div className="app-container">
         <Sidebar />
-        <main className="main-content">
+        <main className="main-content" id="main-content" tabIndex={-1}>
           <Routes>
             <Route path="/" element={<Dashboard />} />
             <Route path="/article" element={<ToolArticle />} />

@@ -1,0 +1,20 @@
+{
+  "version": 1,
+  "mode": "warn",
+  "approved_statuses": [
+    "owned",
+    "licensed",
+    "permission",
+    "public_domain",
+    "remix_allowed"
+  ],
+  "blocked_statuses": [
+    "blocked",
+    "denied",
+    "do_not_use",
+    "expired",
+    "unlicensed"
+  ],
+  "music_requires_approved": true,
+  "notes": "Unknown source rights are logged for review; explicit denial is blocked. Production BGM must be approved and include a license source."
+}

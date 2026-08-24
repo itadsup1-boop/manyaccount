@@ -56,6 +56,8 @@ def save_fb_to_sheet(ai_result: dict, video_url: str, source_name: str = "", id_
         "id_tiktok": id_tiktok,                                     # N
         "quality_score": ai_result.get("quality_score", ""),
         "skip_reason": ai_result.get("skip_reason", ""),
+        "pipeline_status": "uploaded",
+        "pipeline_stage": "uploaded",
     }
 
     print(f"      📊 Ghi Sheet 'facebook': link→A, hook→B+E, script_voice→C, have_frame→F, title→I, time→K")
@@ -90,6 +92,8 @@ def update_fb_drive_link(row: int, drive_link: str) -> bool:
         "sheet_name": "facebook",
         "row": int(row),
         "drive_link": drive_link,
+        "pipeline_status": "uploaded",
+        "pipeline_stage": "uploaded",
     }
     result = safe_post_json(SHEET_URL, payload)
     return result.get("status") == "success" if result else False
@@ -102,6 +106,8 @@ def update_fb_status(row: int, status: str) -> bool:
         "sheet_name": "facebook",
         "row": int(row),
         "status": status,
+        "pipeline_status": status,
+        "pipeline_stage": status,
     }
     result = safe_post_json(SHEET_URL, payload)
     return result.get("status") == "success" if result else False

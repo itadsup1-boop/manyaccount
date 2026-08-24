@@ -1,0 +1,28 @@
+{
+  "experiment_id": "hook-result-vs-conflict-adsupnews-v1",
+  "name": "Hook result so với conflict",
+  "channel_id": "Adsupnews",
+  "status": "draft",
+  "source_types": ["article", "facebook", "tiktok"],
+  "primary_metric": "median_watch_percentage",
+  "minimum_sample_size": 30,
+  "starts_at": "",
+  "ends_at": "",
+  "operator_notes": "Chỉ bật sau khi chạy assign preview với dữ liệu không production.",
+  "variants": [
+    {
+      "name": "result",
+      "weight": 50,
+      "changes": {
+        "hook_type": "result"
+      }
+    },
+    {
+      "name": "conflict",
+      "weight": 50,
+      "changes": {
+        "hook_type": "conflict"
+      }
+    }
+  ]
+}
