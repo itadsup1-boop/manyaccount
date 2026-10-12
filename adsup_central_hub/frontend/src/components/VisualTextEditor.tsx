@@ -382,7 +382,7 @@ export default function VisualTextEditor({ channelId, frameType, config, hasFram
                 <div className="readout-row"><span>Y Start:</span><span>{config.text_y1}</span></div>
                 <div className="readout-row"><span>Y End:</span><span>{config.text_y2}</span></div>
                 <div className="readout-row"><span>Width:</span><span>{(config.text_w * 100).toFixed(0)}%</span></div>
-                <div className="readout-row"><span>X Offset:</span><span>{config.text_x}px</span></div>
+                <div className="readout-row"><span>X Offset (lệch tâm):</span><span>{config.text_x}px</span></div>
               </>
             ) : (
               <>

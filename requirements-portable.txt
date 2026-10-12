@@ -1,0 +1,7 @@
+-r requirements.txt
+
+# Runtime packages imported by optional apps but missing from requirements.txt.
+fastapi==0.136.1
+uvicorn==0.46.0
+pyTelegramBotAPI>=4.28,<5
+faster-whisper>=1.2,<2

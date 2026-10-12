@@ -32,7 +32,7 @@ from datetime import datetime
 # apps/creator_facebook/fb_sheet_api.py → creator_facebook → apps → mannyAccount
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, PROJECT_ROOT)
-from shared.services.sheet_api import safe_post_json
+from shared.services.sheet_api import save_idempotent_to_sheet, safe_post_json
 
 SHEET_URL = "https://script.google.com/macros/s/AKfycbyW2cMY-3kh2qUMWwc2Tta8BrqrZY1mZLhDyQ1i8G94J9QX7LCr7LY2Brri54PVWmcC/exec"
 
@@ -62,7 +62,13 @@ def save_fb_to_sheet(ai_result: dict, video_url: str, source_name: str = "", id_
 
     print(f"      📊 Ghi Sheet 'facebook': link→A, hook→B+E, script_voice→C, have_frame→F, title→I, time→K")
 
-    result = safe_post_json(SHEET_URL, payload)
+    result = save_idempotent_to_sheet(
+        SHEET_URL,
+        payload,
+        source_url=video_url,
+        channel_id=id_tiktok,
+        sheet_name="facebook",
+    )
 
     if result and result.get("status") == "success":
         row = result.get("row", "?")

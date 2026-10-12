@@ -381,6 +381,9 @@ def build_performance_dashboard(
             "latest_video_count": len(current_records),
             "anomaly_count": len(analysis["snapshot_anomalies"]),
             "malformed_quality_lines": malformed_quality_lines,
+            "metric_coverage": dict(
+                analysis["overview"].get("data_quality", {})
+            ),
         },
         "pipeline": pipeline,
         "system_health": system_health,

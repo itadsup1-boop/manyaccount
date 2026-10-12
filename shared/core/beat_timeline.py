@@ -92,7 +92,67 @@ class BeatTimeline:
         return asdict(self)
 
 
-def _fallback_beats(media_count: int, hook_text: str) -> list[dict[str, Any]]:
+def resolve_intro_overlay_text(
+    spoken_title: Any,
+    timeline: BeatTimeline | None = None,
+) -> str:
+    """Keep the intro overlay synchronized with the title voice-over.
+
+    ``first_frame_text`` is deliberately compact and remains useful as a
+    fallback when no dedicated title voice exists.  When the renderer does
+    have a spoken title, showing a different compact beat label makes the
+    first frame feel disconnected from the audio.
+    """
+    spoken = _text(spoken_title)
+    if spoken:
+        return spoken
+    return _text(timeline.first_frame_text if timeline else "")
+
+
+def _fallback_beats(
+    media_count: int,
+    hook_text: str,
+    script_text: str = "",
+) -> list[dict[str, Any]]:
+    """Create usable beats when an AI response omitted the beat array.
+
+    Source-video remixes commonly have one physical video asset but several
+    sentences in the generated script.  Splitting those sentences gives the
+    renderer meaningful cut points instead of holding one source segment for
+    the entire voice-over.
+    """
+    script_sentences = [
+        _text(item)
+        for item in re.split(r"(?<=[.!?;:])\s+|\n+", _text(script_text))
+        if _text(item)
+    ]
+    if script_sentences and media_count <= 1:
+        clean_hook = _text(hook_text)
+        if clean_hook and clean_hook.casefold() not in {
+            item.casefold() for item in script_sentences
+        }:
+            script_sentences.insert(0, clean_hook)
+        script_sentences = script_sentences[:6]
+        result = []
+        for index, sentence in enumerate(script_sentences):
+            if index == 0:
+                role = "hook"
+            elif index == len(script_sentences) - 1:
+                role = "payoff"
+            else:
+                role = "development"
+            result.append({
+                "role": role,
+                "duration_hint": max(1.0, min(8.0, len(sentence.split()) / 3.0)),
+                "voice_over": sentence,
+                "visual_query": sentence,
+                "on_screen_text": compact_overlay_text(sentence),
+                "motion": "slow_push_in" if index == 0 else "static",
+                "transition": "cut",
+            })
+        if result:
+            return result
+
     count = max(1, media_count)
     result = []
     for index in range(count):
@@ -114,6 +174,7 @@ def plan_beat_timeline(
     hook_duration: float = 0.0,
     media_count: int = 1,
     hook_text: str = "",
+    script_text: str = "",
 ) -> BeatTimeline:
     """Allocate the real audio duration across semantic beats.
 
@@ -126,7 +187,7 @@ def plan_beat_timeline(
     clean_beats = [dict(item) for item in (beats or []) if isinstance(item, Mapping)]
     used_fallback = not clean_beats
     if not clean_beats:
-        clean_beats = _fallback_beats(media_count, hook_text)
+        clean_beats = _fallback_beats(media_count, hook_text, script_text)
 
     weights = []
     for item in clean_beats:

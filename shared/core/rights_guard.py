@@ -22,6 +22,9 @@ class RightsReport:
     requires_review: bool
     errors: tuple[str, ...]
     warnings: tuple[str, ...]
+    asset_count: int = 0
+    verified_count: int = 0
+    review_count: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -124,15 +127,49 @@ def guard_media_assets(
     errors: list[str] = []
     warnings: list[str] = []
     statuses: list[str] = []
+    verified_count = 0
+    review_count = 0
+    assets = list(assets or [])
     for index, asset in enumerate(assets):
+        if not isinstance(asset, Mapping):
+            errors.append(f"Asset #{index + 1}: metadata không hợp lệ.")
+            continue
+        local_path = str(asset.get("path") or asset.get("local_path") or "").strip()
+        provenance = str(
+            asset.get("asset_url")
+            or asset.get("source_url")
+            or asset.get("page_url")
+            or asset.get("source_name")
+            or ""
+        ).strip()
+        if not local_path:
+            errors.append(f"Asset #{index + 1}: thiếu đường dẫn local.")
+        if not provenance:
+            errors.append(f"Asset #{index + 1}: thiếu provenance nguồn hình ảnh.")
         report = guard_source_rights(asset, policy=policy)
         statuses.append(report.status)
         errors.extend(f"Asset #{index + 1}: {message}" for message in report.errors)
         warnings.extend(f"Asset #{index + 1}: {message}" for message in report.warnings)
+        if report.passed and report.status in _APPROVED:
+            verified_count += 1
+        if report.requires_review:
+            review_count += 1
     return RightsReport(
         passed=not errors,
         status=",".join(statuses) or "none",
         requires_review=bool(warnings),
         errors=tuple(errors),
         warnings=tuple(warnings),
+        asset_count=len(assets),
+        verified_count=verified_count,
+        review_count=review_count,
     )
+
+
+def guard_image_assets(
+    assets: Sequence[Mapping[str, Any]],
+    *,
+    policy: Mapping[str, Any] | None = None,
+) -> RightsReport:
+    """Apply provenance and license checks specifically to still images."""
+    return guard_media_assets(assets, policy=policy)

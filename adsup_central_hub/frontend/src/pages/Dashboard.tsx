@@ -15,15 +15,21 @@ import {
   Video,
 } from 'lucide-react';
 
+import '../features/dashboard/dashboard.css';
+import '../features/tiktok/tiktok.css';
+
 type Summary = {
   sample_size: number;
   total_views: number;
   median_views: number;
   median_average_watch_time: number;
   median_watch_percentage: number;
+  weighted_average_watch_time: number;
+  weighted_watch_percentage: number;
   median_watched_full_rate: number;
   median_retention_2s: number;
   median_retention_6s: number;
+  median_retention_drop_2s_to_6s: number;
   likes_per_1000: number;
   comments_per_1000: number;
   shares_per_1000: number;
@@ -32,6 +38,14 @@ type Summary = {
   engagements_per_1000: number;
   measured_from: string;
   measured_to: string;
+  data_quality?: {
+    with_duration: number;
+    with_watch_time: number;
+    watch_time_view_coverage: number;
+    with_completion: number;
+    with_retention_2s: number;
+    with_retention_6s: number;
+  };
   eligible?: boolean;
 };
 
@@ -116,8 +130,11 @@ type DashboardFilters = {
 type BreakdownKey = 'channel_id' | 'story_type' | 'hook_type' | 'duration' | 'music_mood';
 type MetricKey =
   | 'median_watch_percentage'
+  | 'weighted_watch_percentage'
   | 'median_watched_full_rate'
+  | 'median_retention_2s'
   | 'median_retention_6s'
+  | 'median_retention_drop_2s_to_6s'
   | 'shares_per_1000'
   | 'saves_per_1000'
   | 'follows_per_1000';
@@ -140,8 +157,11 @@ const BREAKDOWN_LABELS: Record<BreakdownKey, string> = {
 
 const METRIC_LABELS: Record<MetricKey, string> = {
   median_watch_percentage: 'Tỷ lệ thời gian xem',
+  weighted_watch_percentage: 'Tỷ lệ xem có trọng số view',
   median_watched_full_rate: 'Tỷ lệ xem hết',
+  median_retention_2s: 'Giữ chân 2 giây',
   median_retention_6s: 'Giữ chân 6 giây',
+  median_retention_drop_2s_to_6s: 'Rơi retention 2s → 6s',
   shares_per_1000: 'Chia sẻ / 1.000 view',
   saves_per_1000: 'Lưu / 1.000 view',
   follows_per_1000: 'Follow / 1.000 view',
@@ -149,8 +169,13 @@ const METRIC_LABELS: Record<MetricKey, string> = {
 
 const PERCENT_METRICS = new Set<MetricKey>([
   'median_watch_percentage',
+  'weighted_watch_percentage',
   'median_watched_full_rate',
+  'median_retention_2s',
   'median_retention_6s',
+]);
+const LOWER_IS_BETTER_METRICS = new Set<MetricKey>([
+  'median_retention_drop_2s_to_6s',
 ]);
 
 const integerFormatter = new Intl.NumberFormat('vi-VN');
@@ -164,7 +189,9 @@ function formatInteger(value: number) {
 }
 
 function formatMetric(value: number, metric: MetricKey) {
-  const suffix = PERCENT_METRICS.has(metric) ? '%' : '';
+  const suffix = metric === 'median_retention_drop_2s_to_6s'
+    ? ' điểm'
+    : PERCENT_METRICS.has(metric) ? '%' : '';
   return `${decimalFormatter.format(Number.isFinite(value) ? value : 0)}${suffix}`;
 }
 
@@ -246,8 +273,9 @@ export default function Dashboard() {
 
   const comparisonRows = useMemo(() => {
     const rows = data?.breakdowns[breakdownKey] || [];
+    const direction = LOWER_IS_BETTER_METRICS.has(metricKey) ? 1 : -1;
     return [...rows]
-      .sort((left, right) => right[metricKey] - left[metricKey])
+      .sort((left, right) => direction * (left[metricKey] - right[metricKey]))
       .slice(0, 10);
   }, [breakdownKey, data, metricKey]);
 
@@ -296,7 +324,7 @@ export default function Dashboard() {
             {healthText}
           </span>
           <button
-            className="btn btn-ghost dashboard-refresh"
+            className="tiktok-btn tiktok-btn--outline"
             type="button"
             onClick={() => setRefreshKey((value) => value + 1)}
             disabled={loading}
@@ -316,7 +344,7 @@ export default function Dashboard() {
         <label className="dashboard-field">
           <span>Từ ngày</span>
           <input
-            className="form-input"
+            className="tiktok-input"
             type="date"
             value={draftFilters.start_date}
             max={draftFilters.end_date || undefined}
@@ -326,7 +354,7 @@ export default function Dashboard() {
         <label className="dashboard-field">
           <span>Đến ngày</span>
           <input
-            className="form-input"
+            className="tiktok-input"
             type="date"
             value={draftFilters.end_date}
             min={draftFilters.start_date || undefined}
@@ -336,7 +364,7 @@ export default function Dashboard() {
         <label className="dashboard-field">
           <span>Kênh</span>
           <select
-            className="form-select"
+            className="tiktok-select"
             value={draftFilters.channel_id}
             onChange={(event) => setDraftFilters({ ...draftFilters, channel_id: event.target.value })}
           >
@@ -349,7 +377,7 @@ export default function Dashboard() {
         <label className="dashboard-field">
           <span>Mốc đo</span>
           <select
-            className="form-select"
+            className="tiktok-select"
             value={draftFilters.measurement_window}
             onChange={(event) => setDraftFilters({ ...draftFilters, measurement_window: event.target.value })}
           >
@@ -362,7 +390,7 @@ export default function Dashboard() {
         <label className="dashboard-field dashboard-field--sample">
           <span>Mẫu tối thiểu</span>
           <input
-            className="form-input"
+            className="tiktok-input"
             type="number"
             min="1"
             max="1000"
@@ -374,8 +402,8 @@ export default function Dashboard() {
           />
         </label>
         <div className="dashboard-filters__actions">
-          <button className="btn btn-primary" type="submit">Áp dụng</button>
-          <button className="btn btn-ghost" type="button" onClick={resetFilters}>Đặt lại</button>
+          <button className="tiktok-btn tiktok-btn--primary" type="submit">Áp dụng</button>
+          <button className="tiktok-btn tiktok-btn--outline" type="button" onClick={resetFilters}>Đặt lại</button>
         </div>
       </form>
 
@@ -383,7 +411,7 @@ export default function Dashboard() {
         <div className="dashboard-state dashboard-state--error" role="alert">
           <AlertTriangle size={20} aria-hidden="true" />
           <span>{error}</span>
-          <button className="btn btn-ghost" type="button" onClick={() => setRefreshKey((value) => value + 1)}>
+          <button className="tiktok-btn tiktok-btn--outline" type="button" onClick={() => setRefreshKey((value) => value + 1)}>
             Thử lại
           </button>
         </div>
@@ -423,14 +451,14 @@ export default function Dashboard() {
                 icon={<Clock3 size={19} />}
                 label="Thời gian xem"
                 value={`${decimalFormatter.format(data.overview.median_watch_percentage)}%`}
-                note={`${decimalFormatter.format(data.overview.median_average_watch_time)} giây trung vị`}
+                note={`${decimalFormatter.format(data.overview.median_average_watch_time)} giây trung vị · ${decimalFormatter.format(data.overview.weighted_watch_percentage)}% theo view`}
                 tone="cyan"
               />
               <KpiCard
                 icon={<TrendingUp size={19} />}
                 label="Xem hết video"
                 value={`${decimalFormatter.format(data.overview.median_watched_full_rate)}%`}
-                note={`Giữ chân 2s ${decimalFormatter.format(data.overview.median_retention_2s)}% · 6s ${decimalFormatter.format(data.overview.median_retention_6s)}%`}
+                note={`Giữ chân 2s ${decimalFormatter.format(data.overview.median_retention_2s)}% · 6s ${decimalFormatter.format(data.overview.median_retention_6s)}% · rơi ${decimalFormatter.format(data.overview.median_retention_drop_2s_to_6s)} điểm`}
                 tone="green"
               />
               <KpiCard
@@ -504,7 +532,11 @@ export default function Dashboard() {
               <div className="dashboard-bars">
                 {comparisonRows.length === 0 && <p className="dashboard-muted">Chưa có nhóm dữ liệu để so sánh.</p>}
                 {comparisonRows.map((row) => {
-                  const width = Math.max(2, Number(row[metricKey]) / comparisonMax * 100);
+                  const metricValue = Number(row[metricKey]) || 0;
+                  const normalizedWidth = LOWER_IS_BETTER_METRICS.has(metricKey)
+                    ? (comparisonMax - metricValue) / comparisonMax * 100
+                    : metricValue / comparisonMax * 100;
+                  const width = Math.max(2, normalizedWidth);
                   return (
                     <div className="dashboard-bar-row" key={row.value}>
                       <div className="dashboard-bar-row__meta">
@@ -548,6 +580,9 @@ export default function Dashboard() {
                 <div><dt>Video mới nhất</dt><dd>{formatInteger(data.data_quality.latest_video_count)}</dd></div>
                 <div><dt>Snapshot bất thường</dt><dd>{formatInteger(data.data_quality.anomaly_count)}</dd></div>
                 <div><dt>Dòng log lỗi định dạng</dt><dd>{formatInteger(data.data_quality.malformed_quality_lines)}</dd></div>
+                <div><dt>Retention 2s có dữ liệu</dt><dd>{formatInteger(data.overview.data_quality?.with_retention_2s ?? 0)}</dd></div>
+                <div><dt>Retention 6s có dữ liệu</dt><dd>{formatInteger(data.overview.data_quality?.with_retention_6s ?? 0)}</dd></div>
+                <div><dt>Watch time theo view</dt><dd>{decimalFormatter.format(data.overview.data_quality?.watch_time_view_coverage ?? 0)}%</dd></div>
               </dl>
               <div className="dashboard-stage-list">
                 <span className="dashboard-small-title">Lỗi theo stage</span>
@@ -573,9 +608,9 @@ export default function Dashboard() {
             </div>
             <div className="dashboard-table-wrap">
               <table className="dashboard-table">
-                <thead><tr><th>Ngày đo</th><th>Video</th><th>View</th><th>Thời gian xem</th><th>Xem hết</th><th>Giữ chân 6s</th><th>Chia sẻ / 1.000</th></tr></thead>
+                <thead><tr><th>Ngày đo</th><th>Video</th><th>View</th><th>Thời gian xem</th><th>Xem hết</th><th>Giữ chân 6s</th><th>Rơi 2s→6s</th><th>Chia sẻ / 1.000</th></tr></thead>
                 <tbody>
-                  {data.trends.length === 0 && <tr><td colSpan={7} className="dashboard-table-empty">Chưa có dữ liệu theo ngày.</td></tr>}
+                  {data.trends.length === 0 && <tr><td colSpan={8} className="dashboard-table-empty">Chưa có dữ liệu theo ngày.</td></tr>}
                   {data.trends.slice(-14).reverse().map((row) => (
                     <tr key={row.date}>
                       <td>{row.date}</td>
@@ -584,6 +619,7 @@ export default function Dashboard() {
                       <td>{decimalFormatter.format(row.median_watch_percentage)}%</td>
                       <td>{decimalFormatter.format(row.median_watched_full_rate)}%</td>
                       <td>{decimalFormatter.format(row.median_retention_6s)}%</td>
+                      <td>{decimalFormatter.format(row.median_retention_drop_2s_to_6s)} điểm</td>
                       <td>{decimalFormatter.format(row.shares_per_1000)}</td>
                     </tr>
                   ))}
@@ -639,11 +675,11 @@ export default function Dashboard() {
                     <tr key={`${failure.ts}-${failure.item_id}-${index}`}>
                       <td>{formatTimestamp(failure.ts)}</td>
                       <td>{failure.pipeline}</td>
-                      <td>{failure.channel_id || '—'}</td>
+                      <td>{failure.channel_id || '-'}</td>
                       <td><span className="dashboard-code">{failure.stage}</span></td>
                       <td><span className="dashboard-code dashboard-code--danger">{failure.error_code}</span></td>
                       <td>{failure.retryable ? 'Có' : 'Không'}</td>
-                      <td className="dashboard-error-message" title={failure.message}>{failure.message || '—'}</td>
+                      <td className="dashboard-error-message" title={failure.message}>{failure.message || '-'}</td>
                     </tr>
                   ))}
                 </tbody>

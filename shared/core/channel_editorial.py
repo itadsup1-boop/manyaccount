@@ -7,6 +7,8 @@ from functools import lru_cache
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 EDITORIAL_CONFIG_PATH = os.path.join(PROJECT_ROOT, "config", "channel_editorial_profiles.json")
+TARGET_VOICE_SPEED = 1.03
+TARGET_VIDEO_DURATION_SECONDS = 52
 
 
 @lru_cache(maxsize=1)
@@ -38,21 +40,5 @@ def get_channel_voice_speed(
     tone: str = "",
     is_sensitive: bool = False,
 ) -> float:
-    """Lấy tốc độ đọc theo kênh và ngữ cảnh, giữ tương thích lời gọi cũ."""
-    try:
-        from shared.core.prompt_builder import get_voice_preset
-
-        preset = get_voice_preset(
-            id_tiktok,
-            story_type=story_type,
-            tone=tone,
-            is_sensitive=is_sensitive,
-        )
-        return float(preset.get("speed", default))
-    except (TypeError, ValueError):
-        return default
-    except ImportError:
-        try:
-            return float(load_channel_editorial(id_tiktok).get("voice_speed", default))
-        except (TypeError, ValueError):
-            return default
+    """Tốc độ voice thống nhất cho mọi nguồn theo chính sách sản xuất."""
+    return TARGET_VOICE_SPEED

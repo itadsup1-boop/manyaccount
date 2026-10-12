@@ -41,6 +41,16 @@ BEAT_ROLES = (
 )
 
 CONFIDENCE_LEVELS = ("high", "medium", "low")
+CLAIM_TYPES = (
+    "fact",
+    "number",
+    "date",
+    "location",
+    "attribution",
+    "observation",
+    "quote",
+    "inference",
+)
 
 
 @dataclass
@@ -66,11 +76,22 @@ class EvidenceItem:
     source_text: str = ""
     source_url: str = ""
     confidence: str = "medium"
+    claim_id: str = ""
+    claim_type: str = "fact"
+    numeric_values: list[str] = field(default_factory=list)
 
     @classmethod
     def from_mapping(cls, value: Mapping[str, Any]) -> "EvidenceItem":
+        numeric_values = value.get("numeric_values") or value.get("numbers") or []
+        if isinstance(numeric_values, str):
+            numeric_values = [numeric_values]
+        if not isinstance(numeric_values, list):
+            numeric_values = []
         return cls(
+            claim_id=str(value.get("claim_id", "")).strip(),
             claim=str(value.get("claim", "")).strip(),
+            claim_type=str(value.get("claim_type", "fact")).strip(),
+            numeric_values=[str(item).strip() for item in numeric_values if str(item).strip()],
             source_text=str(value.get("source_text", "")).strip(),
             source_url=str(value.get("source_url", "")).strip(),
             confidence=str(value.get("confidence", "medium")).strip(),
@@ -124,6 +145,7 @@ class ContentPlan:
     channel_id: str = ""
     source_type: str = ""
     source_url: str = ""
+    fact_sheet: dict[str, Any] = field(default_factory=dict)
     story_type: str = "explainer"
     main_angle: str = ""
     audience_payoff: str = ""
@@ -143,6 +165,7 @@ class ContentPlan:
     experiment_variant: str = ""
     experiment_variable: str = ""
     experiment_value: str = ""
+    claim_register: list[dict[str, Any]] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

@@ -23,7 +23,7 @@ ENV_FILE = os.path.join(APP_DIR, ".env")
 def load_env():
     env = {}
     if os.path.exists(ENV_FILE):
-        with open(ENV_FILE, "r") as f:
+        with open(ENV_FILE, "r", encoding="utf-8", errors="replace") as f:
             for line in f:
                 line = line.strip()
                 if line and not line.startswith("#") and "=" in line:
@@ -203,11 +203,18 @@ class FBNewsApp(ctk.CTk):
         self.chrome_dropdown.grid(row=1, column=0, padx=15, pady=(0, 15), sticky="w")
         
         self.btn_login = ctk.CTkButton(
-            chrome_frame, text="🔑 Mở Chrome Đăng Nhập", width=160, height=32,
+            chrome_frame, text="🔑 Mở Chrome ChatGPT", width=160, height=32,
             fg_color=COLORS["success"], hover_color=COLORS["success_hover"],
             command=self._login_selected,
         )
         self.btn_login.grid(row=1, column=1, padx=5, pady=(0, 15), sticky="w")
+
+        self.btn_login_gemini = ctk.CTkButton(
+            chrome_frame, text="🌐 Mở Chrome Gemini", width=160, height=32,
+            fg_color=COLORS["primary"], hover_color=COLORS["primary_hover"],
+            command=self._login_gemini,
+        )
+        self.btn_login_gemini.grid(row=1, column=2, padx=5, pady=(0, 15), sticky="w")
 
 
 
@@ -1200,6 +1207,18 @@ class FBNewsApp(ctk.CTk):
             except Exception as e:
                 self.log(f"❌ Lỗi khi mở Chrome: {e}")
                 
+        threading.Thread(target=run_login, daemon=True).start()
+
+    def _login_gemini(self):
+        self.log("🔑 Đang mở trình duyệt đăng nhập Gemini Web (Dùng chung)...")
+        def run_login():
+            try:
+                python_exe = sys.executable
+                cmd = [python_exe, "apps/creator_facebook/gemini_automator.py", "login"]
+                subprocess.run(cmd, cwd=PROJECT_ROOT)
+                self.log("✅ Đã đóng cửa sổ đăng nhập Gemini Web.")
+            except Exception as e:
+                self.log(f"❌ Lỗi khi mở Gemini Chrome: {e}")
         threading.Thread(target=run_login, daemon=True).start()
 
     # ═══════════════════════════════════════════════════════

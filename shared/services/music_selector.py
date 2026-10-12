@@ -13,9 +13,11 @@ import json
 import os
 from pathlib import Path
 import random
+import subprocess
 import threading
 from typing import Any, Iterator
 
+from shared.core.ffmpeg_utils import ffmpeg_command
 from shared.core.rights_guard import guard_music_rights
 
 
@@ -102,6 +104,9 @@ class MusicSelection:
     bed_lufs: float
     license_status: str
     license_source: str = ""
+    # Gain tĩnh (dB) đưa track về mức bed_lufs. None = chưa đo được, filter
+    # sẽ dùng mức dự phòng.
+    bed_gain_db: float | None = None
 
 
 def clamp_energy(value: Any) -> int:
@@ -109,6 +114,48 @@ def clamp_energy(value: Any) -> int:
         return max(1, min(3, int(value)))
     except (TypeError, ValueError):
         return 2
+
+
+_MEASURED_BED_GAIN_CACHE: dict[str, float] = {}
+_MEASURE_LOCK = threading.Lock()
+
+
+def measure_bed_gain_db(path: str | os.PathLike[str], target_lufs: float) -> float | None:
+    """Đo integrated loudness của track và quy thành gain dB tĩnh.
+
+    Phải đo ngoài filtergraph vì sidechaincompress mất khoảng 3 giây cuối
+    stream (giọng hook bị đứt) nếu một trong hai đầu vào từng đi qua bộ
+    chuẩn hoá động như loudnorm/dynaudnorm. Gain tĩnh giữ nguyên mục tiêu
+    bed_lufs mà không đưa loudnorm vào cạnh sidechaincompress.
+    """
+    try:
+        key = f"{os.path.realpath(str(path))}::{float(target_lufs):.2f}"
+    except (OSError, ValueError):
+        return None
+    with _MEASURE_LOCK:
+        cached = _MEASURED_BED_GAIN_CACHE.get(key)
+    if cached is not None:
+        return cached
+    try:
+        result = subprocess.run(
+            ffmpeg_command(
+                "-hide_banner", "-nostats", "-i", str(path),
+                "-af", "loudnorm=print_format=json", "-f", "null", "-",
+            ),
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        stderr_tail = (result.stderr or "")[-6000:]
+        start = stderr_tail.rfind("{")
+        end = stderr_tail.rfind("}")
+        measured_i = float(json.loads(stderr_tail[start : end + 1])["input_i"])
+    except Exception:
+        return None
+    gain = max(-24.0, min(-3.0, float(target_lufs) - measured_i))
+    with _MEASURE_LOCK:
+        _MEASURED_BED_GAIN_CACHE[key] = gain
+    return gain
 
 
 def _as_bool(value: Any) -> bool:
@@ -331,6 +378,7 @@ def select_music(
 
     # Energy nudges the target bed loudness without changing the selected mood.
     bed_lufs = max(-27.0, min(-18.0, MOOD_BED_LUFS[mood] + (normalized_energy - 2) * 1.5))
+    bed_gain_db = measure_bed_gain_db(track.path, bed_lufs)
     return MusicSelection(
         track_id=track.track_id,
         path=track.path,
@@ -340,6 +388,7 @@ def select_music(
         bed_lufs=bed_lufs,
         license_status=track.license_status,
         license_source=track.license_source,
+        bed_gain_db=bed_gain_db,
     )
 
 
@@ -361,12 +410,26 @@ def build_ducked_mix_filter(
     bgm = bgm_label.strip("[]")
     out = output_label.strip("[]")
     prefix = "".join(char for char in label_prefix if char.isalnum() or char == "_") or "music"
+    # sidechaincompress dừng sớm (~mất 3 giây cuối, voice ngắn còn ~0.1s) nếu
+    # một trong hai đầu vào của nó từng đi qua loudnorm/dynaudnorm: bộ chuẩn
+    # hoá động phát frame không đều khiến cặp main/sidechain mất đồng bộ.
+    # Vì vậy tách bản voice THÔ cho sidechain, loudnorm chỉ đứng sau khi đã
+    # tách; bed chỉnh mức bằng gain tĩnh đo trước (bed_gain_db) thay vì
+    # loudnorm trong graph.
+    bed_gain = (
+        f"{selection.bed_gain_db:.2f}"
+        if selection.bed_gain_db is not None
+        else "-12.00"
+    )
     return (
-        f"[{voice}]loudnorm=I=-16:LRA=7:TP=-2,asplit=2[{prefix}_voice][{prefix}_side];"
-        f"[{bgm}]atrim=start={cue:.3f}:duration={duration:.3f},asetpts=PTS-STARTPTS,"
+        f"[{voice}]aformat=sample_rates=48000:channel_layouts=stereo,"
+        f"asplit=2[{prefix}_voicemix][{prefix}_side];"
+        f"[{prefix}_voicemix]loudnorm=I=-16:LRA=7:TP=-2[{prefix}_voice];"
+        f"[{bgm}]aformat=sample_rates=48000:channel_layouts=stereo,"
+        f"atrim=start={cue:.3f}:duration={duration:.3f},asetpts=PTS-STARTPTS,"
         f"afade=t=in:st=0:d={min(0.2, duration / 4):.3f},"
         f"afade=t=out:st={fade_out_start:.3f}:d={duration - fade_out_start:.3f},"
-        f"loudnorm=I={selection.bed_lufs:.1f}:LRA=11:TP=-3[{prefix}_bed];"
+        f"volume={bed_gain}dB[{prefix}_bed];"
         f"[{prefix}_bed][{prefix}_side]sidechaincompress="
         f"threshold=0.08:ratio=4:attack=15:release=300[{prefix}_ducked];"
         f"[{prefix}_voice][{prefix}_ducked]amix="

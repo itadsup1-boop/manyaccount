@@ -20,6 +20,8 @@ try:
 except ImportError:
     supabase = None
 
+from shared.core.ai_provider_factory import get_configured_ai_provider, save_configured_ai_provider
+
 
 class FBNewsPipelinePage:
     def __init__(self, parent_frame):
@@ -130,8 +132,19 @@ class FBNewsPipelinePage:
         self.source_dropdown.pack(padx=10, pady=(0, 10))
 
         # ── Nút điều khiển chính ──
-        control_frame = ctk.CTkFrame(self.parent, fg_color="transparent")
-        control_frame.pack(fill="x", pady=5)
+        ai_frame = ctk.CTkFrame(control_frame)
+        ai_frame.pack(fill="x", padx=10, pady=(0, 5))
+
+        ctk.CTkLabel(ai_frame, text="🤖 Chọn AI Engine:", font=ctk.CTkFont(weight="bold")).pack(side="left", padx=10, pady=5)
+        current_provider = "Gemini (Web)" if get_configured_ai_provider() == "gemini" else "ChatGPT"
+        self.ai_provider_var = ctk.StringVar(value=current_provider)
+        self.ai_provider_selector = ctk.CTkSegmentedButton(
+            ai_frame,
+            values=["ChatGPT", "Gemini (Web)"],
+            variable=self.ai_provider_var,
+            command=self._on_ai_provider_change
+        )
+        self.ai_provider_selector.pack(side="left", padx=10, pady=5)
 
         self.btn_start = ctk.CTkButton(
             control_frame,
@@ -142,6 +155,11 @@ class FBNewsPipelinePage:
             command=self._toggle_pipeline
         )
         self.btn_start.pack(fill="x", padx=10, pady=5)
+
+    def _on_ai_provider_change(self, value):
+        provider_key = "gemini" if "gemini" in value.lower() else "chatgpt"
+        save_configured_ai_provider(provider_key)
+        self._log(f"⚙️ Đã chuyển đổi AI Engine sang: {value.upper()}")
 
         self.btn_run_once = ctk.CTkButton(
             control_frame,
@@ -192,6 +210,17 @@ class FBNewsPipelinePage:
 
         try:
             if supabase:
+                existing = (
+                    supabase.table("facebook_sources")
+                    .select("id")
+                    .eq("source_url", url)
+                    .eq("is_active", True)
+                    .limit(1)
+                    .execute()
+                )
+                if existing.data:
+                    self.log("⚠️ Nguồn Facebook này đã tồn tại và đang được bật.")
+                    return
                 result = supabase.table("facebook_sources").insert({
                     "source_name": name,
                     "source_url": url,

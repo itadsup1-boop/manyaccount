@@ -8,6 +8,7 @@ from typing import Any, Mapping
 
 from shared.core.content_models import (
     BEAT_ROLES,
+    CLAIM_TYPES,
     CONFIDENCE_LEVELS,
     CONTENT_SCHEMA_VERSION,
     HOOK_TYPES,
@@ -59,6 +60,23 @@ def _float(value: Any, default: float, minimum: float, maximum: float) -> float:
     return max(minimum, min(maximum, parsed))
 
 
+def _optional_float(
+    value: Any, *, minimum: float = 0.0, maximum: float = 3600.0
+) -> float | None:
+    """Chuẩn hóa số thực tùy chọn nhưng giữ ``None`` khi AI không xác định."""
+    if value in (None, ""):
+        return None
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return None
+    if parsed != parsed or parsed in (float("inf"), float("-inf")):  # NaN/Infinity
+        return None
+    if parsed < minimum or parsed > maximum:
+        return None
+    return parsed
+
+
 def _list(value: Any) -> list[Any]:
     if isinstance(value, list):
         return value
@@ -69,6 +87,17 @@ def _list(value: Any) -> list[Any]:
 
 def _normalized_key(value: Any) -> str:
     return re.sub(r"[^0-9a-zA-ZÀ-ỹ]+", " ", _text(value).lower()).strip()
+
+
+def _numeric_values(value: Any) -> list[str]:
+    """Extract digit-based values while preserving decimal/percent context."""
+    text = _text(value)
+    matches = re.findall(
+        r"(?<![\w])\d[\d.,]*(?:\s*(?:%|tá»·|triá»‡u|nghÃ¬n|kg|km|m))?",
+        text,
+        flags=re.IGNORECASE,
+    )
+    return list(dict.fromkeys(match.strip() for match in matches if match.strip()))
 
 
 def _content_id(
@@ -166,7 +195,45 @@ def _normalize_hook_variants(raw: Mapping[str, Any], selected_hook: str) -> list
     return variants
 
 
-def _normalize_evidence(raw: Mapping[str, Any], source_url: str) -> list[dict[str, str]]:
+def _normalize_claim_register(raw: Mapping[str, Any]) -> list[dict[str, Any]]:
+    normalized = []
+    values = _list(raw.get("claim_register") or raw.get("claims"))
+    for index, item in enumerate(values):
+        if isinstance(item, str):
+            item = {"claim": item}
+        if not isinstance(item, Mapping):
+            continue
+        claim = _text(item.get("claim") or item.get("text"))
+        if not claim:
+            continue
+        claim_id = _text(
+            item.get("claim_id") or item.get("id") or f"claim_{index + 1}"
+        )
+        claim_type = _text(
+            item.get("claim_type") or item.get("type") or "fact"
+        ).lower()
+        if claim_type not in CLAIM_TYPES:
+            claim_type = "fact"
+        numeric_values = item.get("numeric_values") or item.get("numbers") or []
+        if isinstance(numeric_values, str):
+            numeric_values = [numeric_values]
+        if not isinstance(numeric_values, list):
+            numeric_values = []
+        numeric_values = [
+            _text(value) for value in numeric_values if _text(value)
+        ] or _numeric_values(claim)
+        normalized.append(
+            {
+                "claim_id": claim_id,
+                "claim": claim,
+                "claim_type": claim_type,
+                "numeric_values": numeric_values,
+            }
+        )
+    return normalized
+
+
+def _normalize_evidence(raw: Mapping[str, Any], source_url: str) -> list[dict[str, Any]]:
     normalized = []
     for item in _list(raw.get("evidence")):
         if isinstance(item, str):
@@ -176,9 +243,25 @@ def _normalize_evidence(raw: Mapping[str, Any], source_url: str) -> list[dict[st
         confidence = _text(item.get("confidence") or "medium").lower()
         if confidence not in CONFIDENCE_LEVELS:
             confidence = "medium"
+        claim = _text(item.get("claim"))
+        claim_type = _text(
+            item.get("claim_type") or item.get("type") or "fact"
+        ).lower()
+        if claim_type not in CLAIM_TYPES:
+            claim_type = "fact"
+        numeric_values = item.get("numeric_values") or item.get("numbers") or []
+        if isinstance(numeric_values, str):
+            numeric_values = [numeric_values]
+        if not isinstance(numeric_values, list):
+            numeric_values = []
         normalized.append(
             {
-                "claim": _text(item.get("claim")),
+                "claim_id": _text(item.get("claim_id") or item.get("id")),
+                "claim": claim,
+                "claim_type": claim_type,
+                "numeric_values": [
+                    _text(value) for value in numeric_values if _text(value)
+                ] or _numeric_values(claim),
                 "source_text": _text(
                     item.get("source_text")
                     or item.get("observed_detail")
@@ -189,6 +272,35 @@ def _normalize_evidence(raw: Mapping[str, Any], source_url: str) -> list[dict[st
             }
         )
     return normalized
+
+
+def _normalize_fact_sheet(raw: Mapping[str, Any]) -> dict[str, Any]:
+    """Chuẩn hóa fact sheet trước khi validator dùng để kiểm chứng script."""
+    value = raw.get("fact_sheet")
+    value = value if isinstance(value, Mapping) else {}
+
+    def _text_list(field_name: str) -> list[str]:
+        values = value.get(field_name)
+        if isinstance(values, str):
+            values = [values]
+        if not isinstance(values, list):
+            values = []
+        return [
+            _text(item)
+            for item in values
+            if _text(item)
+        ]
+
+    return {
+        "who": _text_list("who"),
+        "what": _text(value.get("what")),
+        "when": _text(value.get("when")),
+        "where": _text(value.get("where")),
+        "cause": _text(value.get("cause")),
+        "impact": _text(value.get("impact")),
+        "confirmed_facts": _text_list("confirmed_facts"),
+        "unknowns": _text_list("unknowns"),
+    }
 
 
 def _looks_sensitive(raw: Mapping[str, Any]) -> bool:
@@ -311,6 +423,8 @@ def normalize_content(
             "channel_id": _text(channel_id) or _text(raw.get("channel_id")),
             "source_type": _text(source_type) or _text(raw.get("source_type")),
             "source_url": authoritative_source_url,
+            "fact_sheet": _normalize_fact_sheet(raw),
+            "claim_register": _normalize_claim_register(raw),
             "story_type": infer_story_type(raw),
             "main_angle": _text(raw.get("main_angle") or raw.get("main_idea")),
             "audience_payoff": _text(
@@ -335,6 +449,9 @@ def normalize_content(
             "should_make_video": _bool(raw.get("should_make_video"), True),
             "topic_fit": _bool(raw.get("topic_fit"), True),
             "have_frame": _bool(raw.get("have_frame"), False),
+            "detected_competitor_frame_end_sec": _optional_float(
+                raw.get("detected_competitor_frame_end_sec")
+            ),
             "is_sensitive": (
                 _bool(raw.get("is_sensitive"), False)
                 or _looks_sensitive(raw)

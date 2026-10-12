@@ -1,0 +1,63 @@
+.facebook-page {
+  display: flex;
+  flex-direction: column;
+  gap: 1.25rem;
+  max-width: 1200px;
+  margin: 0 auto;
+}
+
+.facebook-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+}
+
+.facebook-auth-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.4rem 0.8rem;
+  border-radius: 999px;
+  font-size: 0.78rem;
+  font-weight: 700;
+}
+
+.facebook-auth-badge.is-logged-in {
+  background: #dcfce7;
+  color: #15803d;
+}
+
+.facebook-auth-badge.is-logged-out {
+  background: #fef3c7;
+  color: #b45309;
+}
+
+.facebook-controls {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  margin-bottom: 1rem;
+}
+
+.facebook-voice-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+  gap: 1rem;
+}
+
+.facebook-voice-card {
+  padding: 1rem;
+  border-radius: 12px;
+  border: 1px solid var(--tiktok-border, #e5e8f0);
+  background: #ffffff;
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.02);
+}
+
+.facebook-voice-card h4 {
+  margin: 0 0 0.5rem;
+  font-size: 0.88rem;
+  font-weight: 700;
+  color: var(--tiktok-text, #1f2430);
+}

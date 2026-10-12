@@ -23,7 +23,7 @@ DEFAULT_CHANNEL_LEARNING_PATH = os.path.join(
     "data",
     "channel_learning.json",
 )
-LEARNING_VERSION = 1
+LEARNING_VERSION = 2
 _LOCK = threading.RLock()
 
 
@@ -52,20 +52,35 @@ def _row_score(row: Mapping[str, Any]) -> float | None:
     """Balanced per-video score; caps protect the median from tiny-view ratios."""
     duration = float(row.get("duration", 0) or 0)
     views = int(row.get("views", 0) or 0)
-    if duration <= 0 or views <= 0:
+    average_watch_time = float(row.get("average_watch_time", 0) or 0)
+    watched_full_rate = float(row.get("watched_full_rate", 0) or 0)
+    retention_2s_value = float(row.get("retention_2s", 0) or 0)
+    retention_6s_value = float(row.get("retention_6s", 0) or 0)
+    has_retention = retention_2s_value > 0 or retention_6s_value > 0
+    has_completion = watched_full_rate > 0
+    if (
+        duration <= 0
+        or views <= 0
+        or average_watch_time <= 0
+        or not has_retention
+        or not has_completion
+        or retention_6s_value > retention_2s_value + 1e-6
+    ):
         return None
     watch_percentage = min(
         120.0,
-        max(0.0, float(row.get("average_watch_time", 0) or 0) / duration * 100.0),
+        max(0.0, average_watch_time / duration * 100.0),
     )
-    completion = min(100.0, max(0.0, float(row.get("watched_full_rate", 0) or 0) * 100.0))
-    retention_6s = min(100.0, max(0.0, float(row.get("retention_6s", 0) or 0) * 100.0))
+    completion = min(100.0, max(0.0, watched_full_rate * 100.0))
+    retention_2s = min(100.0, max(0.0, retention_2s_value * 100.0))
+    retention_6s = min(100.0, max(0.0, retention_6s_value * 100.0))
     return (
-        watch_percentage * 0.35
-        + completion * 0.25
-        + retention_6s * 0.20
-        + _per_1000(row, "shares") * 0.08
-        + _per_1000(row, "saves") * 0.07
+        watch_percentage * 0.30
+        + completion * 0.20
+        + retention_2s * 0.10
+        + retention_6s * 0.15
+        + _per_1000(row, "shares") * 0.10
+        + _per_1000(row, "saves") * 0.10
         + _per_1000(row, "follows") * 0.05
     )
 
@@ -220,6 +235,8 @@ def _prompt_lessons(learning: Mapping[str, Any]) -> list[str]:
     duration_range = learning.get("best_duration_range") or []
     moods = learning.get("winning_music_moods") or []
     weak_patterns = learning.get("weak_patterns") or []
+    analysis = learning.get("analysis") or {}
+    overview = analysis.get("overview", {}) if isinstance(analysis, Mapping) else {}
     if hooks:
         lessons.append(
             "Ưu tiên hook type đã có median tốt hơn trong cùng story type: "
@@ -239,6 +256,26 @@ def _prompt_lessons(learning: Mapping[str, Any]) -> list[str]:
         )
     if moods:
         lessons.append("Music mood đang có tín hiệu tốt: " + ", ".join(moods) + ".")
+    if overview.get("median_watch_percentage", 0):
+        lessons.append(
+            "Watch-time trung vị hiện tại là "
+            f"{overview['median_watch_percentage']:.1f}% độ dài video; "
+            "ưu tiên cấu trúc giữ thông tin mới liên tục."
+        )
+    retention_drop = float(
+        overview.get("median_retention_drop_2s_to_6s", 0) or 0
+    )
+    if retention_drop >= 15:
+        lessons.append(
+            "Retention rơi mạnh từ 2s xuống 6s "
+            f"({retention_drop:.1f} điểm phần trăm); cần làm hook và payoff sớm hơn."
+        )
+    elif overview.get("median_retention_6s", 0):
+        lessons.append(
+            "Retention 6s trung vị là "
+            f"{float(overview['median_retention_6s']):.1f}%; "
+            "giữ chủ thể/hành động chính xuất hiện ngay đầu video."
+        )
     lessons.extend(str(item) for item in weak_patterns[:3])
     return lessons
 
@@ -266,6 +303,15 @@ def build_channel_learning(
         enriched = dict(row)
         enriched["_learning_score"] = score
         usable.append(enriched)
+    missing_watch_metrics = sum(
+        float(row.get("average_watch_time", 0) or 0) <= 0
+        for row in latest
+    )
+    invalid_retention_rows = sum(
+        float(row.get("retention_6s", 0) or 0)
+        > float(row.get("retention_2s", 0) or 0) + 1e-6
+        for row in latest
+    )
 
     base = {
         "learning_version": LEARNING_VERSION,
@@ -274,6 +320,7 @@ def build_channel_learning(
         "status": "ready" if len(usable) >= minimum_sample else "insufficient_sample",
         "sample_size": len(latest),
         "usable_sample_size": len(usable),
+        "excluded_sample_size": max(0, len(latest) - len(usable)),
         "minimum_sample_size": minimum_sample,
         "minimum_group_size": minimum_group,
         "generated_at": _utc_now(),
@@ -283,9 +330,21 @@ def build_channel_learning(
         "winning_music_moods": [],
         "weak_patterns": [],
         "prompt_lessons": [],
+        "retention_diagnostics": {
+            "median_average_watch_time": 0.0,
+            "median_watch_percentage": 0.0,
+            "median_retention_2s": 0.0,
+            "median_retention_6s": 0.0,
+            "median_retention_drop_2s_to_6s": 0.0,
+        },
+        "data_quality": {
+            "missing_watch_metrics": missing_watch_metrics,
+            "invalid_retention_rows": invalid_retention_rows,
+        },
         "analysis": {},
         "method": (
-            "latest snapshot/video; median metrics; engagement per 1,000 views; "
+            "latest snapshot/video; median watch/retention metrics; "
+            "retention drop 2s-to-6s; engagement per 1,000 views; "
             "hook/duration/music normalized inside story_type"
         ),
     }
@@ -332,6 +391,17 @@ def build_channel_learning(
         "story_type": story_ranking,
         "duration": duration_ranking,
         "music_mood": music_ranking,
+    }
+    overview = base["analysis"]["overview"]
+    base["retention_diagnostics"] = {
+        key: overview.get(key, 0.0)
+        for key in (
+            "median_average_watch_time",
+            "median_watch_percentage",
+            "median_retention_2s",
+            "median_retention_6s",
+            "median_retention_drop_2s_to_6s",
+        )
     }
     base["prompt_lessons"] = _prompt_lessons(base)
     return base

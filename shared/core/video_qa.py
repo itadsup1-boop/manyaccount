@@ -10,6 +10,7 @@ from dataclasses import asdict, dataclass
 from typing import Any, Mapping
 
 from shared.core.safe_zone import validate_ass_file, validate_element_box
+from shared.core.ffmpeg_utils import ffmpeg_command, ffprobe_command
 
 
 @dataclass(frozen=True)
@@ -218,12 +219,12 @@ def run_video_qa(
 ) -> VideoQAResult:
     if not video_path or not os.path.exists(video_path):
         return evaluate_video_qa({}, analysis_log="", decode_ok=False)
-    probe_cmd = [
-        "ffprobe", "-v", "error",
+    probe_cmd = ffprobe_command(
+        "-v", "error",
         "-show_entries",
         "format=format_name,duration,size:stream=codec_type,codec_name,width,height,pix_fmt,r_frame_rate,avg_frame_rate,sample_rate,channels",
         "-of", "json", video_path,
-    ]
+    )
     try:
         probe_result = subprocess.run(probe_cmd, capture_output=True, text=True, timeout=30)
         probe = json.loads(probe_result.stdout) if probe_result.returncode == 0 else {}
@@ -231,7 +232,7 @@ def run_video_qa(
         probe = {}
 
     analysis_cmd = [
-        "ffmpeg", "-hide_banner", "-nostats", "-v", "info", "-i", video_path,
+        *ffmpeg_command("-hide_banner", "-nostats", "-v", "info", "-i", video_path),
         "-vf", "blackdetect=d=1.0:pix_th=0.10:pic_th=0.98,freezedetect=n=-50dB:d=2.0",
         "-af", "silencedetect=n=-45dB:d=2.0,ebur128=peak=true",
         "-f", "null", "-",

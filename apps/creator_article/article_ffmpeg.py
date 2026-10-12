@@ -8,7 +8,7 @@ if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
 from shared.services.music_selector import build_ducked_mix_filter, select_music
-from shared.core.beat_timeline import plan_beat_timeline
+from shared.core.beat_timeline import plan_beat_timeline, resolve_intro_overlay_text
 from shared.core.video_encoding import (
     CLEAN_METADATA_ARGS,
     build_color_filter,
@@ -17,6 +17,9 @@ from shared.core.video_encoding import (
 )
 from shared.core.safe_zone import plan_text_layout
 from shared.services.audio_director import plan_audio_cues
+from shared.core.ffmpeg_utils import ffprobe_command, resolve_ffmpeg_binary
+
+FFMPEG_BINARY = resolve_ffmpeg_binary()
 
 CHANNELS_DIR = os.path.join(PROJECT_ROOT, "assets", "channels")
 SFX_DIR = os.path.join(PROJECT_ROOT, "assets", "sfx")
@@ -36,13 +39,17 @@ def _get_supabase_client():
             pass
     url = env.get("SUPABASE_URL", "")
     key = env.get("SUPABASE_KEY", "")
-    if url and key:
+    if url and key and not key.startswith("your_"):
         try:
             from supabase import create_client
             return create_client(url, key)
         except Exception as e:
             print(f"⚠️ Không thể tạo client Supabase: {e}")
-    return None
+    try:
+        from shared.services.supabase_api import supabase as shared_supabase
+        return shared_supabase
+    except Exception:
+        return None
 
 def sync_channel_assets(id_tiktok: str):
     """Đồng bộ assets (frame, logo, config.json) của kênh từ Supabase Storage về local."""
@@ -64,6 +71,12 @@ def sync_channel_assets(id_tiktok: str):
         for file_name in files:
             if file_name in ["frame_intro.png", "frame_content.png", "frame.png", "logo.png", "config.json"]:
                 local_path = os.path.join(channel_dir, file_name)
+                # The Web Hub saves the operator's visual configuration locally.
+                # Do not overwrite it with an older cloud copy during every
+                # render. A new machine (without a local file) still gets the
+                # cloud configuration on first sync.
+                if file_name == "config.json" and os.path.exists(local_path):
+                    continue
                 storage_path = f"{storage_folder}/{file_name}"
                 try:
                     data = client.storage.from_("assets").download(storage_path)
@@ -129,7 +142,11 @@ def get_channel_config(id_tiktok: str) -> dict:
         "text_color": "#ffffff",
         "text_stroke": 3,
         "text_font": "RobotoCondensed-Bold.ttf",
-        "text_x": 0
+        "text_x": 0,
+        # Coordinates selected in the visual editor are explicit canvas
+        # coordinates. Keep them stable instead of silently applying the
+        # platform hook safe-zone clamp.
+        "text_position_mode": "manual",
     }
     
     config.update(custom_config)
@@ -174,10 +191,10 @@ def create_article_video(
     # Lấy độ dài audio
     def get_duration(p):
         if not p or not os.path.exists(p): return 0.0
-        duration_cmd = [
-            "ffprobe", "-v", "error", "-show_entries", "format=duration", 
-            "-of", "default=noprint_wrappers=1:nokey=1", p
-        ]
+        duration_cmd = ffprobe_command(
+            "-v", "error", "-show_entries", "format=duration",
+            "-of", "default=noprint_wrappers=1:nokey=1", p,
+        )
         return float(subprocess.check_output(duration_cmd).decode("utf-8").strip())
 
     try:
@@ -224,6 +241,7 @@ def create_article_video(
         hook_duration=hook_dur,
         media_count=num_imgs,
         hook_text=hook_text,
+        script_text=script_text,
     )
     segments = list(timeline.segments)
     image_paths = [source_images[item.media_index] for item in segments]
@@ -238,7 +256,7 @@ def create_article_video(
         )
         for index, segment in enumerate(segments)
     ]
-    hook_text = timeline.first_frame_text or hook_text
+    hook_text = resolve_intro_overlay_text(hook_text, timeline)
     color_grade = resolve_color_grade(
         id_tiktok,
         tone=tone,
@@ -269,6 +287,9 @@ def create_article_video(
             "margin_v": cfg.get("sub_margin_v"),
             "hex_color": cfg.get("sub_color"),
         })
+        manual_text_position = (
+            str(cfg.get("text_position_mode", "manual")).lower() == "manual"
+        )
         keywords = [
             value
             for segment in segments
@@ -291,6 +312,7 @@ def create_article_video(
             font_name=subtitle_preset["font_name"],
             margin_l=subtitle_preset["margin_l"],
             margin_r=subtitle_preset["margin_r"],
+            clamp_to_safe_zone=not manual_text_position,
         )
         if not ass_path and script_text:
             print("   ⚠️ Whisper không tạo được subtitle, dùng script_voice text để tạo karaoke gần đúng...")
@@ -308,9 +330,14 @@ def create_article_video(
                 font_name=subtitle_preset["font_name"],
                 margin_l=subtitle_preset["margin_l"],
                 margin_r=subtitle_preset["margin_r"],
+                clamp_to_safe_zone=not manual_text_position,
             )
         if ass_path:
-            print(f"   ✅ Đã tạo phụ đề ASS: {os.path.basename(ass_path)}")
+            print(
+                f"   ✅ Đã tạo phụ đề ASS: {os.path.basename(ass_path)} "
+                f"(margin_v={subtitle_preset['margin_v']}px, "
+                f"mode={'manual' if manual_text_position else 'safe-zone'})"
+            )
     except Exception as e:
         print(f"   ⚠️ Lỗi tạo phụ đề: {e}")
         ass_path = None
@@ -522,13 +549,25 @@ def create_article_video(
             preferred_x=preferred_x,
             preferred_y=preferred_y,
             max_width=max_width_px,
+            clamp_to_safe_zone=(
+                str(cfg.get("text_position_mode", "manual")).lower() != "manual"
+            ),
+        )
+        print(
+            f"   🧭 Hook text position: configured x={text_x_offset}px "
+            f"y={float(cfg.get('text_y1', 0.73)):.4f} "
+            f"→ rendered x={layout.x}px y={layout.y}px width={layout.width}px"
         )
         
+        # FFmpeg coi "\" là ký tự escape trong filtergraph, nên đường dẫn
+        # Windows (D:\...\font.ttf) làm hỏng cả chuỗi filter. Dùng dấu "/" và
+        # escape dấu hai chấm sau tên ổ đĩa, giống cách filter subtitles xử lý.
+        safe_font_path = font_path.replace("\\", "/").replace(":", "\\:")
         for i, line in enumerate(layout.lines):
             y_pos = layout.y + (i * layout.line_spacing)
             draw_filter = (
-                f"drawtext=fontfile='{font_path}':text='{line}':"
-                f"fontsize={font_size}:fontcolor={text_color}:bordercolor=black:borderw={stroke}:"
+                f"drawtext=fontfile='{safe_font_path}':text='{line}':"
+                f"fontsize={layout.font_size}:fontcolor={text_color}:bordercolor=black:borderw={stroke}:"
                 f"shadowcolor=black:shadowx=3:shadowy=3:"
                 f"x={layout.x}:y={y_pos}:"
                 f"enable='between(t,0,{hook_show_dur:.2f})'"
@@ -541,7 +580,13 @@ def create_article_video(
 
     if ass_path and os.path.exists(ass_path):
         safe_ass_path = ass_path.replace("\\", "/").replace(":", "\\:")
-        fonts_dir = os.path.join(PROJECT_ROOT, "assets", "font").replace("\\", "/")
+        # Phải escape cả dấu hai chấm của ổ đĩa Windows ("D:/..." -> "D\:/...")
+        # giống safe_ass_path, nếu không FFmpeg đọc "D" thành tên option.
+        fonts_dir = (
+            os.path.join(PROJECT_ROOT, "assets", "font")
+            .replace("\\", "/")
+            .replace(":", "\\:")
+        )
         sub_filter = f"subtitles='{safe_ass_path}':fontsdir='{fonts_dir}'"
         filter_complex += f";{out_pad}{sub_filter}[v_with_sub]"
         out_pad = "[v_with_sub]"
@@ -552,7 +597,7 @@ def create_article_video(
         temp_main_path = output_path.replace(".mp4", "_main.mp4")
 
     # ═══ ENCODE CHUẨN DÙNG CHUNG: H.264 High + AAC 48 kHz stereo ═══
-    cmd = ["ffmpeg", "-y"] + inputs + [
+    cmd = [FFMPEG_BINARY, "-y"] + inputs + [
         "-filter_complex", filter_complex,
         "-map", f"{out_pad}",
         "-map", f"{audio_map}",
@@ -578,7 +623,7 @@ def create_article_video(
             
             has_audio = False
             try:
-                probe = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "a", "-show_entries", "stream=codec_name", "-of", "default=noprint_wrappers=1:nokey=1", appended_video_path], capture_output=True, text=True)
+                probe = subprocess.run(ffprobe_command("-v", "error", "-select_streams", "a", "-show_entries", "stream=codec_name", "-of", "default=noprint_wrappers=1:nokey=1", appended_video_path), capture_output=True, text=True)
                 has_audio = bool(probe.stdout.strip())
             except: pass
             
@@ -597,7 +642,7 @@ def create_article_video(
             else:
                 filter_v += ";[1:a]asetpts=PTS-STARTPTS[aout]"
                 
-            cmd_app = ["ffmpeg", "-y", "-i", appended_video_path]
+            cmd_app = [FFMPEG_BINARY, "-y", "-i", appended_video_path]
             if not has_audio:
                 cmd_app += ["-f", "lavfi", "-i", "anullsrc=channel_layout=stereo:sample_rate=48000"]
                 
@@ -618,7 +663,7 @@ def create_article_video(
                 f.write(f"file '{os.path.basename(temp_appended)}'\n")
                 
             cmd_concat = [
-                "ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", concat_txt,
+                FFMPEG_BINARY, "-y", "-f", "concat", "-safe", "0", "-i", concat_txt,
                 "-c", "copy", "-movflags", "+faststart", *CLEAN_METADATA_ARGS,
                 output_path,
             ]

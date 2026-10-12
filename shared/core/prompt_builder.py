@@ -8,10 +8,35 @@ import os
 from copy import deepcopy
 from typing import Any, Iterable, Mapping
 
-from shared.core.channel_editorial import load_channel_editorial
+from shared.core.channel_editorial import (
+    TARGET_VIDEO_DURATION_SECONDS,
+    TARGET_VOICE_SPEED,
+    load_channel_editorial,
+)
+from shared.core.evidence_guard import EVIDENCE_GUARD_ENABLED
 
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+TARGET_VIDEO_LENGTH = (
+    "50-55 giây; tổng hook và script khoảng 150-165 từ; "
+    "hook 10-16 từ và script_voice khoảng 140-150 từ."
+)
+
+NEWSROOM_SCRIPT_STANDARD = """QUY CHUẨN LỜI DẪN BẢN TIN — ƯU TIÊN CAO
+- Viết như một biên tập viên đang dẫn bản tin hiện đại, không viết như người đang xem và mô tả từng khung hình.
+- Mục tiêu 50-55 giây: hook 10-16 từ, script_voice 140-150 từ. Quy chuẩn này ưu tiên hơn mọi mô tả thời lượng cũ còn sót trong hồ sơ kênh.
+- Hình ảnh chỉ là bằng chứng hỗ trợ. Tối đa 20% lời thoại dùng để tả chi tiết nhìn thấy; không kể tuần tự máy quay, góc quay hoặc cảnh tiếp theo.
+- Không lặp các cách dẫn như “video cho thấy”, “phần mô tả”, “hình ảnh cho thấy”, “máy quay”, “góc quay”, “xuất hiện”. Nếu dữ kiện chỉ có trong caption, ghi nguồn một lần thật tự nhiên rồi tiếp tục dẫn tin.
+- Mạch lời bắt buộc: sự kiện chính → bối cảnh cần thiết → diễn biến hoặc dữ kiện nổi bật → ý nghĩa/tác động → payoff và câu chốt.
+- Dùng động từ cụ thể, từ nối tự nhiên và nhịp câu dài-ngắn xen kẽ. Giọng có cảm xúc phù hợp sự kiện nhưng không cường điệu, phán xét hoặc bịa thêm.
+- Mỗi câu phải làm câu chuyện tiến lên. Không dùng nhiều câu để diễn đạt lại cùng một hình ảnh hay cùng một ý.
+- Nếu nguồn không đủ dữ kiện cho một bản tin 50 giây an toàn, đặt should_make_video=false; không kéo dài bằng mô tả khung hình hoặc suy đoán."""
+try:
+    from dotenv import load_dotenv
+
+    load_dotenv(os.path.join(PROJECT_ROOT, ".env"), override=False)
+except Exception:
+    pass
 
 PROFILE_FIELD_LABELS = (
     ("Tên kênh", "channel_name"),
@@ -82,7 +107,7 @@ DEFAULT_CONTENT_PROFILE: dict[str, Any] = {
         "entertainment_drama",
     ],
     "preferred_hook_types": ["result", "conflict", "impact"],
-    "video_length": "22-30 giây; tổng hook và script khoảng 60-90 từ.",
+    "video_length": TARGET_VIDEO_LENGTH,
     "format_style": "Hook cụ thể, bối cảnh ngắn, bằng chứng, tác động và payoff.",
     "hook_style": "Nêu thẳng chủ thể và sự việc trong hai giây đầu.",
     "source_preference": "Ưu tiên nguồn có chủ thể, hành động và dữ kiện kiểm chứng được.",
@@ -199,7 +224,11 @@ def get_content_profile(
     if include_runtime:
         profiles.append(load_runtime_content_profile(channel_id))
     profiles.extend(operator_profiles)
-    return merge_content_profiles(*profiles)
+    merged = merge_content_profiles(*profiles)
+    # Chính sách thời lượng chung có độ ưu tiên cao nhất để Supabase/profile
+    # cũ không tiếp tục yêu cầu video 20-30 hoặc 45-60 giây.
+    merged["video_length"] = TARGET_VIDEO_LENGTH
+    return merged
 
 
 def extract_operator_overrides(channel_id: str, profile: Any) -> dict[str, Any]:
@@ -295,7 +324,6 @@ def _voice_from_editorial(
     tone: str = "",
     is_sensitive: bool = False,
 ) -> dict[str, Any]:
-    default_speed = editorial.get("voice_speed", 1.05)
     presets = editorial.get("voice_presets", {})
     if not isinstance(presets, Mapping):
         presets = {}
@@ -306,7 +334,7 @@ def _voice_from_editorial(
         if isinstance(candidate, Mapping):
             selected = dict(candidate)
             break
-    selected.setdefault("speed", default_speed)
+    selected["speed"] = TARGET_VOICE_SPEED
     selected.setdefault("direction", direction)
     return selected
 
@@ -373,7 +401,7 @@ def build_output_schema(
         "music_energy": 2,
         "subtitle_style": "keyword_highlight",
         "cta_mode": "specific",
-        "target_duration_seconds": 0,
+        "target_duration_seconds": TARGET_VIDEO_DURATION_SECONDS,
         "visual_beat_count": 0,
         "experiment_id": "",
         "experiment_variant": "",
@@ -385,14 +413,25 @@ def build_output_schema(
         "topic_fit_reason": "",
         "quality_score": 7,
         "skip_reason": "",
+        "claim_register": [
+            {
+                "claim_id": "claim_1",
+                "claim": "",
+                "claim_type": "fact",
+                "numeric_values": [],
+            }
+        ] if EVIDENCE_GUARD_ENABLED else [],
         "evidence": [
             {
+                "claim_id": "claim_1",
                 "claim": "",
+                "claim_type": "fact",
+                "numeric_values": [],
                 "source_text": "",
                 "source_url": "",
                 "confidence": "high",
             }
-        ],
+        ] if EVIDENCE_GUARD_ENABLED else [],
         "beats": [
             {
                 "beat_number": 1,
@@ -412,6 +451,18 @@ def build_output_schema(
     }
     if is_video:
         schema["have_frame"] = False
+        schema["detected_competitor_frame_end_sec"] = None
+    if source_type == "article":
+        schema["fact_sheet"] = {
+            "who": [],
+            "what": "",
+            "when": "",
+            "where": "",
+            "cause": "",
+            "impact": "",
+            "confirmed_facts": [],
+            "unknowns": [],
+        }
     if experiment_assignment:
         for key in (
             "experiment_id", "experiment_variant", "experiment_variable",
@@ -503,7 +554,20 @@ def build_prompt(
             source_type=source_type,
             operator_profiles=operator_profiles,
         ),
+        NEWSROOM_SCRIPT_STANDARD,
     ]
+    tiktok_topic_gate_enabled = str(
+        os.environ.get("TIKTOK_TOPIC_GATE", "off")
+    ).strip().lower() in {"1", "true", "yes", "on"}
+    if source_type == "tiktok" and not tiktok_topic_gate_enabled:
+        sections.append(
+            "DUYỆT NGUỒN TIKTOK BỞI OPERATOR\n"
+            "Nguồn TikTok đã được operator kiểm tra và duyệt trước khi đưa vào pipeline. "
+            "Không được từ chối video chỉ vì lệch topic/định vị của kênh đầu ra; hãy đặt "
+            "topic_fit=true và tiếp tục viết theo đúng hình ảnh, âm thanh, caption thực tế. "
+            "Chỉ đặt should_make_video=false khi thiếu file video, không đọc được hình/âm thanh, "
+            "thiếu bằng chứng nghiêm trọng hoặc nội dung không thể dựng an toàn."
+        )
     assignment = experiment_assignment
     if assignment is None:
         assignment = resolve_prompt_experiment(
@@ -538,6 +602,15 @@ def build_prompt(
             f"{lessons}\n"
             "Chỉ dùng để ưu tiên cách thể hiện; không được thay thế dữ kiện nguồn."
         )
+    if EVIDENCE_GUARD_ENABLED:
+        sections.append(
+            "ADVANCED EVIDENCE CONTRACT\n"
+            "Register every factual claim in claim_register with a unique claim_id, claim_type, "
+            "and numeric_values. Every claim_id must have at least one evidence item with the "
+            "same claim_id, matching claim text, and source_text/observed_detail. Every number "
+            "in a claim, script, hook, title, fact sheet, or on-screen text must be registered "
+            "and reproduced in the evidence source_text. Do not invent or estimate numbers."
+        )
     if task_input.strip():
         sections.append(f"ĐẦU VÀO TÁC VỤ\n{task_input.strip()}")
     if repair_instruction.strip():
@@ -548,4 +621,5 @@ def build_prompt(
             "Chỉ trả JSON thuần, không bỏ hoặc đổi tên field:\n"
             + build_output_schema(source_type, assignment)
         )
+    sections.append("chỉ được trả về text json")
     return "\n\n".join(section for section in sections if section)

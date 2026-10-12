@@ -22,6 +22,7 @@ class TeleBotConfigApp(ctk.CTk):
         super().__init__()
         self.title("Cấu hình Kênh TeleBot")
         self.geometry("900x750")
+        self.protocol("WM_DELETE_WINDOW", self.on_close)
 
         self.channels = self.load_config()
         self.bot_process = None
@@ -283,9 +284,9 @@ class TeleBotConfigApp(ctk.CTk):
 
     def _build_ui(self):
         print("⏳ Đang tải danh sách file từ Supabase...")
-        self.frames_list = ["-- Trống --"] + SupabaseAPI.get_list_storage_files("assets", "frame")
-        self.logos_list = ["-- Trống --"] + SupabaseAPI.get_list_storage_files("assets", "logo")
-        self.fonts_list = ["-- Trống --"] + SupabaseAPI.get_list_storage_files("assets", "font")
+        self.frames_list = ["-- Trống --"] + self._load_asset_names("frame")
+        self.logos_list = ["-- Trống --"] + self._load_asset_names("logo")
+        self.fonts_list = ["-- Trống --"] + self._load_asset_names("font")
 
         self.tabview = ctk.CTkTabview(self, corner_radius=10, height=350)
         self.tabview.pack(fill="x", padx=15, pady=5)
@@ -320,6 +321,32 @@ class TeleBotConfigApp(ctk.CTk):
 
         self.log_box = ctk.CTkTextbox(bot_frame, height=80, state="disabled")
         self.log_box.pack(fill="x", padx=10, pady=(0, 10))
+
+    def _load_asset_names(self, folder_name):
+        """Đọc asset từ Supabase, fallback sang bản local khi mất mạng."""
+        remote_names = SupabaseAPI.get_list_storage_files(
+            "assets", folder_name, quiet=True
+        )
+        if remote_names:
+            return remote_names
+
+        names = set()
+        for base_dir in (
+            os.path.join(PROJECT_ROOT, "assets", folder_name),
+            os.path.join(PROJECT_ROOT, "shared", "assets", folder_name),
+        ):
+            if not os.path.isdir(base_dir):
+                continue
+            for filename in os.listdir(base_dir):
+                path = os.path.join(base_dir, filename)
+                if os.path.isfile(path):
+                    names.add(filename)
+        if names:
+            print(
+                f"⚠️ Không truy cập được Supabase Storage ({folder_name}); "
+                "đang dùng danh sách asset local."
+            )
+        return sorted(names)
 
     def delete_channel(self):
         c_id = self.entry_action_id.get().strip()
@@ -367,6 +394,12 @@ class TeleBotConfigApp(ctk.CTk):
             self.bot_process = None
             self.log("🛑 Đã dừng bot.")
             self.btn_bot.configure(text="▶️ KHỞI ĐỘNG TELEGRAM BOT", fg_color="#1f538d", hover_color="#14375e")
+
+    def on_close(self):
+        """Dừng bot con trước khi đóng giao diện cấu hình."""
+        if self.bot_process:
+            self.stop_bot()
+        self.destroy()
 
     def read_bot_output(self):
         if self.bot_process:

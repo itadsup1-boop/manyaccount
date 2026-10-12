@@ -1,0 +1,72 @@
+.content-header {
+  align-items: center;
+}
+
+.content-account-select {
+  max-width: 420px;
+}
+
+.saved-profile-panel {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  margin: 1rem 0;
+  padding: 0.8rem;
+  border: 1px solid #d9dbff;
+  border-radius: 10px;
+  background: #f8f9ff;
+}
+
+.saved-profile-panel > div:first-child {
+  display: grid;
+}
+
+.saved-profile-panel strong {
+  font-size: 0.8rem;
+}
+
+.saved-profile-panel span {
+  color: var(--tiktok-subtle);
+  font-size: 0.73rem;
+}
+
+.saved-profile-panel > div:last-child {
+  display: flex;
+  gap: 0.45rem;
+  flex-wrap: wrap;
+}
+
+.content-profile-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0.8rem;
+}
+
+.content-profile-grid .is-wide {
+  grid-column: 1 / -1;
+}
+
+.api-config-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 1rem;
+}
+
+.config-fields {
+  display: grid;
+  gap: 0.75rem;
+}
+
+.server-config {
+  display: flex;
+  align-items: end;
+  justify-content: space-between;
+  gap: 1rem;
+}
+
+.server-config > div {
+  width: min(100%, 360px);
+}
+
+

@@ -10,10 +10,12 @@ Script này sẽ mở trình duyệt cho bạn.
 
 import webbrowser
 import os
+import shutil
+import subprocess
 import sys
 
 SUPABASE_PROJECT_REF = "iynwmytfroatvzhbkodf"
-SQL_FILE = os.path.join(os.path.dirname(__file__), "src", "database", "migrations", "001_create_tables.sql")
+MIGRATIONS_DIR = os.path.join(os.path.dirname(__file__), "database", "migrations")
 
 def main():
     print("╔═══════════════════════════════════════════════════╗")
@@ -21,27 +23,35 @@ def main():
     print("╚═══════════════════════════════════════════════════╝")
     print()
 
-    # Đọc SQL
-    if not os.path.exists(SQL_FILE):
-        print(f"❌ Không tìm thấy file SQL: {SQL_FILE}")
+    migration_files = sorted(
+        os.path.join(MIGRATIONS_DIR, name)
+        for name in os.listdir(MIGRATIONS_DIR)
+        if name.endswith(".sql")
+    ) if os.path.isdir(MIGRATIONS_DIR) else []
+    if not migration_files:
+        print(f"❌ Không tìm thấy migration SQL trong: {MIGRATIONS_DIR}")
         sys.exit(1)
 
-    with open(SQL_FILE, "r") as f:
-        sql = f.read()
+    sql_parts = []
+    for migration_file in migration_files:
+        with open(migration_file, "r", encoding="utf-8") as f:
+            sql_parts.append(f"-- FILE: {os.path.basename(migration_file)}\n{f.read()}")
+    sql = "\n\n".join(sql_parts)
 
-    print("📋 SQL đã được copy. Làm theo 3 bước sau:\n")
+    print(f"📋 Đã nạp {len(migration_files)} migration. Làm theo 3 bước sau:\n")
     print("   BƯỚC 1: Trình duyệt sẽ mở Supabase SQL Editor")
     print("   BƯỚC 2: Paste (Ctrl+V) toàn bộ SQL vào editor")
     print("   BƯỚC 3: Nhấn nút [Run] (nút xanh góc phải)\n")
 
     # Copy SQL vào clipboard (nếu có xclip)
     try:
-        proc = os.popen("which xclip", "r")
-        has_xclip = bool(proc.read().strip())
-        proc.close()
-
-        if has_xclip:
-            os.popen(f'echo """{sql}""" | xclip -selection clipboard')
+        if shutil.which("xclip"):
+            subprocess.run(
+                ["xclip", "-selection", "clipboard"],
+                input=sql,
+                text=True,
+                check=True,
+            )
             print("✅ SQL đã được copy vào clipboard!")
         else:
             # Fallback: ghi ra file tạm

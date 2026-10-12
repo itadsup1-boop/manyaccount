@@ -16,6 +16,13 @@ from shared.services.supabase_api import SupabaseAPI
 
 MAX_CONCURRENT_WORKERS = 2
 MAX_CONCURRENT_WORKERS_HARD_LIMIT = 2
+try:
+    WORKER_TIMEOUT_SECONDS = max(
+        300,
+        int(os.getenv("MATRIX_WORKER_TIMEOUT_SECONDS", "2400")),
+    )
+except (TypeError, ValueError):
+    WORKER_TIMEOUT_SECONDS = 2400
 
 def get_max_concurrent_workers(schedule_config=None):
     raw_value = None
@@ -51,28 +58,94 @@ def get_active_accounts():
 
 def run_worker_batch(account_ids):
     processes = []
-    print(f"   🚀 Đang khởi động {len(account_ids)} luồng song song...")
+    print(f"   🚀 Đang khởi động {len(account_ids)} luồng song song...", flush=True)
 
     for acc_id in account_ids:
         worker_script = os.path.join(PROJECT_ROOT, "shared", "core", "worker.py")
-        cmd = [sys.executable, worker_script, acc_id]
+        # -u is important here: stdout is redirected to a per-account log and
+        # otherwise Python buffers prints until the worker exits, making a live
+        # run look frozen in both the scheduler terminal and worker log.
+        cmd = [sys.executable, "-u", worker_script, acc_id]
 
         try:
-            p = subprocess.Popen(cmd, cwd=PROJECT_ROOT)
+            # Worker không được kế thừa stdout pipe của Hub. Giữ cả các
+            # print() của TTS/Drive trong file riêng để tra cứu link khi cần.
+            console_dir = os.path.join(PROJECT_ROOT, "shared", "data", acc_id)
+            os.makedirs(console_dir, exist_ok=True)
+            console_path = os.path.join(console_dir, "worker_console.log")
+            with open(console_path, "a", encoding="utf-8") as console_file:
+                p = subprocess.Popen(
+                    cmd,
+                    cwd=PROJECT_ROOT,
+                    stdout=console_file,
+                    stderr=subprocess.STDOUT,
+                    close_fds=True,
+                )
             processes.append((acc_id, p))
-            print(f"      ▶️  Đã kích hoạt: {acc_id} (PID: {p.pid})")
+            print(f"      ▶️  Đã kích hoạt: {acc_id} (PID: {p.pid})", flush=True)
         except Exception as e:
-            print(f"      ❌ Lỗi kích hoạt {acc_id}: {e}")
+            print(f"      ❌ Lỗi kích hoạt {acc_id}: {e}", flush=True)
 
-    print(f"   ⏳ Đang chờ {len(processes)} luồng hoàn tất xử lý...")
+    print(f"   ⏳ Đang chờ {len(processes)} luồng hoàn tất xử lý...", flush=True)
     finished_count = 0
     total = len(processes)
+    started_at = time.monotonic()
+    reported_finished = set()
+    last_heartbeat = started_at
 
     while finished_count < total:
         time.sleep(2)
-        finished_count = sum(1 for _, p in processes if p.poll() is not None)
+        now = time.monotonic()
+        for acc_id, process in processes:
+            return_code = process.poll()
+            if return_code is not None and acc_id not in reported_finished:
+                reported_finished.add(acc_id)
+                if return_code == 0:
+                    print(f"      ✅ Worker hoàn tất: {acc_id} (PID: {process.pid})", flush=True)
+                else:
+                    print(
+                        f"      ⚠️ Worker kết thúc lỗi: {acc_id} "
+                        f"(PID: {process.pid}, exit={return_code}); xem worker_console.log",
+                        flush=True,
+                    )
+        finished_count = len(reported_finished)
+        if finished_count < total and now - last_heartbeat >= 30:
+            running = [acc_id for acc_id, process in processes if process.poll() is None]
+            elapsed = int(now - started_at)
+            print(
+                f"   🔄 Batch vẫn đang chạy ({elapsed}s): {running}; "
+                "log chi tiết nằm trong shared/data/<account>/worker_console.log",
+                flush=True,
+            )
+            last_heartbeat = now
+        if finished_count < total and time.monotonic() - started_at >= WORKER_TIMEOUT_SECONDS:
+            print(
+                f"   ⚠️ Batch quá thời gian cho phép ({WORKER_TIMEOUT_SECONDS}s); "
+                "dừng worker còn treo để không khóa các batch sau.",
+                flush=True,
+            )
+            for acc_id, process in processes:
+                if process.poll() is None:
+                    try:
+                        process.terminate()
+                        print(f"      🛑 Đã yêu cầu dừng worker treo: {acc_id} (PID: {process.pid})", flush=True)
+                    except Exception as error:
+                        print(f"      ⚠️ Không dừng được worker {acc_id}: {error}", flush=True)
+            deadline = time.monotonic() + 15
+            while time.monotonic() < deadline and any(
+                process.poll() is None for _, process in processes
+            ):
+                time.sleep(1)
+            for acc_id, process in processes:
+                if process.poll() is None:
+                    try:
+                        process.kill()
+                        print(f"      🛑 Đã kill worker vẫn còn treo: {acc_id} (PID: {process.pid})", flush=True)
+                    except Exception:
+                        pass
+            break
 
-    print(f"   ✅ Đợt chạy này đã hoàn tất (100%).")
+    print(f"   ✅ Đợt chạy này đã hoàn tất ({finished_count}/{total} worker kết thúc).", flush=True)
 
 def start_schedule_loop():
     print("="*60)

@@ -7,7 +7,7 @@ import requests
 # Lùi 3 cấp để về thư mục mannyAccount (nơi chứa thư mục services)
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, PROJECT_ROOT)
-from shared.services.sheet_api import safe_post_json
+from shared.services.sheet_api import save_idempotent_to_sheet, safe_post_json
 
 SHEET_URL = "https://script.google.com/macros/s/AKfycbyW2cMY-3kh2qUMWwc2Tta8BrqrZY1mZLhDyQ1i8G94J9QX7LCr7LY2Brri54PVWmcC/exec"
 
@@ -40,7 +40,13 @@ def save_article_to_sheet(ai_result: dict, article_url: str, id_tiktok: str) -> 
 
     print(f"      📊 Ghi Sheet '{sheet_name}': id_tiktok→N, hook→B+E, voice→C, image_prompts→G")
 
-    result = safe_post_json(SHEET_URL, payload)
+    result = save_idempotent_to_sheet(
+        SHEET_URL,
+        payload,
+        source_url=article_url,
+        channel_id=id_tiktok,
+        sheet_name=sheet_name,
+    )
 
     if result and result.get("status") == "success":
         row = result.get("row", "?")

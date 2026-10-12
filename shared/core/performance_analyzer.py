@@ -190,6 +190,28 @@ def normalize_performance_record(
     source_domain = _text(_pick(raw, fallback, "source_domain", "domain"))
     if not source_domain and source_url:
         source_domain = urlsplit(source_url).netloc.lower().removeprefix("www.")
+    views = int(parse_number(_pick(
+        raw, fallback, "views", "video_views", "view_count", "luot_xem",
+    )))
+    retention_2s = parse_number(_pick(
+        raw, fallback, "retention_2s", "retention_2_sec", "2s_retention",
+        "giu chan 2 giay",
+    ), rate=True)
+    retention_6s = parse_number(_pick(
+        raw, fallback, "retention_6s", "retention_6_sec", "6s_retention",
+        "giu chan 6 giay",
+    ), rate=True)
+    if views > 0:
+        if retention_2s <= 0:
+            retention_2s = parse_number(_pick(
+                raw, fallback, "2-second video views", "2 second video views",
+                "2s views", "luot xem 2 giay",
+            )) / views
+        if retention_6s <= 0:
+            retention_6s = parse_number(_pick(
+                raw, fallback, "6-second video views", "6 second video views",
+                "6s views", "luot xem 6 giay",
+            )) / views
 
     record = {
         "video_id": video_id,
@@ -228,21 +250,18 @@ def normalize_performance_record(
         "experiment_value": _text(_pick(
             raw, fallback, "experiment_value", "test_value", "gia_tri_thu_nghiem",
         )),
-        "views": int(parse_number(_pick(
-            raw, fallback, "views", "video_views", "view_count", "luot_xem",
-        ))),
+        "views": views,
         "average_watch_time": parse_number(_pick(
-            raw, fallback, "average_watch_time", "avg_watch_time", "watch_time", "thoi_gian_xem_trung_binh",
+            raw, fallback, "average_watch_time", "avg_watch_time", "watch_time",
+            "average watch duration", "avg watch duration",
+            "thoi_gian_xem_trung_binh", "thoi_gian_xem_trung_binh_giay",
         )),
         "watched_full_rate": min(1.0, parse_number(_pick(
-            raw, fallback, "watched_full_rate", "completion_rate", "watched_full_video", "ty_le_xem_het",
+            raw, fallback, "watched_full_rate", "completion_rate",
+            "watched_full_video", "watched full video rate", "ty_le_xem_het",
         ), rate=True)),
-        "retention_2s": min(1.0, parse_number(_pick(
-            raw, fallback, "retention_2s", "retention_2_sec", "2s_retention",
-        ), rate=True)),
-        "retention_6s": min(1.0, parse_number(_pick(
-            raw, fallback, "retention_6s", "retention_6_sec", "6s_retention",
-        ), rate=True)),
+        "retention_2s": min(1.0, max(0.0, retention_2s)),
+        "retention_6s": min(1.0, max(0.0, retention_6s)),
         "likes": int(parse_number(_pick(raw, fallback, "likes", "like_count", "luot_thich"))),
         "comments": int(parse_number(_pick(raw, fallback, "comments", "comment_count", "binh_luan"))),
         "shares": int(parse_number(_pick(raw, fallback, "shares", "share_count", "luot_chia_se"))),
@@ -279,6 +298,19 @@ def _median(values: Iterable[float]) -> float:
     return statistics.median(clean) if clean else 0.0
 
 
+def _watch_percentage(item: Mapping[str, Any]) -> float | None:
+    duration = float(item.get("duration", 0) or 0)
+    if duration <= 0:
+        return None
+    return float(item.get("average_watch_time", 0) or 0) / duration * 100.0
+
+
+def _retention_drop_2s_to_6s(item: Mapping[str, Any]) -> float:
+    retention_2s = float(item.get("retention_2s", 0) or 0)
+    retention_6s = float(item.get("retention_6s", 0) or 0)
+    return (retention_2s - retention_6s) * 100.0
+
+
 def aggregate_performance(records: Iterable[Mapping[str, Any]]) -> dict[str, Any]:
     rows = [dict(item) for item in records]
     total_views = sum(int(item.get("views", 0) or 0) for item in rows)
@@ -288,10 +320,48 @@ def aggregate_performance(records: Iterable[Mapping[str, Any]]) -> dict[str, Any
         return (total / total_views * 1000.0) if total_views else 0.0
 
     watch_percentages = [
-        float(item.get("average_watch_time", 0) or 0)
-        / float(item.get("duration", 0) or 0) * 100.0
+        percentage for item in rows
+        if float(item.get("average_watch_time", 0) or 0) > 0
+        and (percentage := _watch_percentage(item)) is not None
+    ]
+    watch_time_rows = [
+        item for item in rows
+        if float(item.get("average_watch_time", 0) or 0) > 0
+    ]
+    completion_rows = [
+        item for item in rows
+        if float(item.get("watched_full_rate", 0) or 0) > 0
+    ]
+    watch_time_views = sum(
+        int(item.get("views", 0) or 0)
+        for item in rows
+        if float(item.get("average_watch_time", 0) or 0) > 0
+    )
+    weighted_watch_time = (
+        sum(
+            float(item.get("average_watch_time", 0) or 0)
+            * int(item.get("views", 0) or 0)
+            for item in rows
+        ) / total_views
+        if total_views else 0.0
+    )
+    duration_views = sum(
+        int(item.get("views", 0) or 0)
         for item in rows
         if float(item.get("duration", 0) or 0) > 0
+    )
+    weighted_watch_percentage = (
+        sum(
+            (_watch_percentage(item) or 0.0) * int(item.get("views", 0) or 0)
+            for item in rows
+            if _watch_percentage(item) is not None
+        ) / duration_views
+        if duration_views else 0.0
+    )
+    retention_rows = [
+        item for item in rows
+        if float(item.get("retention_2s", 0) or 0) > 0
+        or float(item.get("retention_6s", 0) or 0) > 0
     ]
     measured_values = [str(item.get("measured_at", "")) for item in rows if item.get("measured_at")]
     result = {
@@ -299,17 +369,22 @@ def aggregate_performance(records: Iterable[Mapping[str, Any]]) -> dict[str, Any
         "total_views": total_views,
         "median_views": round(_median(item.get("views", 0) for item in rows), 3),
         "median_average_watch_time": round(_median(
-            item.get("average_watch_time", 0) for item in rows
+            item.get("average_watch_time", 0) for item in watch_time_rows
         ), 3),
         "median_watch_percentage": round(_median(watch_percentages), 3),
+        "weighted_average_watch_time": round(weighted_watch_time, 3),
+        "weighted_watch_percentage": round(weighted_watch_percentage, 3),
         "median_watched_full_rate": round(_median(
-            float(item.get("watched_full_rate", 0) or 0) * 100.0 for item in rows
+            float(item.get("watched_full_rate", 0) or 0) * 100.0 for item in completion_rows
         ), 3),
         "median_retention_2s": round(_median(
-            float(item.get("retention_2s", 0) or 0) * 100.0 for item in rows
+            float(item.get("retention_2s", 0) or 0) * 100.0 for item in retention_rows
         ), 3),
         "median_retention_6s": round(_median(
-            float(item.get("retention_6s", 0) or 0) * 100.0 for item in rows
+            float(item.get("retention_6s", 0) or 0) * 100.0 for item in retention_rows
+        ), 3),
+        "median_retention_drop_2s_to_6s": round(_median(
+            _retention_drop_2s_to_6s(item) for item in retention_rows
         ), 3),
         "likes_per_1000": round(per_1000("likes"), 3),
         "comments_per_1000": round(per_1000("comments"), 3),
@@ -321,7 +396,13 @@ def aggregate_performance(records: Iterable[Mapping[str, Any]]) -> dict[str, Any
         "data_quality": {
             "with_duration": sum(float(item.get("duration", 0) or 0) > 0 for item in rows),
             "with_watch_time": sum(float(item.get("average_watch_time", 0) or 0) > 0 for item in rows),
+            "watch_time_view_coverage": round(
+                watch_time_views / total_views * 100.0 if total_views else 0.0,
+                3,
+            ),
             "with_completion": sum(float(item.get("watched_full_rate", 0) or 0) > 0 for item in rows),
+            "with_retention_2s": sum(float(item.get("retention_2s", 0) or 0) > 0 for item in rows),
+            "with_retention_6s": sum(float(item.get("retention_6s", 0) or 0) > 0 for item in rows),
         },
     }
     engagement_total = sum(
@@ -394,6 +475,18 @@ def find_snapshot_anomalies(
                         "previous_measured_at": previous.get("measured_at", ""),
                         "current_measured_at": current.get("measured_at", ""),
                     })
+        for snapshot in ordered:
+            retention_2s = float(snapshot.get("retention_2s", 0) or 0)
+            retention_6s = float(snapshot.get("retention_6s", 0) or 0)
+            if retention_6s > retention_2s + 1e-6:
+                anomalies.append({
+                    "channel_id": channel_id,
+                    "video_id": video_id,
+                    "error_code": "RETENTION_6S_GT_2S",
+                    "retention_2s": retention_2s,
+                    "retention_6s": retention_6s,
+                    "measured_at": snapshot.get("measured_at", ""),
+                })
     return anomalies[:100]
 
 

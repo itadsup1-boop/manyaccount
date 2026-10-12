@@ -1,0 +1,9 @@
+{
+  "admin@adsup.vn": {
+    "email": "admin@adsup.vn",
+    "name": "Quản trị viên Adsup",
+    "picture": "https://ui-avatars.com/api/?name=Admin+Adsup&background=2563eb&color=fff",
+    "role": "admin",
+    "last_login": "2026-10-11 12:23:06"
+  }
+}

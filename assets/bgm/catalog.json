@@ -1,4 +1,85 @@
 {
   "version": 1,
-  "tracks": []
+  "tracks": [
+    {
+      "id": "Cam_dong_MzXCyO0DcyU",
+      "file": "Cam_dong_MzXCyO0DcyU.mp3",
+      "moods": ["sensitive_empathy"],
+      "energy": 1,
+      "license_status": "approved",
+      "license_source": "https://www.youtube.com/watch?v=MzXCyO0DcyU"
+    },
+    {
+      "id": "Hoi_hop_lWvRxwH0l2o",
+      "file": "Hoi_hop_lWvRxwH0l2o.mp3",
+      "moods": ["serious_warning", "breaking_tension", "entertainment_drama"],
+      "energy": 2,
+      "license_status": "approved",
+      "license_source": "https://www.youtube.com/watch?v=lWvRxwH0l2o"
+    },
+    {
+      "id": "Kich_tinh_cypqGpxAX_0",
+      "file": "Kich_tinh_cypqGpxAX_0.mp3",
+      "moods": ["breaking_tension", "sports_energy", "entertainment_drama"],
+      "energy": 3,
+      "license_status": "approved",
+      "license_source": "https://www.youtube.com/watch?v=cypqGpxAX_0"
+    },
+    {
+      "id": "Kich_tinh_lTjN0nytcxo",
+      "file": "Kich_tinh_lTjN0nytcxo.mp3",
+      "moods": ["breaking_tension", "sports_energy", "entertainment_drama"],
+      "energy": 3,
+      "license_status": "approved",
+      "license_source": "https://www.youtube.com/watch?v=lTjN0nytcxo"
+    },
+    {
+      "id": "Kich_tinh_nQpuPvkCfE4",
+      "file": "Kich_tinh_nQpuPvkCfE4.mp3",
+      "moods": ["breaking_tension", "sports_energy", "entertainment_drama"],
+      "energy": 3,
+      "license_status": "approved",
+      "license_source": "https://www.youtube.com/watch?v=nQpuPvkCfE4"
+    },
+    {
+      "id": "Trung_tinh_cvfVy_I5PrQ",
+      "file": "Trung_tinh_cvfVy_I5PrQ.mp3",
+      "moods": ["neutral_news"],
+      "energy": 2,
+      "license_status": "approved",
+      "license_source": "https://www.youtube.com/watch?v=cvfVy_I5PrQ"
+    },
+    {
+      "id": "Trung_tinh_cyvH8AG0xSU",
+      "file": "Trung_tinh_cyvH8AG0xSU.mp3",
+      "moods": ["neutral_news"],
+      "energy": 2,
+      "license_status": "approved",
+      "license_source": "https://www.youtube.com/watch?v=cyvH8AG0xSU"
+    },
+    {
+      "id": "Vui_ve_N6piaLQbC6Y",
+      "file": "Vui_ve_N6piaLQbC6Y.mp3",
+      "moods": ["positive_upbeat"],
+      "energy": 2,
+      "license_status": "approved",
+      "license_source": "https://www.youtube.com/watch?v=N6piaLQbC6Y"
+    },
+    {
+      "id": "Vui_ve_d2z-Ivhlcr4",
+      "file": "Vui_ve_d2z-Ivhlcr4.mp3",
+      "moods": ["positive_upbeat"],
+      "energy": 2,
+      "license_status": "approved",
+      "license_source": "https://www.youtube.com/watch?v=d2z-Ivhlcr4"
+    },
+    {
+      "id": "Vui_ve_lZIzMQNcbmU",
+      "file": "Vui_ve_lZIzMQNcbmU.mp3",
+      "moods": ["positive_upbeat"],
+      "energy": 2,
+      "license_status": "approved",
+      "license_source": "https://www.youtube.com/watch?v=lZIzMQNcbmU"
+    }
+  ]
 }

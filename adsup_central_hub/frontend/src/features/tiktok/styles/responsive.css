@@ -1,0 +1,106 @@
+@media (max-width: 980px) {
+  .account-create-grid,
+  .channel-create-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .account-create-grid .tiktok-btn,
+  .channel-create-grid .tiktok-btn {
+    justify-self: start;
+  }
+
+  .channel-workspace {
+    grid-template-columns: 220px minmax(0, 1fr);
+  }
+}
+
+@media (max-width: 760px) {
+  .tiktok-page {
+    margin: -1.75rem -2rem;
+    padding: 1.15rem 1rem 2rem;
+  }
+
+  .tiktok-tab span {
+    display: none;
+  }
+
+  .tiktok-tab {
+    flex: 1 0 48px;
+    justify-content: center;
+  }
+
+  .channel-workspace,
+  .api-config-grid,
+  .content-profile-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .content-profile-grid .is-wide {
+    grid-column: auto;
+  }
+
+  .channel-list {
+    position: static;
+  }
+
+  .channel-list__items {
+    grid-auto-flow: column;
+    grid-auto-columns: minmax(190px, 70%);
+    overflow-x: auto;
+    padding-bottom: 0.25rem;
+  }
+
+  .saved-profile-panel,
+  .server-config {
+    align-items: stretch;
+    flex-direction: column;
+  }
+}
+
+@media (max-width: 560px) {
+  .tiktok-page {
+    margin: -1.75rem -1rem;
+  }
+
+  .tiktok-page__header,
+  .bot-status-row,
+  .content-header {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+
+  .bot-stat-grid,
+  .account-create-grid,
+  .channel-create-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .schedule-add,
+  .schedule-add .tiktok-btn,
+  .bot-status-row .tiktok-btn,
+  .account-create-grid .tiktok-btn,
+  .channel-create-grid .tiktok-btn {
+    width: 100%;
+  }
+
+  .schedule-add {
+    max-width: none;
+    flex-direction: column;
+  }
+
+  .channel-editor__actions .tiktok-btn,
+  .config-actions .tiktok-btn {
+    flex: 1 1 100%;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .tiktok-page *,
+  .tiktok-page *::before,
+  .tiktok-page *::after {
+    scroll-behavior: auto !important;
+    transition-duration: 0.01ms !important;
+    animation-duration: 0.01ms !important;
+  }
+}
+

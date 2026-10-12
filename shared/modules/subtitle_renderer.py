@@ -7,6 +7,7 @@ from typing import Any, Iterable, Sequence
 
 from shared.core.safe_zone import get_subtitle_constraints
 from shared.core.video_encoding import final_output_args
+from shared.core.ffmpeg_utils import ffmpeg_command
 
 
 PHRASE_ENDINGS = (".", "!", "?", ";", ":", ",")
@@ -36,22 +37,33 @@ def _get_ass_header(
     font_name="UTM Helve",
     margin_l=90,
     margin_r=150,
+    clamp_to_safe_zone=True,
 ):
     ass_color = _ass_color(hex_color)
     constraints = get_subtitle_constraints()
-    font_size = max(
-        int(constraints.get("min_font_size", 46)),
-        min(int(constraints.get("max_font_size", 76)), int(font_size)),
-    )
-    # Keep subtitles clear of TikTok's bottom caption and right-side controls.
-    margin_v = max(
-        int(constraints.get("min_margin_bottom", 320)),
-        min(int(constraints.get("max_margin_bottom", 760)), int(margin_v)),
-    )
-    margin_l = max(int(constraints.get("min_margin_left", 40)), int(margin_l))
-    margin_r = max(int(constraints.get("min_margin_right", 100)), int(margin_r))
+    if clamp_to_safe_zone:
+        font_size = max(
+            int(constraints.get("min_font_size", 46)),
+            min(int(constraints.get("max_font_size", 76)), int(font_size)),
+        )
+        # Keep subtitles clear of TikTok's bottom caption and right-side controls.
+        margin_v = max(
+            int(constraints.get("min_margin_bottom", 320)),
+            min(int(constraints.get("max_margin_bottom", 760)), int(margin_v)),
+        )
+        margin_l = max(int(constraints.get("min_margin_left", 40)), int(margin_l))
+        margin_r = max(int(constraints.get("min_margin_right", 100)), int(margin_r))
+    else:
+        # Manual positions from the visual editor are still bounded by the ASS
+        # canvas, but must not be silently moved to the platform safe zone.
+        font_size = max(1, min(300, int(font_size)))
+        margin_v = max(0, min(1920, int(margin_v)))
+        margin_l = max(0, min(1080, int(margin_l)))
+        margin_r = max(0, min(1080, int(margin_r)))
 
+    position_mode = "safe-zone" if clamp_to_safe_zone else "manual"
     return f"""[Script Info]
+; PositionMode: {position_mode}
 ScriptType: v4.00+
 PlayResX: 1080
 PlayResY: 1920
@@ -178,7 +190,11 @@ def _apply_long_caption_preset(
     margin_v: int,
     margin_l: int,
     margin_r: int,
+    clamp_to_safe_zone: bool = True,
+    adaptive_long_caption: bool = False,
 ) -> tuple[int, int, int, int, int]:
+    if not clamp_to_safe_zone or not adaptive_long_caption:
+        return words_per_line, font_size, margin_v, margin_l, margin_r
     fallback = get_subtitle_constraints(long_caption=True)
     threshold = int(fallback.get("word_threshold", 95))
     if word_count < threshold:
@@ -205,6 +221,8 @@ def generate_word_ass(
     font_name: str = "Roboto Condensed",
     margin_l: int = 90,
     margin_r: int = 150,
+    clamp_to_safe_zone: bool = True,
+    adaptive_long_caption: bool = False,
 ):
     """
     Transcribe audio with Faster-Whisper and generate an ASS subtitle file.
@@ -238,6 +256,8 @@ def generate_word_ass(
             margin_v=margin_v,
             margin_l=margin_l,
             margin_r=margin_r,
+            clamp_to_safe_zone=clamp_to_safe_zone,
+            adaptive_long_caption=adaptive_long_caption,
         )
 
         lines = []
@@ -267,6 +287,7 @@ def generate_word_ass(
                 font_name=font_name,
                 margin_l=margin_l,
                 margin_r=margin_r,
+                clamp_to_safe_zone=clamp_to_safe_zone,
             ))
             f.write("\n".join(lines))
             f.write("\n")
@@ -292,6 +313,8 @@ def generate_text_ass(
     font_name: str = "Roboto Condensed",
     margin_l: int = 90,
     margin_r: int = 150,
+    clamp_to_safe_zone: bool = True,
+    adaptive_long_caption: bool = False,
 ):
     """
     Generate an approximate karaoke ASS file directly from the known script text.
@@ -312,6 +335,8 @@ def generate_text_ass(
             margin_v=margin_v,
             margin_l=margin_l,
             margin_r=margin_r,
+            clamp_to_safe_zone=clamp_to_safe_zone,
+            adaptive_long_caption=adaptive_long_caption,
         )
 
         word_duration = duration / len(words)
@@ -343,6 +368,7 @@ def generate_text_ass(
                 font_name=font_name,
                 margin_l=margin_l,
                 margin_r=margin_r,
+                clamp_to_safe_zone=clamp_to_safe_zone,
             ))
             f.write("\n".join(lines))
             f.write("\n")
@@ -365,11 +391,13 @@ def apply_subtitles_to_video(input_video: str, ass_path: str, output_video: str,
         safe_ass = ass_path.replace("\\", "/").replace(":", "\\:")
         sub_filter = f"subtitles='{safe_ass}'"
         if fonts_dir:
-            safe_fonts = fonts_dir.replace("\\", "/")
+            # Escape cả dấu hai chấm của ổ đĩa Windows ("D:/..." -> "D\:/..."),
+            # nếu không FFmpeg đọc "D" thành tên option và hỏng filtergraph.
+            safe_fonts = fonts_dir.replace("\\", "/").replace(":", "\\:")
             sub_filter += f":fontsdir='{safe_fonts}'"
 
         cmd = [
-            "ffmpeg", "-y", "-i", input_video,
+            *ffmpeg_command("-y", "-i", input_video),
             "-vf", sub_filter,
             *final_output_args(),
             output_video

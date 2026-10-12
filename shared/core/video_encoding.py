@@ -13,6 +13,11 @@ FINAL_VIDEO_ARGS = [
     "-preset", "medium",
     "-crf", "19",
     "-pix_fmt", "yuv420p",
+    # Ảnh JPEG giải mã ra dải màu đầy đủ (yuvj*), khiến bản encode cuối mang
+    # pix_fmt "yuvj420p" dù đã yêu cầu "yuv420p" — VideoQA coi đó là sai chuẩn
+    # và chặn upload. Ép hẳn về dải màu limited để mọi nguồn (ảnh lẫn video)
+    # cho ra đúng yuv420p.
+    "-color_range", "tv",
     "-profile:v", "high",
     "-level:v", "4.1",
     "-r", "30",

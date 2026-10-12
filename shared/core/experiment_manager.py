@@ -29,10 +29,14 @@ PRIMARY_METRICS = {
     "median_watched_full_rate",
     "median_retention_2s",
     "median_retention_6s",
+    "median_retention_drop_2s_to_6s",
     "shares_per_1000",
     "saves_per_1000",
     "follows_per_1000",
     "engagements_per_1000",
+}
+LOWER_IS_BETTER_METRICS = {
+    "median_retention_drop_2s_to_6s",
 }
 
 EXPERIMENT_VARIABLES: dict[str, dict[str, Any]] = {
@@ -515,9 +519,17 @@ def evaluate_experiment(
     uplift_percent = 0.0
     absolute_difference = 0.0
     if eligible and len(set(metric_values.values())) > 1:
-        leader = max(metric_values, key=metric_values.get)
+        leader = (
+            min(metric_values, key=metric_values.get)
+            if metric in LOWER_IS_BETTER_METRICS
+            else max(metric_values, key=metric_values.get)
+        )
         other = next(name for name in variant_names if name != leader)
-        absolute_difference = metric_values[leader] - metric_values[other]
+        absolute_difference = (
+            metric_values[other] - metric_values[leader]
+            if metric in LOWER_IS_BETTER_METRICS
+            else metric_values[leader] - metric_values[other]
+        )
         uplift_percent = (
             absolute_difference / abs(metric_values[other]) * 100.0
             if metric_values[other] else 0.0

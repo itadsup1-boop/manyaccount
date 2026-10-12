@@ -1,0 +1,124 @@
+.channel-create-grid {
+  grid-template-columns: minmax(210px, 0.8fr) minmax(280px, 1.5fr) 88px auto;
+}
+
+.channel-workspace {
+  display: grid;
+  grid-template-columns: 270px minmax(0, 1fr);
+  gap: 1rem;
+  align-items: start;
+}
+
+.channel-list {
+  position: sticky;
+  top: 0;
+}
+
+.channel-list__items {
+  display: grid;
+  gap: 0.5rem;
+}
+
+.channel-list-item {
+  display: grid;
+  gap: 0.16rem;
+  width: 100%;
+  min-height: 58px;
+  padding: 0.62rem 0.72rem;
+  border: 1px solid var(--tiktok-border);
+  border-radius: 10px;
+  background: #ffffff;
+  color: var(--tiktok-text);
+  text-align: left;
+}
+
+.channel-list-item:hover,
+.channel-list-item.is-active {
+  border-color: #b8bcff;
+  background: #f4f4ff;
+}
+
+.channel-list-item.is-active {
+  box-shadow: inset 3px 0 0 var(--tiktok-primary);
+}
+
+.channel-list-item strong {
+  overflow: hidden;
+  color: var(--tiktok-primary-dark);
+  font-size: 0.79rem;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.channel-list-item span {
+  color: var(--tiktok-subtle);
+  font-size: 0.71rem;
+}
+
+.channel-editor__header {
+  padding-bottom: 0.8rem;
+  border-bottom: 1px solid var(--tiktok-border);
+}
+
+.subtitle-lock {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  margin-top: 1rem;
+  padding: 0.75rem;
+  border: 1px solid var(--tiktok-border);
+  border-radius: 10px;
+  background: #fafbff;
+}
+
+.subtitle-lock > div {
+  display: grid;
+}
+
+.subtitle-lock strong {
+  font-size: 0.8rem;
+}
+
+.subtitle-lock span {
+  color: var(--tiktok-subtle);
+  font-size: 0.73rem;
+}
+
+.subtitle-lock .lock-badge {
+  color: var(--tiktok-warning);
+  background: #fffbeb;
+}
+
+.channel-editor__actions,
+.config-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 0.5rem;
+  margin-top: 1rem;
+  flex-wrap: wrap;
+}
+
+.tiktok-empty-state {
+  display: grid;
+  justify-items: center;
+  gap: 0.25rem;
+  padding: 2.5rem 1rem;
+  border: 1px dashed #cfd4df;
+  border-radius: 14px;
+  background: rgb(255 255 255 / 65%);
+  text-align: center;
+}
+
+.tiktok-empty-state.is-compact {
+  margin-top: 1rem;
+  padding: 1.5rem 1rem;
+}
+
+.tiktok-empty-state span,
+.tiktok-empty-inline {
+  color: var(--tiktok-subtle);
+  font-size: 0.78rem;
+}
+
+

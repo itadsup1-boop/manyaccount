@@ -5,14 +5,19 @@ CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_ROOT = os.path.dirname(os.path.dirname(CURRENT_DIR))
 sys.path.insert(0, PROJECT_ROOT)
 sys.path.insert(0, os.path.join(PROJECT_ROOT, "apps", "creator_facebook"))
+sys.path.insert(0, os.path.join(PROJECT_ROOT, "apps", "creator_article"))
 
 import telebot
 import threading
 import queue
 from dotenv import load_dotenv
 import re
+import time
+from contextlib import contextmanager
 from fb_pipeline import FBNewsPipeline
+from article_pipeline_core import ArticlePipelineCore
 import uuid
+from shared.core.ffmpeg_utils import ffmpeg_command
 
 load_dotenv()
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -21,7 +26,101 @@ if not BOT_TOKEN:
     print("⚠️ Vui lòng thêm TELEGRAM_BOT_TOKEN vào file .env")
     exit(1)
 
-bot = telebot.TeleBot(BOT_TOKEN)
+@contextmanager
+def _single_instance_lock():
+    """Giữ một bot polling duy nhất trên máy hiện tại.
+
+    Telegram chỉ cho phép một long-polling consumer cho mỗi token. Khóa này
+    tránh việc người vận hành mở nhầm hai cửa sổ bot trên cùng máy. Đây là
+    advisory lock nên tự giải phóng khi tiến trình chết, không để lại PID rác.
+    """
+    lock_dir = os.path.join(PROJECT_ROOT, "data")
+    os.makedirs(lock_dir, exist_ok=True)
+    lock_path = os.path.join(lock_dir, "telegram_bot.polling.lock")
+    lock_file = open(lock_path, "a+", encoding="utf-8")
+    # msvcrt.locking() cần ít nhất một byte trong file.
+    lock_file.seek(0, os.SEEK_END)
+    if lock_file.tell() == 0:
+        lock_file.write("1")
+        lock_file.flush()
+    lock_file.seek(0)
+    locked = False
+    try:
+        if os.name == "nt":
+            import msvcrt
+
+            try:
+                msvcrt.locking(lock_file.fileno(), msvcrt.LK_NBLCK, 1)
+                locked = True
+            except OSError:
+                locked = False
+        else:
+            import fcntl
+
+            try:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                locked = True
+            except OSError:
+                locked = False
+
+        if not locked:
+            print(
+                "❌ Bot đã chạy ở một tiến trình khác trên máy này. "
+                "Hãy dừng cửa sổ bot đang mở trước khi khởi động lại."
+            )
+            yield False
+            return
+
+        yield True
+    finally:
+        if locked:
+            try:
+                if os.name == "nt":
+                    import msvcrt
+
+                    lock_file.seek(0)
+                    msvcrt.locking(lock_file.fileno(), msvcrt.LK_UNLCK, 1)
+                else:
+                    import fcntl
+
+                    fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+            except OSError:
+                pass
+        lock_file.close()
+
+
+def _is_polling_conflict(error):
+    """Trả về True khi Telegram báo token đang bị consumer khác giữ."""
+    return getattr(error, "error_code", None) == 409 or (
+        "409" in str(error) and "getUpdates" in str(error)
+    )
+
+
+def _print_webhook_diagnostic():
+    """In URL webhook nếu token đang bị webhook giữ (không in token)."""
+    try:
+        webhook_info = bot.get_webhook_info()
+        webhook_url = getattr(webhook_info, "url", "") or ""
+        if webhook_url:
+            print(
+                f"ℹ️ Webhook hiện đang bật tại: {webhook_url}. "
+                "Hãy tắt webhook trước khi dùng polling."
+            )
+    except Exception:
+        # Chẩn đoán không được làm che mất lỗi 409 gốc.
+        pass
+
+
+class ConflictAwareTeleBot(telebot.TeleBot):
+    """Cho phép main() nhận 409 thay vì để pyTelegramBotAPI retry vô hạn."""
+
+    def _handle_exception(self, exception):
+        if _is_polling_conflict(exception):
+            raise exception
+        return super()._handle_exception(exception)
+
+
+bot = ConflictAwareTeleBot(BOT_TOKEN)
 
 def extract_video_id(url):
     # Dùng regex đơn giản để bóc ID hoặc trả về uuid ngẫu nhiên nếu không tìm thấy
@@ -29,6 +128,22 @@ def extract_video_id(url):
     if match:
         return match.group(1)
     return uuid.uuid4().hex[:8]
+
+
+def _clean_url(url):
+    """Bỏ dấu câu thường dính ở cuối link khi người dùng gửi qua Telegram."""
+    return str(url or "").strip().rstrip(".,!?;:)]}>")
+
+
+def classify_url(url):
+    """Phân loại link Telegram thành video mạng xã hội hoặc bài báo."""
+    clean_url = _clean_url(url)
+    lowered = clean_url.lower()
+    if any(host in lowered for host in ("tiktok.com", "facebook.com", "fb.watch")):
+        return "video", clean_url
+    if lowered.startswith(("http://", "https://")):
+        return "article", clean_url
+    return "unsupported", clean_url
 
 import json
 
@@ -89,7 +204,7 @@ def process_video_thread(message, url, c_id, c_info, extra_content=""):
                     
                     # Lệnh nén video bằng FFmpeg (giảm bitrate, nhanh)
                     cmd = [
-                        "ffmpeg", "-y", "-i", final_path,
+                        *ffmpeg_command("-y", "-i", final_path),
                         "-vcodec", "libx264", "-crf", "18", "-preset", "fast",
                         "-c:a", "aac", "-b:a", "64k",
                         compressed_path
@@ -130,6 +245,88 @@ def process_video_thread(message, url, c_id, c_info, extra_content=""):
     except Exception as e:
         bot.send_message(chat_id, f"❌ Có lỗi xảy ra trong Bot: {e}")
 
+
+def process_article_thread(message, url, c_id, c_info, extra_content=""):
+    """Tạo video bài báo thủ công từ một URL gửi qua Telegram."""
+    chat_id = message.chat.id
+    pipeline = ArticlePipelineCore()
+    source_id = f"telegram-{c_id}"
+    success_notified = {"value": False}
+
+    def on_success(drive_link, final_path, sheet_row=None):
+        success_notified["value"] = True
+        text = "📰 Đã tạo bài viết thủ công thành công!"
+        if sheet_row:
+            text += f"\n📊 Google Sheet: dòng {sheet_row}"
+        text += f"\n🔗 Link Google Drive: {drive_link}"
+        bot.send_message(chat_id, text)
+        _send_video_to_telegram(chat_id, final_path)
+
+    def on_error(error_message):
+        safe_err = str(error_message).replace("<", "&lt;").replace(">", "&gt;")
+        bot.send_message(
+            chat_id,
+            f"❌ <b>Không tạo được bài viết:</b>\n<code>{safe_err}</code>",
+            parse_mode="HTML",
+        )
+
+    bot.send_message(
+        chat_id,
+        "⏳ Đã nhận bài báo. Đang cào nội dung, viết kịch bản và dựng video "
+        "(có thể mất vài phút)...",
+    )
+    try:
+        result = pipeline.process_single_article(
+            c_id,
+            source_id,
+            url,
+            operator_instruction=extra_content,
+            manual_approval=True,
+            on_success=on_success,
+            on_error=on_error,
+        )
+        if result == "skipped":
+            bot.send_message(chat_id, "⏭️ Bài báo đã được AI đánh dấu không phù hợp.")
+        elif result is True and not success_notified["value"]:
+            bot.send_message(chat_id, "⚠️ Link bài báo này đã được xử lý trước đó; hệ thống không tạo trùng.")
+        elif not result:
+            # Chi tiết lỗi đã được gửi qua on_error.
+            pass
+    except Exception as error:
+        on_error(error)
+
+
+def _send_video_to_telegram(chat_id, final_path):
+    """Gửi bản nén thành phẩm nếu Telegram Bot API còn đủ hạn mức."""
+    try:
+        if not final_path or not os.path.exists(final_path):
+            return
+        import subprocess
+        compressed_path = final_path.replace(".mp4", "_compressed.mp4")
+        bot.send_message(chat_id, "🗜 Đang nén video để gửi trực tiếp vào Telegram...")
+        cmd = [
+            *ffmpeg_command("-y", "-i", final_path),
+            "-vcodec", "libx264", "-crf", "18", "-preset", "fast",
+            "-c:a", "aac", "-b:a", "64k", compressed_path,
+        ]
+        subprocess.run(cmd, capture_output=True, check=False)
+        send_path = compressed_path if os.path.exists(compressed_path) else final_path
+        size_mb = os.path.getsize(send_path) / 1024 / 1024
+        if size_mb < 50:
+            bot.send_message(chat_id, f"📤 Đang tải video lên Telegram ({size_mb:.1f}MB)...")
+            with open(send_path, "rb") as video_file:
+                bot.send_video(chat_id, video_file, caption="🎬 Thành phẩm của bạn đây!")
+        else:
+            bot.send_message(
+                chat_id,
+                f"⚠️ Video {size_mb:.1f}MB vượt giới hạn gửi trực tiếp; "
+                "vui lòng tải từ link Google Drive.",
+            )
+        if os.path.exists(compressed_path):
+            os.remove(compressed_path)
+    except Exception as error:
+        bot.send_message(chat_id, f"⚠️ Không gửi được video trực tiếp: {error}")
+
 # Queue chứa các link chờ xử lý
 video_queue = queue.Queue()
 pending_urls = {}
@@ -140,15 +337,21 @@ def worker_loop():
         if task is None:
             break
         
-        # task = (message, url, c_id, c_info, extra_content)
-        if len(task) == 5:
+        # task = (kind, message, url, c_id, c_info, extra_content)
+        if len(task) == 6:
+            kind, message, url, c_id, c_info, extra_content = task
+        elif len(task) == 5:  # Tương thích task video đời cũ
             message, url, c_id, c_info, extra_content = task
-        else: # Tương thích cũ nếu có lỗi
+            kind = "video"
+        else:
             message, url, c_id, c_info = task
-            extra_content = ""
-            
+            kind, extra_content = "video", ""
+        
         bot.send_message(message.chat.id, f"⚙️ Đến lượt bạn! Hệ thống đang xử lý link cho kênh {c_info.get('name')}...")
-        process_video_thread(message, url, c_id, c_info, extra_content)
+        if kind == "article":
+            process_article_thread(message, url, c_id, c_info, extra_content)
+        else:
+            process_video_thread(message, url, c_id, c_info, extra_content)
         video_queue.task_done()
 
 # Khởi chạy 1 worker duy nhất
@@ -287,18 +490,31 @@ def handle_stats(message):
 
 @bot.message_handler(func=lambda message: True)
 def handle_message(message):
-    text = message.text
+    text = message.text or ""
     chat_id = message.chat.id
     
-    urls = re.findall(r'(https?://[^\s]+)', text)
+    urls = [_clean_url(item) for item in re.findall(r'(https?://[^\s]+)', text)]
     if not urls:
-        bot.send_message(chat_id, "👋 Chào bạn! Hãy dán 1 link TikTok hoặc Facebook vào đây, tôi sẽ tự động xử lý video cho bạn!\n\n💡 Bạn cũng có thể dùng lệnh /stats để xem tiến độ làm video hôm nay.")
+        bot.send_message(
+            chat_id,
+            "👋 Hãy gửi link TikTok/Facebook để làm video, hoặc gửi link bài báo "
+            "kèm tin nhắn chỉ đạo để tạo bài viết thủ công.\n\n"
+            "💡 Bạn cũng có thể dùng lệnh /stats để xem tiến độ hôm nay.",
+        )
         return
         
-    valid_urls = [u for u in urls if 'tiktok.com' in u or 'facebook.com' in u or 'fb.watch' in u]
-    
-    if not valid_urls:
-        bot.send_message(chat_id, "⚠️ Hiện tại tôi chỉ hỗ trợ link TikTok và Facebook.")
+    classified = [classify_url(url) for url in urls]
+    unsupported = [url for kind, url in classified if kind == "unsupported"]
+    if unsupported:
+        bot.send_message(chat_id, "⚠️ Có link không hợp lệ. Hãy gửi URL bắt đầu bằng http:// hoặc https://.")
+        return
+
+    kinds = {kind for kind, _ in classified}
+    if len(kinds) > 1:
+        bot.send_message(
+            chat_id,
+            "⚠️ Vui lòng gửi riêng link video và link bài báo; một tin nhắn không nên trộn hai loại.",
+        )
         return
 
     channels = load_channels()
@@ -311,8 +527,19 @@ def handle_message(message):
         btn = telebot.types.InlineKeyboardButton(c_info.get('name', c_id), callback_data=f"chan_{c_id}")
         markup.add(btn)
 
-    pending_urls[message.message_id] = valid_urls
-    bot.reply_to(message, f"📥 Đã nhận {len(valid_urls)} link.\nVui lòng chọn kênh để làm video:", reply_markup=markup)
+    link_kind = next(iter(kinds))
+    inline_instruction = re.sub(r'https?://[^\s]+', ' ', text).strip()
+    pending_urls[message.message_id] = {
+        "kind": link_kind,
+        "urls": [url for _, url in classified],
+        "initial_content": inline_instruction,
+    }
+    action = "tạo bài viết thủ công" if link_kind == "article" else "làm video"
+    bot.reply_to(
+        message,
+        f"📥 Đã nhận {len(urls)} link.\nVui lòng chọn kênh để {action}:",
+        reply_markup=markup,
+    )
 
 # Dict lưu trạng thái chờ nhập content: { chat_id: { "urls", "c_id", "c_info", "reply_msg", "waiting": True } }
 pending_content = {}
@@ -323,10 +550,17 @@ def callback_channel(call):
     msg_id = call.message.reply_to_message.message_id if call.message.reply_to_message else None
     
     if msg_id and msg_id in pending_urls:
-        urls = pending_urls.pop(msg_id)
+        pending_request = pending_urls.pop(msg_id)
+        if isinstance(pending_request, dict):
+            urls = pending_request.get("urls", [])
+            link_kind = pending_request.get("kind", "video")
+            initial_content = pending_request.get("initial_content", "")
+        else:  # Tương thích dữ liệu pending của bản cũ
+            urls, link_kind, initial_content = pending_request, "video", ""
         channels = load_channels()
         c_info = channels.get(c_id, {})
         c_name = c_info.get("name", c_id)
+        item_label = "bài báo" if link_kind == "article" else "video"
         
         # Tạo nút "Bỏ qua"
         skip_markup = telebot.types.InlineKeyboardMarkup()
@@ -334,9 +568,9 @@ def callback_channel(call):
         
         bot.edit_message_text(
             f"✅ Đã chọn kênh: <b>{c_name}</b>\n\n"
-            f"💬 Bạn có muốn gửi thêm nội dung/chỉ đạo cho video không?\n\n"
+            f"💬 Bạn có muốn gửi thêm nội dung/chỉ đạo cho {item_label} không?\n\n"
             f"👉 <b>Nhập nội dung</b> vào ô chat bên dưới\n"
-            f"👉 Hoặc bấm nút <b>Bỏ qua</b> để dùng nội dung gốc của video",
+            f"👉 Hoặc bấm nút <b>Bỏ qua</b> để dùng nội dung gốc",
             call.message.chat.id, call.message.message_id,
             reply_markup=skip_markup, parse_mode="HTML"
         )
@@ -348,8 +582,24 @@ def callback_channel(call):
             "c_info": c_info,
             "reply_msg": call.message.reply_to_message,
             "prompt_msg_id": call.message.message_id,
+            "kind": link_kind,
             "waiting": True
         }
+
+        # Cho phép gửi link và chỉ đạo trong cùng một tin nhắn. Nếu có phần
+        # chữ ngoài URL, không bắt người dùng gửi lại một tin nhắn thứ hai.
+        if initial_content:
+            pending_content[call.message.chat.id]["waiting"] = False
+            pending_content.pop(call.message.chat.id, None)
+            bot.edit_message_text(
+                f"✅ Đã nhận chỉ đạo thủ công.\n🚀 Đưa {len(urls)} link vào hàng đợi xử lý.",
+                call.message.chat.id,
+                call.message.message_id,
+            )
+            for url in urls:
+                video_queue.put((link_kind, call.message.reply_to_message, url, c_id, c_info, initial_content))
+            bot.answer_callback_query(call.id, "✅ Đã đưa vào hàng đợi!")
+            return
         
         # Đăng ký lắng nghe tin nhắn tiếp theo
         bot.register_next_step_handler(call.message, process_extra_content)
@@ -367,10 +617,11 @@ def callback_skip_content(call):
         c_id = ctx["c_id"]
         c_info = ctx["c_info"]
         reply_msg = ctx["reply_msg"]
+        link_kind = ctx.get("kind", "video")
         
         # Xóa nút bỏ qua và cập nhật tin nhắn
         bot.edit_message_text(
-            f"⏭ Đã bỏ qua phần nhập nội dung.\n🚀 Đưa {len(urls)} link vào hàng đợi xử lý (dùng nội dung gốc video).",
+            f"⏭ Đã bỏ qua phần nhập nội dung.\n🚀 Đưa {len(urls)} link vào hàng đợi xử lý (dùng nội dung gốc).",
             chat_id, call.message.message_id
         )
         
@@ -378,7 +629,7 @@ def callback_skip_content(call):
         bot.clear_step_handler_by_chat_id(chat_id)
         
         for url in urls:
-            video_queue.put((reply_msg, url, c_id, c_info, ""))
+            video_queue.put((link_kind, reply_msg, url, c_id, c_info, ""))
         
         bot.answer_callback_query(call.id, "✅ Đã bỏ qua!")
     else:
@@ -397,6 +648,7 @@ def process_extra_content(message):
     c_info = ctx["c_info"]
     reply_msg = ctx["reply_msg"]
     prompt_msg_id = ctx.get("prompt_msg_id")
+    link_kind = ctx.get("kind", "video")
     
     extra_content = (message.text or "").strip()
     
@@ -413,22 +665,37 @@ def process_extra_content(message):
         bot.send_message(chat_id, f"🚀 Đưa {len(urls)} link vào hàng đợi xử lý (dùng nội dung gốc video).")
     
     for url in urls:
-        video_queue.put((reply_msg, url, c_id, c_info, extra_content))
+        video_queue.put((link_kind, reply_msg, url, c_id, c_info, extra_content))
 
 if __name__ == '__main__':
-    print("🚀 Telegram Bot đang chạy! Chờ tin nhắn...")
     import logging
-    import time
     telebot.logger.setLevel(logging.ERROR)  # Ẩn các cảnh báo timeout mạng rác
-    
-    while True:
-        try:
-            # Tăng timeout lên 60s để chống lỗi mạng
-            bot.infinity_polling(timeout=60)
-        except KeyboardInterrupt:
-            print("Đã dừng Bot.")
-            break
-        except Exception as e:
-            print(f"⚠️ Lỗi đứt kết nối mạng Telegram: {e}")
-            print("⏳ Đang thử kết nối lại sau 5 giây...")
-            time.sleep(5)
+
+    with _single_instance_lock() as lock_owned:
+        if not lock_owned:
+            raise SystemExit(1)
+
+        print("🚀 Telegram Bot đang chạy! Chờ tin nhắn...")
+        while True:
+            try:
+                # Dùng polling một vòng thay vì infinity_polling: bản
+                # infinity_polling của pyTelegramBotAPI nuốt 409 rồi retry
+                # vô hạn, khiến bot spam log và không bao giờ thoát.
+                bot.polling(non_stop=False, timeout=60, logger_level=logging.ERROR)
+                print("⚠️ Polling đã dừng; thử kết nối lại sau 5 giây...")
+                time.sleep(5)
+            except KeyboardInterrupt:
+                print("Đã dừng Bot.")
+                break
+            except Exception as error:
+                if _is_polling_conflict(error):
+                    _print_webhook_diagnostic()
+                    print(
+                        "❌ Telegram từ chối polling (409 Conflict): token đang "
+                        "bị một tiến trình khác hoặc webhook giữ. Hãy dừng bot "
+                        "còn lại/tắt webhook rồi khởi động lại."
+                    )
+                    break
+                print(f"⚠️ Lỗi kết nối Telegram: {error}")
+                print("⏳ Đang thử kết nối lại sau 5 giây...")
+                time.sleep(5)

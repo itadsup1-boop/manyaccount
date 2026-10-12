@@ -1,0 +1,422 @@
+.dashboard-page {
+  display: flex;
+  flex-direction: column;
+  gap: 1.25rem;
+  max-width: 1200px;
+  margin: 0 auto;
+}
+
+.dashboard-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 1rem;
+  margin-bottom: 0.25rem;
+}
+
+.dashboard-eyebrow {
+  display: inline-block;
+  font-size: 0.76rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--tiktok-primary-dark, #4f46e5);
+  margin-bottom: 0.2rem;
+}
+
+.dashboard-title {
+  margin: 0;
+  font-size: 1.35rem;
+  font-weight: 800;
+  color: var(--tiktok-text, #1f2430);
+  line-height: 1.25;
+}
+
+.dashboard-subtitle {
+  margin: 0.2rem 0 0;
+  color: var(--tiktok-subtle, #6b7280);
+  font-size: 0.82rem;
+}
+
+.dashboard-header__actions {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+}
+
+.dashboard-health {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  padding: 0.45rem 0.75rem;
+  border-radius: 999px;
+  font-size: 0.78rem;
+  font-weight: 700;
+}
+
+.dashboard-health--healthy {
+  background: #dcfce7;
+  color: #15803d;
+}
+
+.dashboard-health--attention {
+  background: #fee2e2;
+  color: #b91c1c;
+}
+
+.dashboard-health--empty {
+  background: #f3f4f6;
+  color: #6b7280;
+}
+
+.dashboard-filters {
+  display: grid;
+  grid-template-columns: auto repeat(5, 1fr) auto;
+  gap: 0.85rem;
+  align-items: flex-end;
+  padding: 1.1rem 1.25rem;
+  border: 1px solid var(--tiktok-border, #e5e8f0);
+  border-radius: 14px;
+  background: #ffffff;
+  box-shadow: 0 2px 8px rgba(31, 36, 48, 0.03);
+}
+
+.dashboard-filters__title {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  font-size: 0.88rem;
+  font-weight: 750;
+  color: var(--tiktok-text, #1f2430);
+  padding-bottom: 0.5rem;
+  white-space: nowrap;
+}
+
+.dashboard-field {
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+}
+
+.dashboard-field span {
+  font-size: 0.75rem;
+  font-weight: 600;
+  color: var(--tiktok-subtle, #6b7280);
+}
+
+.dashboard-filters__actions {
+  display: flex;
+  gap: 0.5rem;
+  align-items: flex-end;
+}
+
+.dashboard-summary__meta {
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+  margin-bottom: 0.85rem;
+  font-size: 0.8rem;
+  color: var(--tiktok-subtle, #6b7280);
+}
+
+.dashboard-status {
+  display: inline-flex;
+  align-items: center;
+  padding: 0.25rem 0.65rem;
+  border-radius: 999px;
+  font-weight: 700;
+  font-size: 0.74rem;
+}
+
+.dashboard-status--ready {
+  background: #dcfce7;
+  color: #15803d;
+}
+
+.dashboard-status--insufficient_sample {
+  background: #fef3c7;
+  color: #b45309;
+}
+
+.dashboard-status--empty {
+  background: #f3f4f6;
+  color: #6b7280;
+}
+
+.dashboard-kpis {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  gap: 0.75rem;
+}
+
+.dashboard-kpi {
+  display: flex;
+  flex-direction: column;
+  padding: 0.95rem;
+  border-radius: 12px;
+  border: 1px solid var(--tiktok-border, #e5e8f0);
+  background: #ffffff;
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.02);
+  transition: transform 0.15s ease, box-shadow 0.15s ease;
+}
+
+.dashboard-kpi:hover {
+  transform: translateY(-1px);
+  box-shadow: 0 4px 12px rgba(99, 102, 241, 0.08);
+}
+
+.dashboard-kpi__header {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  margin-bottom: 0.4rem;
+}
+
+.dashboard-kpi__icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  border-radius: 8px;
+}
+
+.dashboard-kpi--indigo .dashboard-kpi__icon { background: #eef0ff; color: #4f46e5; }
+.dashboard-kpi--blue .dashboard-kpi__icon { background: #e0f2fe; color: #0284c7; }
+.dashboard-kpi--cyan .dashboard-kpi__icon { background: #cff4fc; color: #0891b2; }
+.dashboard-kpi--green .dashboard-kpi__icon { background: #dcfce7; color: #16a34a; }
+.dashboard-kpi--orange .dashboard-kpi__icon { background: #ffedd5; color: #ea580c; }
+.dashboard-kpi--pink .dashboard-kpi__icon { background: #fce7f3; color: #db2777; }
+.dashboard-kpi--purple .dashboard-kpi__icon { background: #f3e8ff; color: #9333ea; }
+
+.dashboard-kpi__label {
+  font-size: 0.76rem;
+  font-weight: 650;
+  color: var(--tiktok-subtle, #6b7280);
+}
+
+.dashboard-kpi__value {
+  font-size: 1.3rem;
+  font-weight: 800;
+  color: var(--tiktok-text, #1f2430);
+  line-height: 1.2;
+}
+
+.dashboard-kpi__note {
+  margin-top: 0.35rem;
+  font-size: 0.72rem;
+  color: var(--tiktok-subtle, #6b7280);
+  line-height: 1.35;
+}
+
+.dashboard-layout {
+  display: grid;
+  grid-template-columns: 1fr 340px;
+  gap: 1rem;
+}
+
+.dashboard-panel {
+  padding: 1.25rem;
+  border: 1px solid var(--tiktok-border, #e5e8f0);
+  border-radius: 14px;
+  background: #ffffff;
+  box-shadow: 0 2px 8px rgba(31, 36, 48, 0.03);
+}
+
+.dashboard-panel__header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 1rem;
+  margin-bottom: 1rem;
+}
+
+.dashboard-panel__eyebrow {
+  display: block;
+  font-size: 0.72rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--tiktok-primary-dark, #4f46e5);
+}
+
+.dashboard-panel__header h3 {
+  margin: 0.15rem 0 0;
+  font-size: 0.96rem;
+  font-weight: 750;
+  color: var(--tiktok-text, #1f2430);
+}
+
+.dashboard-panel__controls {
+  display: flex;
+  gap: 0.5rem;
+}
+
+.dashboard-bars {
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+}
+
+.dashboard-bar-row {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+}
+
+.dashboard-bar-row__meta {
+  display: flex;
+  justify-content: space-between;
+  font-size: 0.78rem;
+}
+
+.dashboard-bar-row__meta strong {
+  color: var(--tiktok-text, #1f2430);
+  font-weight: 700;
+}
+
+.dashboard-bar-row__meta span {
+  color: var(--tiktok-subtle, #6b7280);
+}
+
+.dashboard-bar-track {
+  height: 10px;
+  border-radius: 999px;
+  background: #f1f5f9;
+  overflow: hidden;
+}
+
+.dashboard-bar {
+  display: block;
+  height: 100%;
+  border-radius: 999px;
+  background: linear-gradient(90deg, #6366f1, #818cf8);
+  width: var(--dashboard-bar-width, 0%);
+  transition: width 0.3s ease;
+}
+
+.dashboard-bar--pending {
+  background: #cbd5e1;
+}
+
+.dashboard-quality-grid {
+  display: grid;
+  grid-template-columns: repeat(2, 1fr);
+  gap: 0.6rem;
+  margin-bottom: 1rem;
+}
+
+.dashboard-quality-grid > div {
+  padding: 0.6rem 0.75rem;
+  border-radius: 8px;
+  background: #f8fafc;
+  border: 1px solid #f1f5f9;
+}
+
+.dashboard-quality-grid dt {
+  font-size: 0.72rem;
+  color: var(--tiktok-subtle, #6b7280);
+}
+
+.dashboard-quality-grid dd {
+  margin: 0.1rem 0 0;
+  font-size: 1rem;
+  font-weight: 750;
+  color: var(--tiktok-text, #1f2430);
+}
+
+.dashboard-failure-count {
+  padding: 0.25rem 0.6rem;
+  border-radius: 999px;
+  background: #f1f5f9;
+  color: #64748b;
+  font-size: 0.75rem;
+  font-weight: 700;
+}
+
+.dashboard-failure-count.is-alert {
+  background: #fee2e2;
+  color: #dc2626;
+}
+
+.dashboard-stage-list {
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+}
+
+.dashboard-stage {
+  display: flex;
+  justify-content: space-between;
+  padding: 0.45rem 0.65rem;
+  border-radius: 6px;
+  background: #fff1f2;
+  font-size: 0.76rem;
+  color: #be123c;
+}
+
+.dashboard-table-wrap {
+  overflow-x: auto;
+}
+
+.dashboard-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.82rem;
+}
+
+.dashboard-table th {
+  text-align: left;
+  padding: 0.65rem 0.75rem;
+  border-bottom: 1px solid var(--tiktok-border, #e5e8f0);
+  color: var(--tiktok-subtle, #6b7280);
+  font-weight: 650;
+  font-size: 0.76rem;
+}
+
+.dashboard-table td {
+  padding: 0.65rem 0.75rem;
+  border-bottom: 1px solid #f1f5f9;
+  color: var(--tiktok-text, #1f2430);
+}
+
+.dashboard-table tbody tr:hover {
+  background: #f8fafc;
+}
+
+.dashboard-table-empty {
+  text-align: center;
+  color: var(--tiktok-subtle, #6b7280);
+  padding: 1.5rem !important;
+}
+
+.dashboard-code {
+  font-family: Consolas, monospace;
+  font-size: 0.75rem;
+  padding: 0.15rem 0.4rem;
+  border-radius: 4px;
+  background: #f1f5f9;
+}
+
+.dashboard-code--danger {
+  background: #fee2e2;
+  color: #b91c1c;
+}
+
+.dashboard-spin {
+  animation: dashboard-spin 1s linear infinite;
+}
+
+@keyframes dashboard-spin {
+  from { transform: rotate(0deg); }
+  to { transform: rotate(360deg); }
+}
+
+@media (max-width: 900px) {
+  .dashboard-filters {
+    grid-template-columns: 1fr 1fr;
+  }
+  .dashboard-layout {
+    grid-template-columns: 1fr;
+  }
+}

@@ -4,6 +4,7 @@ import time
 import json
 import requests
 import re
+import shutil
 
 # =========================================================================
 # 1. THIẾT LẬP ĐƯỜNG DẪN HỆ THỐNG TRƯỚC TIÊN (Để chống lỗi ModuleNotFoundError)
@@ -14,19 +15,23 @@ sys.path.insert(0, WORKSPACE_ROOT)
 sys.path.insert(0, SHARED_DIR)
 PROJECT_ROOT = SHARED_DIR
 
+try:
+    from dotenv import load_dotenv
+
+    load_dotenv(os.path.join(WORKSPACE_ROOT, ".env"), override=False)
+except Exception:
+    pass
+
 # Đảm bảo các thư mục assets tồn tại
 TEMP_VOICE_DIR = os.path.join(PROJECT_ROOT, "assets", "temp_voice")
 FRAME_DIR = os.path.join(PROJECT_ROOT, "assets", "frame")
 LOGO_DIR = os.path.join(PROJECT_ROOT, "assets", "logo")
 FONT_DIR = os.path.join(PROJECT_ROOT, "assets", "font")
-CREDENTIALS_FILE = os.path.join(PROJECT_ROOT,"config",'credentials.json')
+CREDENTIALS_FILE = os.path.join(PROJECT_ROOT, "config", "credentials.json")
 
 for d in [TEMP_VOICE_DIR, FRAME_DIR, LOGO_DIR, FONT_DIR]:
     if not os.path.exists(d): os.makedirs(d)
 
-# =========================================================================
-# 2. BÂY GIỜ MỚI IMPORT CÁC MODULE NỘI BỘ
-# =========================================================================
 try:
     from services.tele_reporter import TeleReporter
     from core.context import AccountContext
@@ -34,7 +39,9 @@ try:
         download_tiktok_video,
         get_channel_video_candidates,
     )
-    from apps.creator_facebook.chatgpt_automator import analyze_video_with_chatgpt
+    from services.tiktok_clipssaver import title_dedupe_key
+    from modules.whisper_transcriber import extract_transcript_from_media
+    from shared.core.ai_provider_factory import analyze_video_content, get_configured_ai_provider
     from modules.video_remix import create_video_from_source_video
     from modules.upload_drive import upload_video_to_drive
     from services.sheet_api import get_latest_row_by_id, save_to_sheet, update_final_result, update_voice_links, update_source_link
@@ -46,8 +53,15 @@ try:
         summarize_validation,
     )
     from core.prompt_builder import build_channel_instruction, get_content_profile
-    from core.evidence_guard import guard_evidence, summarize_evidence
+    from core.evidence_guard import (
+        EVIDENCE_GUARD_ENABLED,
+        guard_evidence,
+        summarize_evidence,
+    )
     from core.rights_guard import guard_source_rights
+    from core.visual_grounding import guard_visual_grounding, summarize_visual_grounding
+    from core.social_evidence import build_social_evidence_pack
+    from core.social_quality_gate import evaluate_social_quality, summarize_social_quality
     from core.source_ranker import rank_candidates, should_process_candidate
     from core.pipeline_state import PipelineLifecycle, PipelineStageError
     from core.quality_log import append_quality_event
@@ -62,6 +76,58 @@ def is_valid_vietnamese(text):
     vn_chars_pattern = re.compile(r'[àáạảãâầấậẩẫăằắặẳẵèéẹẻẽêềếệểễìíịỉĩòóọỏõôồốộổỗơờớợởỡùúụủũưừứựửữỳýỵỷỹđ]', re.IGNORECASE)
     return bool(vn_chars_pattern.search(text))
 
+
+def retry_pending_sheet_results(ctx, sheet_url, state):
+    """Ghi bù link Drive đã upload nhưng Sheet từng trả lỗi/rỗng.
+
+    Video đã có trên Drive thì không render/upload lại. Chỉ retry thao tác
+    lưu kết quả và đánh dấu candidate đã xử lý sau khi Sheet xác nhận success.
+    """
+    pending = ctx.load_pending_results()
+    if not pending:
+        return 0
+
+    remaining = []
+    recovered = 0
+    for item in pending:
+        row = item.get("row")
+        drive_link = str(item.get("drive_link") or "").strip()
+        if not row or not drive_link:
+            remaining.append(item)
+            continue
+        if update_final_result(sheet_url, row, drive_link):
+            candidate_url = str(item.get("candidate_url") or "").strip()
+            title_key = str(item.get("title_key") or "").strip()
+            if candidate_url and candidate_url not in state.setdefault("crawled_videos", []):
+                state["crawled_videos"].append(candidate_url)
+            if title_key and title_key not in state.setdefault("crawled_video_titles", []):
+                state["crawled_video_titles"].append(title_key)
+            source_url = str(item.get("source_url") or "").strip()
+            if source_url:
+                counts = state.setdefault("pending_video_index_increments", {})
+                counts[source_url] = int(counts.get(source_url, 0)) + 1
+            local_path = str(item.get("local_path") or "").strip()
+            if local_path and os.path.exists(local_path):
+                try:
+                    os.remove(local_path)
+                except OSError:
+                    pass
+            recovered += 1
+            ctx.logger.info(
+                f"✅ Đã khôi phục kết quả pending: dòng {row} -> {drive_link}"
+            )
+        else:
+            remaining.append(item)
+
+    ctx.save_pending_results(remaining)
+    if recovered:
+        ctx.save_state(state)
+    if remaining:
+        ctx.logger.warning(
+            f"⚠️ Còn {len(remaining)} kết quả Drive chờ ghi lại vào Sheet."
+        )
+    return recovered
+
 def load_credentials():
     if not os.path.exists(CREDENTIALS_FILE): return {}
     try:
@@ -69,7 +135,7 @@ def load_credentials():
     except: return {}
 
 def handle_tts_and_update_sheet(
-    api_key, text, voice_id, row_idx, sheet_url, is_title=False, save_dir=None, speed=1.05
+    api_key, text, voice_id, row_idx, sheet_url, is_title=False, save_dir=None, speed=1.03
 ):
     if not text: return None, None
 
@@ -89,6 +155,7 @@ def handle_tts_and_update_sheet(
             rvc_pitch=0,
             emotion="binh_thuong",
             speed=speed,
+            api_key=api_key,
         )
 
         if local_path and os.path.exists(local_path):
@@ -133,8 +200,15 @@ def run_worker_process(account_id):
 
     state = ctx.load_state()
     if "crawled_videos" not in state: state["crawled_videos"] = []
+    if "crawled_video_titles" not in state:
+        state["crawled_video_titles"] = []
     if "pending_video_index_increments" not in state:
         state["pending_video_index_increments"] = {}
+
+    retry_pending_sheet_results(ctx, sheet_url, state)
+    pending_results = ctx.load_pending_results()
+    pending_urls = {str(item.get("candidate_url") or "") for item in pending_results}
+    pending_titles = {str(item.get("title_key") or "") for item in pending_results}
 
     processed_count = 0
     acc_limit = cfg.get("video_limit_per_run", 3)
@@ -149,24 +223,41 @@ def run_worker_process(account_id):
         src_url = channel.get("url") or channel.get("channel_url")
         if not src_url: continue
 
-        limit = channel.get("limit", 3)
+        # ClipSaver chỉ lấy tối đa ba video mới nhất cho mỗi kênh nguồn.
+        limit = max(1, min(int(channel.get("limit", 3) or 3), 3))
         render_settings = channel.get("render_settings", {})
-        last_crawled_url = channel.get("last_video_url", "")
 
-        ctx.logger.info(f"🔍 Quét kênh: {src_url} (Lấy tối đa {limit} video)")
+        ctx.logger.info(
+            f"🔍 Quét ClipSaver: {src_url} (Lấy tối đa {limit} video)"
+        )
 
         try:
-            all_videos = get_channel_video_candidates(src_url, limit=15)
+            all_videos = get_channel_video_candidates(src_url, limit=limit)
         except Exception as e:
             ctx.logger.error(f"   ⚠️ Lỗi quét video: {e}")
             continue
 
         new_videos_batch = []
         for candidate in all_videos:
-            video_url = candidate.get("url", "")
-            if video_url == last_crawled_url:
-                break
-            if video_url in state["crawled_videos"]:
+            candidate_title_key = str(
+                candidate.get("title_key")
+                or title_dedupe_key(
+                    src_url,
+                    candidate.get("title") or candidate.get("caption") or "",
+                )
+            )
+            if not candidate_title_key:
+                ctx.logger.info("   ⏭️ Bỏ qua video không có tiêu đề.")
+                continue
+            candidate["title_key"] = candidate_title_key
+            if candidate.get("url") in pending_urls or candidate_title_key in pending_titles:
+                ctx.logger.info("   ⏳ Video đã upload Drive, đang chờ ghi link vào Sheet.")
+                continue
+            if candidate_title_key in state["crawled_video_titles"]:
+                ctx.logger.info(
+                    f"   ⏭️ Tiêu đề đã xử lý: "
+                    f"{candidate.get('title') or candidate.get('caption') or ''}"
+                )
                 continue
             new_videos_batch.append(candidate)
 
@@ -183,17 +274,34 @@ def run_worker_process(account_id):
             clean_tid,
             *operator_profiles,
         )
+        manual_topic_approval = str(
+            os.environ.get("TIKTOK_TOPIC_GATE", "off")
+        ).strip().lower() not in {"1", "true", "yes", "on"}
         ranked_videos = rank_candidates(
             new_videos_batch,
             resolved_content_profile,
             source_type="tiktok",
+            # TikTok sources are manually approved by the operator.  Keep
+            # SourceRanker for ordering, but do not reject a candidate merely
+            # because its metadata does not match the output-channel topic.
+            thresholds={"reject": 0} if manual_topic_approval else None,
         )
         videos_to_process = ranked_videos[:limit]
 
-        def mark_candidate_handled(video_url):
+        def mark_candidate_handled(handled_candidate):
+            video_url = handled_candidate.get("url", "")
+            handled_title_key = handled_candidate.get("title_key", "")
             if video_url not in state["crawled_videos"]:
                 state["crawled_videos"].append(video_url)
-                ctx.save_state(state)
+            if (
+                handled_title_key
+                and handled_title_key not in state["crawled_video_titles"]
+            ):
+                state["crawled_video_titles"].append(handled_title_key)
+            # Giữ state gọn khi tiến trình chạy lâu.
+            state["crawled_videos"] = state["crawled_videos"][-2000:]
+            state["crawled_video_titles"] = state["crawled_video_titles"][-2000:]
+            ctx.save_state(state)
 
         for candidate in videos_to_process:
             vid_url = candidate["url"]
@@ -209,13 +317,13 @@ def run_worker_process(account_id):
             )
             if not should_process_candidate(candidate):
                 ctx.logger.info("   ⏭️ SourceRanker loại video không phù hợp kênh.")
-                mark_candidate_handled(vid_url)
+                mark_candidate_handled(candidate)
                 continue
 
             rights = guard_source_rights(candidate, channel)
             if not rights.passed:
                 ctx.logger.info(f"   ⛔ RightsGuard chặn: {' '.join(rights.errors)}")
-                mark_candidate_handled(vid_url)
+                mark_candidate_handled(candidate)
                 continue
             if rights.requires_review:
                 ctx.logger.info(f"   ⚠️ RightsGuard: {' '.join(rights.warnings)}")
@@ -224,14 +332,22 @@ def run_worker_process(account_id):
             quality_score = 0
             qa_result = None
             try:
-                paths = download_tiktok_video(vid_url, ctx.temp_dir)
+                paths = download_tiktok_video(
+                    vid_url,
+                    ctx.temp_dir,
+                    candidate=candidate,
+                )
                 if not paths: continue
-
-                # (Đã di chuyển phần update link lên Google Sheet xuống phía dưới, sau khi AI Studio chạy xong)
 
                 up_path = paths.get('ai_studio') or paths.get('original')
 
-                ctx.logger.info("   🤖 Gửi video cho ChatGPT phân tích, bỏ qua Google AI Studio...")
+                whisper_transcript = ""
+                if up_path and os.path.exists(up_path):
+                    ctx.logger.info("   🎙️ Đang bóc tách thoại video gốc bằng Faster-Whisper...")
+                    whisper_transcript = extract_transcript_from_media(up_path, model_name="base")
+
+                active_provider = get_configured_ai_provider().upper()
+                ctx.logger.info(f"   🤖 Gửi video cho {active_provider} phân tích, bỏ qua Google AI Studio...")
                 content_instruction = build_channel_instruction(
                     clean_tid,
                     source_type="tiktok",
@@ -242,7 +358,14 @@ def run_worker_process(account_id):
                     or candidate.get("title")
                     or f"Nguồn TikTok: {vid_url}"
                 )
-                ai_result = analyze_video_with_chatgpt(
+                evidence_pack = build_social_evidence_pack(
+                    source_type="tiktok",
+                    source_url=vid_url,
+                    caption=caption,
+                    transcript=whisper_transcript,
+                    metadata=candidate,
+                )
+                ai_result = analyze_video_content(
                     up_path,
                     caption,
                     is_tele_bot=False,
@@ -250,13 +373,49 @@ def run_worker_process(account_id):
                     profile_id=clean_tid,
                     source_type="tiktok",
                     experiment_content_key=vid_url,
+                    whisper_transcript=whisper_transcript,
                 )
 
                 if not ai_result:
                     raise PipelineStageError(
                         "scripted", "SCRIPT_GENERATION_FAILED",
-                        "ChatGPT không trả về kịch bản hợp lệ.",
+                        "AI Provider không trả về kịch bản hợp lệ.",
                     )
+
+                # Apply the manual TikTok source approval before the content
+                # repair/validator step; otherwise a topic-only decline would
+                # leave a permanently skipped validation report.
+                if manual_topic_approval and (
+                    str(ai_result.get("topic_fit", True)).lower() == "false"
+                    or not ai_result.get("topic_fit", True)
+                ):
+                    topic_text = str(
+                        ai_result.get("topic_fit_reason")
+                        or ai_result.get("skip_reason")
+                        or ""
+                    ).lower()
+                    topic_markers = (
+                        "chủ đề", "định vị", "không phù hợp", "tệp người xem",
+                        "showbiz", "topic", "channel",
+                    )
+                    is_topic_decline = any(
+                        marker in topic_text for marker in topic_markers
+                    )
+                    ctx.logger.info(
+                        "   ✅ TikTok source đã được operator duyệt; "
+                        "bỏ qua topic_fit của AI."
+                    )
+                    ai_result["topic_fit"] = True
+                    ai_result["topic_fit_reason"] = (
+                        "Nguồn TikTok đã được operator duyệt thủ công."
+                    )
+                    if is_topic_decline:
+                        if (
+                            str(ai_result.get("should_make_video", True)).lower() == "false"
+                            or not ai_result.get("should_make_video", True)
+                        ):
+                            ai_result["should_make_video"] = True
+                            ai_result["skip_reason"] = ""
                 lifecycle.advance("scripted")
 
                 prepared_content = prepare_content_with_single_repair(
@@ -265,7 +424,7 @@ def run_worker_process(account_id):
                     channel_id=clean_tid,
                     source_url=vid_url,
                     profile=resolved_content_profile,
-                    repair_callback=lambda instruction: analyze_video_with_chatgpt(
+                    repair_callback=lambda instruction: analyze_video_content(
                         up_path,
                         caption,
                         is_tele_bot=False,
@@ -274,6 +433,7 @@ def run_worker_process(account_id):
                         repair_instruction=instruction,
                         source_type="tiktok",
                         experiment_content_key=vid_url,
+                        whisper_transcript=whisper_transcript,
                     ),
                 )
                 ai_result = prepared_content.content
@@ -286,17 +446,30 @@ def run_worker_process(account_id):
                     )
 
                 should_make_video = ai_result.get("should_make_video", True)
+
                 if str(should_make_video).lower() == "false" or not should_make_video:
-                    ctx.logger.info(f"   ⏭️ ChatGPT đánh giá không nên làm video này: {ai_result.get('skip_reason', '')}")
-                    mark_candidate_handled(vid_url)
+                    active_provider = get_configured_ai_provider().upper()
+                    ctx.logger.info(f"   ⏭️ {active_provider} đánh giá không nên làm video này: {ai_result.get('skip_reason', '')}")
+                    mark_candidate_handled(candidate)
                     continue
 
-                topic_fit = ai_result.get("topic_fit", True)
-                if str(topic_fit).lower() == "false" or not topic_fit:
-                    topic_fit_reason = ai_result.get("topic_fit_reason") or ai_result.get("skip_reason", "")
-                    ctx.logger.info(f"   ⏭️ Video không đúng định vị kênh: {topic_fit_reason}")
-                    mark_candidate_handled(vid_url)
-                    continue
+                # TẠM THỜI TẮT LỌC NỘI DUNG
+                ai_result["topic_fit"] = True
+                if str(ai_result.get("topic_fit", True)).lower() == "false":
+                    if manual_topic_approval:
+                        ctx.logger.info(
+                            "   ✅ TikTok topic_fit được bỏ qua theo duyệt thủ công."
+                        )
+                    else:
+                        topic_fit_reason = (
+                            ai_result.get("topic_fit_reason")
+                            or ai_result.get("skip_reason", "")
+                        )
+                        ctx.logger.info(
+                            f"   ⏭️ Video không đúng định vị kênh: {topic_fit_reason}"
+                        )
+                        mark_candidate_handled(candidate)
+                        continue
 
                 if not prepared_content.report.passed:
                     validation_reason = summarize_validation(
@@ -306,7 +479,14 @@ def run_worker_process(account_id):
                         f"   ⏭️ ContentValidator không đạt: "
                         f"{validation_reason}"
                     )
-                    mark_candidate_handled(vid_url)
+                    # Keep validator failures retryable.  A repair attempt may
+                    # have been based on a false-positive (for example one
+                    # sentence combining two registered visual claims); marking
+                    # the URL as handled here permanently discarded the video
+                    # after a transient/model-format issue.
+                    ctx.logger.info(
+                        "   🔁 Giữ video để retry ở đợt kế tiếp sau khi sửa nội dung."
+                    )
                     continue
                 ctx.logger.info(
                     f"   ✅ ContentValidator: "
@@ -317,24 +497,67 @@ def run_worker_process(account_id):
                     ai_result,
                     source_type="tiktok",
                     source_url=vid_url,
-                    source_text=caption,
+                    source_text=evidence_pack.source_text,
                     profile=resolved_content_profile,
                 )
-                if not evidence_report.passed:
+                if not EVIDENCE_GUARD_ENABLED:
+                    ctx.logger.info("   ⏭️ EvidenceGuard đã tắt; tiếp tục xử lý video.")
+                elif not evidence_report.passed:
                     ctx.logger.info(
                         f"   ⏭️ EvidenceGuard không đạt: "
                         f"{summarize_evidence(evidence_report)}"
                     )
-                    mark_candidate_handled(vid_url)
+                    mark_candidate_handled(candidate)
+                    continue
+                else:
+                    ctx.logger.info(
+                        f"   ✅ EvidenceGuard: {evidence_report.score}/100"
+                    )
+                visual_report = guard_visual_grounding(
+                    ai_result,
+                    source_type="tiktok",
+                    source_text=evidence_pack.source_text,
+                )
+                if not visual_report.passed:
+                    ctx.logger.info(
+                        f"   ⏭️ VisualGrounding không đạt: "
+                        f"{summarize_visual_grounding(visual_report)}"
+                    )
+                    mark_candidate_handled(candidate)
                     continue
                 ctx.logger.info(
-                    f"   ✅ EvidenceGuard: {evidence_report.score}/100"
+                    f"   ✅ VisualGrounding: {visual_report.score}/100"
+                )
+                social_report = evaluate_social_quality(
+                    ai_result,
+                    source_type="tiktok",
+                    validation_report=prepared_content.report,
+                    evidence_report=evidence_report,
+                    visual_report=visual_report,
+                    rights_report=rights,
+                    evidence_pack=evidence_pack.to_dict(),
+                    frame_mode=bool(ai_result.get("have_frame")),
+                    threshold=int(os.environ.get("SOCIAL_QUALITY_THRESHOLD", "70")),
+                )
+                if not social_report.passed:
+                    ctx.logger.info(
+                        f"   ⏭️ Social Quality Gate: "
+                        f"{summarize_social_quality(social_report)}"
+                    )
+                    mark_candidate_handled(candidate)
+                    continue
+                ctx.logger.info(
+                    f"   ✅ Social Quality Gate: {social_report.score}/100"
                 )
                 quality_score = int(ai_result.get("quality_score", 0) or 0)
                 lifecycle.advance("validated")
                 append_quality_event(
                     "tiktok_matrix", clean_tid, quality_score, "validated",
                     stage="validated", item_id=vid_url,
+                    source_url=vid_url,
+                    editorial_score=social_report.score,
+                    ai_quality_score=quality_score,
+                    quality_breakdown=social_report.breakdown,
                 )
 
                 sheet_result = save_to_sheet(
@@ -453,7 +676,7 @@ def run_worker_process(account_id):
                 
                 download_if_missing("font", FONT_DIR, font_name)
 
-                final_path = create_video_from_source_video(
+                render_result = create_video_from_source_video(
                     audio_url=local_content,
                     source_video_url=paths['original'],
                     title_audio_url=local_title,
@@ -479,18 +702,45 @@ def run_worker_process(account_id):
                     subtitle_style=ai_result.get(
                         "subtitle_style", "keyword_highlight",
                     ),
+                    have_frame=bool(ai_result.get("have_frame")),
+                    frame_end_sec=ai_result.get(
+                        "detected_competitor_frame_end_sec"
+                    ),
+                )
+                final_path = (
+                    render_result.get("final_path")
+                    if isinstance(render_result, dict) else render_result
                 )
                 if not final_path or not os.path.exists(final_path):
+                    render_error = (
+                        render_result.get("error", "")
+                        if isinstance(render_result, dict) else ""
+                    )
                     raise PipelineStageError(
                         "rendered", "RENDER_FAILED",
-                        "Renderer không tạo ra file MP4.",
+                        "Renderer không tạo ra file MP4."
+                        + (f" Chi tiết: {render_error}" if render_error else ""),
                     )
                 lifecycle.advance("rendered")
 
+                render_subtitle_path = (
+                    render_result.get("subtitle_ass_path", "")
+                    if isinstance(render_result, dict) else ""
+                )
+                render_watermark_detected = (
+                    bool(render_result.get("watermark_detected"))
+                    if isinstance(render_result, dict) else False
+                )
                 qa_result = run_video_qa(
                     final_path,
-                    watermark_detected=bool(candidate.get("watermark_detected")),
+                    subtitle_ass_path=render_subtitle_path or "",
+                    watermark_detected=render_watermark_detected,
                 )
+                if render_subtitle_path and os.path.exists(render_subtitle_path):
+                    try:
+                        os.remove(render_subtitle_path)
+                    except OSError:
+                        pass
                 if not qa_result.passed:
                     raise PipelineStageError(
                         "qa_passed",
@@ -524,10 +774,38 @@ def run_worker_process(account_id):
                     qa=qa_result.to_dict(),
                 )
 
+                # Lưu phiếu khôi phục trước khi gọi Apps Script. Nếu kết nối
+                # rớt hoặc tiến trình dừng, lượt sau chỉ ghi bù link.
+                preserved_path = ""
+                if final_path and os.path.exists(final_path):
+                    preserved_path = os.path.join(
+                        ctx.outbox_dir, os.path.basename(final_path)
+                    )
+                    try:
+                        shutil.copy2(final_path, preserved_path)
+                    except OSError as copy_error:
+                        ctx.logger.warning(
+                            f"⚠️ Không sao lưu được MP4 chờ Sheet: {copy_error}"
+                        )
+                        preserved_path = ""
+                ctx.enqueue_pending_result({
+                    "candidate_url": vid_url,
+                    "title_key": candidate.get("title_key", ""),
+                    "source_url": src_url,
+                    "row": row_data["row"],
+                    "drive_link": drv_link,
+                    "local_path": preserved_path,
+                    "created_at": time.time(),
+                })
+
                 if update_final_result(sheet_url, row_data['row'], drv_link):
                     ctx.logger.info("   ✅ HOÀN TẤT!")
 
-                    mark_candidate_handled(vid_url)
+                    ctx.remove_pending_result(vid_url, row_data["row"])
+                    if preserved_path and os.path.exists(preserved_path):
+                        os.remove(preserved_path)
+
+                    mark_candidate_handled(candidate)
                     pending_counts = state["pending_video_index_increments"]
                     pending_counts[src_url] = int(pending_counts.get(src_url, 0)) + 1
                     ctx.save_state(state)
@@ -570,9 +848,12 @@ def run_worker_process(account_id):
                 ctx.cleanup_temp()
                 time.sleep(5)
 
-        batch_urls = [item.get("url", "") for item in new_videos_batch]
-        batch_fully_handled = batch_urls and all(
-            video_url in state["crawled_videos"] for video_url in batch_urls
+        batch_title_keys = [
+            item.get("title_key", "") for item in new_videos_batch
+        ]
+        batch_fully_handled = batch_title_keys and all(
+            item_key in state["crawled_video_titles"]
+            for item_key in batch_title_keys
         )
         if batch_fully_handled:
             safe_checkpoint = new_videos_batch[0]["url"]
@@ -589,17 +870,16 @@ def run_worker_process(account_id):
                 if not checkpoint_updated:
                     raise RuntimeError("Không tìm thấy channel để cập nhật checkpoint")
                 ctx.logger.info(
-                    f"   ☁️ Batch hoàn tất, cập nhật last_video_url an toàn: "
+                    f"   ☁️ Batch tiêu đề đã xử lý xong; giữ mốc tương thích: "
                     f"{safe_checkpoint}"
                 )
                 pending_counts.pop(src_url, None)
                 ctx.save_state(state)
             except Exception as e:
                 ctx.logger.error(f"   ⚠️ Lỗi cập nhật checkpoint Supabase: {e}")
-        elif batch_urls:
+        elif batch_title_keys:
             ctx.logger.info(
-                "   📥 Giữ nguyên last_video_url vì batch vẫn còn ứng viên "
-                "chưa xử lý."
+                "   📥 Còn tiêu đề chưa xử lý; chưa cập nhật mốc tương thích."
             )
 
     ctx.logger.info(f"🏁 WORKER FINISHED. Tổng video thành công: {processed_count}/{acc_limit}")

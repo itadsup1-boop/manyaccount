@@ -7,9 +7,11 @@ import os
 import subprocess
 import json
 
+from shared.core.ffmpeg_utils import ffmpeg_command, ffprobe_command
+
 
 def _get_duration(path):
-    cmd = ["ffprobe", "-v", "quiet", "-print_format", "json", "-show_format", path]
+    cmd = ffprobe_command("-v", "quiet", "-print_format", "json", "-show_format", path)
     r = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
     return float(json.loads(r.stdout)["format"]["duration"])
 
@@ -17,7 +19,7 @@ def _get_duration(path):
 def _extract_gray_frame(path, timestamp, W=135, H=240):
     """Returns W*H raw grayscale bytes via FFmpeg pipe. No external libs."""
     cmd = [
-        "ffmpeg", "-y", "-ss", str(timestamp), "-i", path,
+        *ffmpeg_command("-y", "-ss", str(timestamp), "-i", path),
         "-vf", f"scale={W}:{H}:force_original_aspect_ratio=disable",
         "-frames:v", "1", "-f", "rawvideo", "-pix_fmt", "gray", "pipe:1"
     ]
@@ -106,3 +108,42 @@ def detect_logo_regions(video_path: str, scale_w=135, scale_h=240, corner_frac=0
     except Exception as e:
         print(f"   ⚠️ Logo detection lỗi: {e}")
         return []
+
+
+def _iou(region_a, region_b) -> float:
+    ax, ay, aw, ah = region_a
+    bx, by, bw, bh = region_b
+    ix1, iy1 = max(ax, bx), max(ay, by)
+    ix2, iy2 = min(ax + aw, bx + bw), min(ay + ah, by + bh)
+    iw, ih = max(0, ix2 - ix1), max(0, iy2 - iy1)
+    inter = iw * ih
+    if inter <= 0:
+        return 0.0
+    union = aw * ah + bw * bh - inter
+    return inter / union if union > 0 else 0.0
+
+
+def verify_watermark_removed(final_video_path: str, original_regions: list, iou_threshold: float = 0.2) -> bool:
+    """Re-run static-region detection on the rendered output video.
+
+    ``original_regions`` are the watermark regions detected on the *source*
+    clip before the delogo/blur filter ran. This checks whether a static
+    region still overlapping one of those spots is present in the final
+    output — i.e. whether the blur actually worked, instead of trusting it
+    blindly. Returns True when the watermark appears gone (safe), False when
+    a matching static region is still detected (blur likely failed).
+
+    Detection failures do not block upload on their own (returns True) since
+    this is a secondary safety check, not the only one.
+    """
+    if not original_regions:
+        return True
+    try:
+        remaining = detect_logo_regions(final_video_path)
+    except Exception:
+        return True
+    return not any(
+        _iou(region, original) >= iou_threshold
+        for region in remaining
+        for original in original_regions
+    )

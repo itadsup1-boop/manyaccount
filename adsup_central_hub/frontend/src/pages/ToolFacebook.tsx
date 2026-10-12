@@ -1,7 +1,47 @@
-import { useState, useEffect } from 'react';
-import { Play, Square, Plus, RefreshCw, Save, Trash2 } from 'lucide-react';
+import { useState, useEffect, useRef } from 'react';
+import {
+  AudioLines,
+  BrainCircuit,
+  ClipboardCheck,
+  Files,
+  LogIn,
+  Pencil,
+  Play,
+  Plus,
+  RefreshCw,
+  Save,
+  Square,
+  Target,
+  Trash2,
+  Type,
+  UsersRound,
+  Workflow,
+  X,
+  ShieldAlert,
+} from 'lucide-react';
+import FacebookGroupSourcesPanel from '../components/facebook/FacebookGroupSourcesPanel';
+import FacebookGroupReviewPanel from '../components/facebook/FacebookGroupReviewPanel';
+import TitlePositionEditor from '../components/TitlePositionEditor';
+import ToolPageHeader from '../components/ui/ToolPageHeader';
+import ToolTabs from '../components/ui/ToolTabs';
+import { useAuth } from '../context/AuthContext';
+import '../features/facebook/facebook.css';
+import '../features/tiktok/tiktok.css';
 
 const FACEBOOK_DEFAULT_CHANNEL_ID = 'Adsupnews';
+
+type FacebookTab = 'pipeline' | 'sources' | 'groups' | 'group-review' | 'content' | 'display' | 'prompt' | 'voice';
+
+const FACEBOOK_TABS = [
+  { id: 'pipeline', label: 'Pipeline', icon: Workflow },
+  { id: 'sources', label: 'Nguồn Page', icon: Files },
+  { id: 'groups', label: 'Nguồn Group', icon: UsersRound },
+  { id: 'group-review', label: 'Chờ duyệt Group', icon: ClipboardCheck },
+  { id: 'content', label: 'Chỉ đạo nội dung', icon: Target },
+  { id: 'display', label: 'Chữ trên video', icon: Type },
+  { id: 'prompt', label: 'Prompt', icon: BrainCircuit },
+  { id: 'voice', label: 'Voice', icon: AudioLines },
+] as const;
 
 const defaultContentProfile: Record<string, string> = {
   channel_name: '',
@@ -10,7 +50,7 @@ const defaultContentProfile: Record<string, string> = {
   content_promise: '',
   primary_goal: 'view',
   tone_style: '',
-  video_length: '30-45s',
+  video_length: '38-42s',
   format_style: '',
   hook_style: '',
   source_preference: '',
@@ -21,7 +61,11 @@ const defaultContentProfile: Record<string, string> = {
 };
 
 function normalizeContentProfile(profile?: Record<string, string>) {
-  return { ...defaultContentProfile, ...(profile || {}) };
+  const normalized = { ...defaultContentProfile, ...(profile || {}) };
+  if (/38\D+42/.test(String(normalized.video_length || ''))) {
+    normalized.video_length = '38-42s';
+  }
+  return normalized;
 }
 
 function getFacebookChannelId(source?: any) {
@@ -30,14 +74,49 @@ function getFacebookChannelId(source?: any) {
 }
 
 export default function ToolFacebook() {
-  const [activeTab, setActiveTab] = useState('pipeline');
-  const [isRunning, setIsRunning] = useState(false);
-  const [logs, setLogs] = useState<string[]>(['[Hệ thống] Sẵn sàng khởi động Tool Facebook...']);
+  const { isAdmin } = useAuth();
+  const [activeTab, setActiveTab] = useState<FacebookTab>('pipeline');
+  const pageLogRef = useRef<HTMLDivElement>(null);
+  const groupLogRef = useRef<HTMLDivElement>(null);
+
+  const [pageStatus, setPageStatus] = useState<{ is_running: boolean; logs: string[] }>({
+    is_running: false,
+    logs: ['[Hệ thống] Sẵn sàng khởi động Tool Facebook Page...']
+  });
+  const [groupStatus, setGroupStatus] = useState<{ is_running: boolean; logs: string[] }>({
+    is_running: false,
+    logs: ['[Hệ thống] Sẵn sàng khởi động Tool Facebook Group...']
+  });
   const [sources, setSources] = useState<any[]>([]);
+  const [groupSources, setGroupSources] = useState<any[]>([]);
   const [promptContent, setPromptContent] = useState('');
   const [voiceConfig, setVoiceConfig] = useState<any>({
     "Tích cực": "", "Trung tính": "", "Cảnh báo": "", "Đồng cảm": ""
   });
+  const [facebookAuth, setFacebookAuth] = useState<any>({ logged_in: false, login_running: false });
+  const [editingSourceId, setEditingSourceId] = useState<number | null>(null);
+  const [aiProvider, setAiProvider] = useState<string>('chatgpt');
+  const [titlePreviewMode, setTitlePreviewMode] = useState<'intro' | 'content'>('intro');
+
+  useEffect(() => {
+    fetch('/api/ai/provider')
+      .then(res => res.json())
+      .then(data => { if (data.provider) setAiProvider(data.provider); })
+      .catch(() => {});
+  }, []);
+
+  const handleSetAiProvider = (provider: string) => {
+    setAiProvider(provider);
+    fetch('/api/ai/provider', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ provider }),
+    });
+  };
+
+  const handleOpenGeminiChrome = () => {
+    fetch('/api/gemini/chrome', { method: 'POST' });
+  };
 
   const [newSource, setNewSource] = useState({
     id_tiktok: FACEBOOK_DEFAULT_CHANNEL_ID,
@@ -49,7 +128,11 @@ export default function ToolFacebook() {
   const [selectedChannel, setSelectedChannel] = useState(FACEBOOK_DEFAULT_CHANNEL_ID);
   const [channelConfig, setChannelConfig] = useState<any>({ content_profile: defaultContentProfile });
 
-  const uniqueChannels = Array.from(new Set([FACEBOOK_DEFAULT_CHANNEL_ID, ...sources.map((source: any) => getFacebookChannelId(source)).filter(Boolean)])) as string[];
+  const uniqueChannels = Array.from(new Set([
+    FACEBOOK_DEFAULT_CHANNEL_ID,
+    ...sources.map((source: any) => getFacebookChannelId(source)).filter(Boolean),
+    ...groupSources.map((source: any) => getFacebookChannelId(source)).filter(Boolean)
+  ])) as string[];
   const channelProfile = normalizeContentProfile(channelConfig.content_profile);
 
   const fetchSources = () => {
@@ -65,6 +148,15 @@ export default function ToolFacebook() {
       .catch(console.error);
   };
 
+  const fetchGroupSources = () => {
+    fetch(`/api/facebook/group-sources`)
+      .then(res => res.json())
+      .then(data => {
+        if (!data.error) setGroupSources(data);
+      })
+      .catch(console.error);
+  };
+
   const fetchVoiceConfig = () => {
     fetch(`/api/facebook/voice`)
       .then(res => res.json())
@@ -72,10 +164,33 @@ export default function ToolFacebook() {
       .catch(console.error);
   };
 
+  const fetchFacebookAuth = () => {
+    fetch(`/api/facebook/auth/status`)
+      .then(res => res.json())
+      .then(data => setFacebookAuth(data))
+      .catch(console.error);
+  };
+
+  const handleFacebookLogin = () => {
+    fetch(`/api/facebook/auth/login`, { method: 'POST' })
+      .then(async res => {
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.detail || 'Không mở được cửa sổ đăng nhập');
+        return data;
+      })
+      .then(() => {
+        setFacebookAuth((current: any) => ({ ...current, login_running: true }));
+        alert('Đã mở cửa sổ Facebook trên máy chạy Hub. Hãy đăng nhập trong cửa sổ đó.');
+      })
+      .catch(error => alert(`Không mở được Facebook: ${error}`));
+  };
+
   useEffect(() => {
     fetchSources();
+    fetchGroupSources();
     fetchVoiceConfig();
-    
+    fetchFacebookAuth();
+
     fetch(`/api/system/prompts/facebook`)
       .then(res => res.json())
       .then(data => {
@@ -87,25 +202,36 @@ export default function ToolFacebook() {
       fetch(`/api/facebook/logs`)
         .then(res => res.json())
         .then(data => {
-          if (data.logs) setLogs(data.logs);
-          if (data.is_running !== undefined) setIsRunning(data.is_running);
+          if (data.page) {
+            setPageStatus({
+              is_running: !!data.page.is_running,
+              logs: data.page.logs || ['[Hệ thống] Sẵn sàng khởi động Tool Facebook Page...']
+            });
+          }
+          if (data.group) {
+            setGroupStatus({
+              is_running: !!data.group.is_running,
+              logs: data.group.logs || ['[Hệ thống] Sẵn sàng khởi động Tool Facebook Group...']
+            });
+          }
         })
         .catch(() => {});
+      fetchFacebookAuth();
     }, 1000);
     return () => clearInterval(interval);
   }, []);
 
-  const handleVoiceConfigChange = (field: string, value: string) => {
-    setVoiceConfig((prev: any) => ({ ...prev, [field]: value }));
-  };
+  useEffect(() => {
+    if (pageLogRef.current) {
+      pageLogRef.current.scrollTop = pageLogRef.current.scrollHeight;
+    }
+  }, [pageStatus.logs]);
 
-  const handleSaveVoiceConfig = () => {
-    fetch(`/api/facebook/voice`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(voiceConfig)
-    }).then(() => alert('Đã lưu cấu hình voice thành công!'));
-  };
+  useEffect(() => {
+    if (groupLogRef.current) {
+      groupLogRef.current.scrollTop = groupLogRef.current.scrollHeight;
+    }
+  }, [groupStatus.logs]);
 
   const handleSavePrompt = () => {
     fetch(`/api/system/prompts/facebook`, {
@@ -124,17 +250,50 @@ export default function ToolFacebook() {
       id_tiktok: String(newSource.id_tiktok || '').trim() || FACEBOOK_DEFAULT_CHANNEL_ID
     };
     if (!payload.id_tiktok || !payload.source_name || !payload.source_url) return;
-    fetch(`/api/facebook/sources`, {
-      method: 'POST',
+    fetch(editingSourceId ? `/api/facebook/sources/${editingSourceId}` : `/api/facebook/sources`, {
+      method: editingSourceId ? 'PUT' : 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(payload)
-    }).then(res => res.json()).then(data => {
+    }).then(async res => {
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.detail || 'Dữ liệu nguồn không hợp lệ');
+      return data;
+    }).then(data => {
       if (data.status === 'success') {
-        setNewSource({ id_tiktok: FACEBOOK_DEFAULT_CHANNEL_ID, source_name: '', source_url: '', max_video_age_hours: 48, delogo: '' });
+        setNewSource({
+          id_tiktok: FACEBOOK_DEFAULT_CHANNEL_ID,
+          source_name: '',
+          source_url: '',
+          max_video_age_hours: 48,
+          delogo: ''
+        });
+        setEditingSourceId(null);
         fetchSources();
       } else {
         alert('Lỗi: ' + data.error);
       }
+    }).catch(error => alert('Lỗi: ' + error.message));
+  };
+
+  const handleEditSource = (source: any) => {
+    setEditingSourceId(source.id);
+    setNewSource({
+      id_tiktok: getFacebookChannelId(source),
+      source_name: source.source_name || '',
+      source_url: source.source_url || '',
+      max_video_age_hours: source.max_video_age_hours ?? 48,
+      delogo: source.delogo || ''
+    });
+  };
+
+  const cancelEditSource = () => {
+    setEditingSourceId(null);
+    setNewSource({
+      id_tiktok: FACEBOOK_DEFAULT_CHANNEL_ID,
+      source_name: '',
+      source_url: '',
+      max_video_age_hours: 48,
+      delogo: ''
     });
   };
 
@@ -169,6 +328,54 @@ export default function ToolFacebook() {
     }));
   };
 
+  const handleConfigField = (key: string, value: string | number) => {
+    setChannelConfig((prev: any) => ({ ...prev, [key]: value }));
+  };
+
+  const handleFacebookTitleEditorChange = (
+    updates: Record<string, number | string>,
+    mode: 'intro' | 'content'
+  ) => {
+    setChannelConfig((prev: any) => {
+      const next = { ...prev, text_position_mode: 'manual' };
+      const widthRatio = Math.max(0.35, Math.min(0.95, Number(prev.text_w ?? 0.85)));
+      const centeredLeft = (1080 - 1080 * widthRatio) / 2;
+
+      if (updates.box_y_start !== undefined) {
+        const y = Math.max(0, Math.min(0.92, Number(updates.box_y_start)));
+        if (mode === 'intro') next.text_y1 = y;
+        else next.text_y_content = y;
+      }
+      if (updates.box_x_offset !== undefined) {
+        // TitlePositionEditor emits an offset from the centered text box,
+        // while the Facebook renderer stores the absolute left X coordinate.
+        next.text_x = Math.round(centeredLeft + Number(updates.box_x_offset));
+      }
+      if (updates.box_width_percentage !== undefined) {
+        next.text_w = Number(updates.box_width_percentage);
+      }
+      if (updates.font_size !== undefined) {
+        next.text_size = Number(updates.font_size);
+      }
+      if (updates.text_color !== undefined) {
+        next.text_color = String(updates.text_color);
+      }
+      return next;
+    });
+  };
+
+  const handleVoiceConfigChange = (field: string, value: string) => {
+    setVoiceConfig((prev: any) => ({ ...prev, [field]: value }));
+  };
+
+  const handleSaveVoiceConfig = () => {
+    fetch(`/api/facebook/voice`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(voiceConfig)
+    }).then(() => alert('Đã lưu cấu hình voice thành công!'));
+  };
+
   const handleSaveChannelProfile = () => {
     if (!selectedChannel) return;
     fetch(`/api/article/config/${selectedChannel}`, {
@@ -181,61 +388,190 @@ export default function ToolFacebook() {
     });
   };
 
-  const handleStart = () => {
-    setIsRunning(true);
-    fetch(`/api/facebook/start`, { method: 'POST' });
+  const handleStart = (sourceScope: 'page' | 'group') => {
+    if (sourceScope === 'page') setPageStatus(prev => ({ ...prev, is_running: true }));
+    else setGroupStatus(prev => ({ ...prev, is_running: true }));
+    fetch(`/api/facebook/start?source_scope=${sourceScope}`, { method: 'POST' });
   };
 
-  const handleStop = () => {
-    setIsRunning(false);
-    fetch(`/api/facebook/stop`, { method: 'POST' });
+  const handleStop = (sourceScope: 'page' | 'group' | 'all' = 'all') => {
+    if (sourceScope === 'page') setPageStatus(prev => ({ ...prev, is_running: false }));
+    else if (sourceScope === 'group') setGroupStatus(prev => ({ ...prev, is_running: false }));
+    else {
+      setPageStatus(prev => ({ ...prev, is_running: false }));
+      setGroupStatus(prev => ({ ...prev, is_running: false }));
+    }
+    fetch(`/api/facebook/stop?source_scope=${sourceScope}`, { method: 'POST' });
   };
 
-  const handleStartOnce = () => {
-    setIsRunning(true);
-    fetch(`/api/facebook/start_once`, { method: 'POST' });
+  const handleStartOnce = (sourceScope: 'page' | 'group') => {
+    if (sourceScope === 'page') setPageStatus(prev => ({ ...prev, is_running: true }));
+    else setGroupStatus(prev => ({ ...prev, is_running: true }));
+    fetch(`/api/facebook/start_once?source_scope=${sourceScope}`, { method: 'POST' });
   };
+
+  const rawTitleWidth = Number(channelConfig.text_w ?? 0.85);
+  const facebookTitleWidth = Number.isFinite(rawTitleWidth)
+    ? Math.max(0.35, Math.min(0.95, rawTitleWidth))
+    : 0.85;
+  const rawIntroY = Number(channelConfig.text_y1 ?? 0.73);
+  const facebookIntroY = Number.isFinite(rawIntroY)
+    ? Math.max(0, Math.min(0.92, rawIntroY))
+    : 0.73;
+  const rawContentY = Number(channelConfig.text_y_content ?? 0);
+  const facebookContentY = Number.isFinite(rawContentY) && rawContentY > 0
+    ? Math.max(0, Math.min(0.92, rawContentY))
+    : Math.min(0.92, facebookIntroY + 220 / 1920);
+  const titleCenteredLeft = (1080 - 1080 * facebookTitleWidth) / 2;
+  const rawTitleX = Number(channelConfig.text_x ?? 0);
+  const facebookTitleXOffset = (Number.isFinite(rawTitleX) ? rawTitleX : 0) - titleCenteredLeft;
+  const rawTitleSize = Number(channelConfig.text_size ?? 50);
+  const facebookTitleSize = Number.isFinite(rawTitleSize) ? rawTitleSize : 50;
 
   return (
-    <div>
-      <h2 className="page-title">Tool Facebook News Auto Remix</h2>
+    <div className="facebook-page">
+      <ToolPageHeader
+        title="Tool Facebook"
+        description="Tự động cào tin bài Facebook Page và Group độc lập"
+        status={(
+          <div style={{ display: 'flex', alignItems: 'center', gap: '12px', flexWrap: 'wrap' }}>
+            <div style={{ display: 'inline-flex', alignItems: 'center', gap: '6px', background: 'rgba(255,255,255,0.06)', borderRadius: '8px', padding: '4px 8px' }}>
+              <span style={{ fontSize: '12px', fontWeight: 600, color: 'var(--text-secondary)' }}>🤖 AI Engine:</span>
+              <button
+                type="button"
+                className={`tiktok-btn ${aiProvider === 'chatgpt' ? 'tiktok-btn--primary' : 'tiktok-btn--outline'}`}
+                style={{ padding: '3px 10px', fontSize: '12px', borderRadius: '6px' }}
+                onClick={() => handleSetAiProvider('chatgpt')}
+              >
+                ChatGPT
+              </button>
+              <button
+                type="button"
+                className={`tiktok-btn ${aiProvider === 'gemini' ? 'tiktok-btn--primary' : 'tiktok-btn--outline'}`}
+                style={{ padding: '3px 10px', fontSize: '12px', borderRadius: '6px' }}
+                onClick={() => handleSetAiProvider('gemini')}
+              >
+                Gemini (Web)
+              </button>
+            </div>
+            <button className="tiktok-btn tiktok-btn--outline" onClick={handleOpenGeminiChrome} title="Đăng nhập Gemini Web">
+              🌐 Gemini Web
+            </button>
+            <span className={`facebook-auth-badge ${facebookAuth.logged_in ? 'is-logged-in' : 'is-logged-out'}`}>
+              {facebookAuth.logged_in ? 'Đã đăng nhập Facebook' : 'Chưa đăng nhập Facebook'}
+            </span>
+            <button className="tiktok-btn tiktok-btn--outline" onClick={handleFacebookLogin}>
+              <LogIn size={16} aria-hidden="true" /> Trình duyệt Facebook
+            </button>
+          </div>
+        )}
+      />
 
-      <div className="tab-headers">
-        <button className={`tab-header ${activeTab === 'pipeline' ? 'active' : ''}`} onClick={() => setActiveTab('pipeline')}>▶️ Pipeline</button>
-        <button className={`tab-header ${activeTab === 'sources' ? 'active' : ''}`} onClick={() => setActiveTab('sources')}>📋 Nguồn theo dõi</button>
-        <button className={`tab-header ${activeTab === 'content' ? 'active' : ''}`} onClick={() => setActiveTab('content')}>🎯 Chỉ đạo nội dung</button>
-        <button className={`tab-header ${activeTab === 'prompt' ? 'active' : ''}`} onClick={() => setActiveTab('prompt')}>🧠 Prompt</button>
-        <button className={`tab-header ${activeTab === 'voice' ? 'active' : ''}`} onClick={() => setActiveTab('voice')}>⚙️ Voice</button>
-      </div>
+      {!isAdmin && (
+        <div style={{ background: 'rgba(59, 130, 246, 0.1)', border: '1px solid rgba(59, 130, 246, 0.3)', margin: '1rem 0', padding: '0.75rem 1rem', borderRadius: '10px', color: '#93c5fd', fontSize: '0.85rem', display: 'flex', alignItems: 'center', gap: '8px' }}>
+          <ShieldAlert size={18} />
+          <span>Bạn đang ở chế độ <strong>Người dùng (User Role)</strong>. Các thao tác điều khiển bot, đổi AI Engine hoặc sửa cấu hình chỉ dành cho Admin.</span>
+        </div>
+      )}
+
+      <ToolTabs
+        activeTab={activeTab}
+        ariaLabel="Các mục Tool Facebook"
+        tabs={FACEBOOK_TABS}
+        onChange={(tab) => setActiveTab(tab)}
+      />
 
       {activeTab === 'pipeline' && (
-        <div className="card" style={{ background: 'var(--bg-color)', border: '1px solid var(--border)' }}>
-          <div className="controls-bar" style={{ display: 'flex', justifyContent: 'space-between' }}>
-            {!isRunning ? (
-              <button className="btn btn-primary" style={{ padding: '1rem 2rem', fontSize: '1.2rem', background: 'var(--success)' }} onClick={handleStart}>
-                <Play size={24}/> BẮT ĐẦU CHẠY PIPELINE FB
-              </button>
-            ) : (
-              <button className="btn btn-danger" style={{ padding: '1rem 2rem', fontSize: '1.2rem' }} onClick={handleStop}>
-                <Square size={24}/> DỪNG LẠI
-              </button>
-            )}
-            <button className="btn" style={{ background: 'var(--sidebar-bg)' }} onClick={handleStartOnce}><Play size={18}/> Chạy 1 lần</button>
-          </div>
+        <div className="tiktok-grid" style={{ gridTemplateColumns: '1fr 1fr', gap: '1.25rem' }}>
+          {/* PIPELINE PAGE CARD */}
+          <article className="tiktok-card">
+            <div className="tiktok-card__header" style={{ justifyContent: 'space-between' }}>
+              <div>
+                <h3>📄 Pipeline Facebook Page</h3>
+                <p style={{ color: 'var(--tiktok-subtle)', fontSize: '0.82rem', margin: '0.2rem 0 0' }}>
+                  Cào và xử lý các trang Facebook Fanpage
+                </p>
+              </div>
+              <span className={`article-status ${pageStatus.is_running ? 'is-running' : ''}`}>
+                <span aria-hidden="true" />
+                {pageStatus.is_running ? 'Đang chạy' : 'Đang dừng'}
+              </span>
+            </div>
 
-          <div className="terminal" style={{ maxHeight: '420px', overflowY: 'auto' }}>
-            {logs.map((log, idx) => (
-              <p key={idx}>{log}</p>
-            ))}
-            {isRunning && <p className="animate-pulse">_</p>}
-          </div>
+            <div style={{ display: 'flex', gap: '0.5rem', margin: '1rem 0' }}>
+              {pageStatus.is_running ? (
+                <button className="tiktok-btn tiktok-btn--danger" onClick={() => handleStop('page')}>
+                  <Square size={16}/> Dừng Pipeline Page
+                </button>
+              ) : (
+                <>
+                  <button className="tiktok-btn tiktok-btn--primary" onClick={() => handleStart('page')}>
+                    <Play size={16}/> Chạy liên tục Page
+                  </button>
+                  <button className="tiktok-btn tiktok-btn--outline" onClick={() => handleStartOnce('page')}>
+                    <Play size={16}/> Page 1 lần
+                  </button>
+                </>
+              )}
+            </div>
+
+            <div ref={pageLogRef} className="tiktok-log" style={{ height: '320px', overflowY: 'auto' }}>
+              {pageStatus.logs.map((log, idx) => (
+                <p key={idx}>{log}</p>
+              ))}
+              {pageStatus.is_running && <p className="animate-pulse">_</p>}
+            </div>
+          </article>
+
+          {/* PIPELINE GROUP CARD */}
+          <article className="tiktok-card">
+            <div className="tiktok-card__header" style={{ justifyContent: 'space-between' }}>
+              <div>
+                <h3>👥 Pipeline Facebook Group</h3>
+                <p style={{ color: 'var(--tiktok-subtle)', fontSize: '0.82rem', margin: '0.2rem 0 0' }}>
+                  Cào và xử lý bài viết trong Facebook Group
+                </p>
+              </div>
+              <span className={`article-status ${groupStatus.is_running ? 'is-running' : ''}`}>
+                <span aria-hidden="true" />
+                {groupStatus.is_running ? 'Đang chạy' : 'Đang dừng'}
+              </span>
+            </div>
+
+            <div style={{ display: 'flex', gap: '0.5rem', margin: '1rem 0' }}>
+              {groupStatus.is_running ? (
+                <button className="tiktok-btn tiktok-btn--danger" onClick={() => handleStop('group')}>
+                  <Square size={16}/> Dừng Pipeline Group
+                </button>
+              ) : (
+                <>
+                  <button className="tiktok-btn tiktok-btn--primary" onClick={() => handleStart('group')}>
+                    <Play size={16}/> Chạy liên tục Group
+                  </button>
+                  <button className="tiktok-btn tiktok-btn--outline" onClick={() => handleStartOnce('group')}>
+                    <Play size={16}/> Group 1 lần
+                  </button>
+                </>
+              )}
+            </div>
+
+            <div ref={groupLogRef} className="tiktok-log" style={{ height: '320px', overflowY: 'auto' }}>
+              {groupStatus.logs.map((log, idx) => (
+                <p key={idx}>{log}</p>
+              ))}
+              {groupStatus.is_running && <p className="animate-pulse">_</p>}
+            </div>
+          </article>
         </div>
       )}
 
       {activeTab === 'sources' && (
         <div className="grid">
           <div className="card">
-            <h3>➕ Thêm nguồn Facebook mới</h3>
+            <h3>{editingSourceId ? 'Sửa nguồn Page' : 'Thêm nguồn Facebook Page'}</h3>
+            <p style={{ color: 'var(--text-secondary)', marginTop: '0.75rem', fontSize: '0.85rem' }}>
+              Đây là khu vực Page cũ. URL Group sẽ không được lưu vào danh sách này.
+            </p>
             <div className="form-group" style={{ marginTop: '1rem' }}>
               <label className="form-label">ID kênh đích:</label>
               <input type="text" className="form-input" placeholder="VD: Adsupnews" value={newSource.id_tiktok} onChange={e => setNewSource({...newSource, id_tiktok: e.target.value})} />
@@ -248,7 +584,7 @@ export default function ToolFacebook() {
               <input type="text" className="form-input" placeholder="VD: VTV24 News" value={newSource.source_name} onChange={e => setNewSource({...newSource, source_name: e.target.value})} />
             </div>
             <div className="form-group" style={{ marginTop: '1rem' }}>
-              <label className="form-label">URL Trang/Nhóm:</label>
+              <label className="form-label">URL Page:</label>
               <input type="text" className="form-input" placeholder="VD: https://facebook.com/vtv24" value={newSource.source_url} onChange={e => setNewSource({...newSource, source_url: e.target.value})} />
             </div>
             <div className="grid" style={{ gridTemplateColumns: '1fr 1fr', marginTop: '1rem', gap: '1rem' }}>
@@ -261,14 +597,20 @@ export default function ToolFacebook() {
                 <input type="text" className="form-input" placeholder="x=683:y=231:w=280:h=85" value={newSource.delogo} onChange={e => setNewSource({...newSource, delogo: e.target.value})} />
               </div>
             </div>
-            <button className="btn btn-primary" style={{ marginTop: '1.5rem', width: '100%', justifyContent: 'center' }} onClick={handleAddSource}>
-              <Plus size={18} /> Thêm Nguồn
-            </button>
+            <div style={{ display: 'flex', gap: '0.75rem', marginTop: '1.5rem' }}>
+              <button className="btn btn-primary" style={{ flex: 1, justifyContent: 'center' }} onClick={handleAddSource}>
+                {editingSourceId ? <Save size={18} /> : <Plus size={18} />}
+                {editingSourceId ? 'Lưu Page' : 'Thêm Page'}
+              </button>
+              {editingSourceId && (
+                <button className="btn" onClick={cancelEditSource}><X size={18} /> Hủy</button>
+              )}
+            </div>
           </div>
 
           <div className="card">
             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-              <h3>📋 Nguồn đang theo dõi</h3>
+              <h3>Nguồn Page đang theo dõi</h3>
               <button className="btn" style={{ background: 'var(--sidebar-bg)' }} onClick={fetchSources}>
                 <RefreshCw size={16} /> Làm mới
               </button>
@@ -295,6 +637,9 @@ export default function ToolFacebook() {
                       <td style={{ padding: '0.5rem' }}>{s.max_video_age_hours}</td>
                       <td style={{ padding: '0.5rem', color: 'var(--text-secondary)' }}>{s.delogo || 'Không'}</td>
                       <td style={{ padding: '0.5rem' }}>
+                        <button className="btn" style={{ background: 'transparent', color: 'var(--info)', padding: '0.25rem' }} onClick={() => handleEditSource(s)}>
+                          <Pencil size={16} />
+                        </button>
                         <button className="btn" style={{ background: 'transparent', color: 'var(--danger)', padding: '0.25rem' }} onClick={() => handleDeleteSource(s.id)}>
                           <Trash2 size={16} />
                         </button>
@@ -302,7 +647,7 @@ export default function ToolFacebook() {
                     </tr>
                   ))}
                   {sources.length === 0 && (
-                    <tr><td colSpan={6} style={{ padding: '1rem', textAlign: 'center', color: 'var(--text-secondary)' }}>Chưa có nguồn nào.</td></tr>
+                    <tr><td colSpan={6} style={{ padding: '1rem', textAlign: 'center', color: 'var(--text-secondary)' }}>Chưa có nguồn Page.</td></tr>
                   )}
                 </tbody>
               </table>
@@ -311,10 +656,21 @@ export default function ToolFacebook() {
         </div>
       )}
 
+      {activeTab === 'groups' && (
+        <FacebookGroupSourcesPanel
+          sources={groupSources}
+          auth={facebookAuth}
+          onRefresh={fetchGroupSources}
+          onLogin={handleFacebookLogin}
+        />
+      )}
+
+      {activeTab === 'group-review' && <FacebookGroupReviewPanel />}
+
       {activeTab === 'content' && (
         <div className="card">
           <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '1rem' }}>
-            <h3>🎯 Chỉ đạo nội dung Facebook theo kênh đích</h3>
+            <h3>Chỉ đạo nội dung Facebook theo kênh đích</h3>
             <button className="btn btn-success" onClick={handleSaveChannelProfile} disabled={!selectedChannel}>
               <Save size={18} /> Lưu chỉ đạo
             </button>
@@ -353,6 +709,7 @@ export default function ToolFacebook() {
               <div className="form-group">
                 <label className="form-label">Độ dài video:</label>
                 <select className="form-select" value={channelProfile.video_length} onChange={e => handleProfileUpdate('video_length', e.target.value)}>
+                  <option value="38-42s">38-42s (khoảng 40s)</option>
                   <option value="30-45s">30-45s</option>
                   <option value="45-60s">45-60s</option>
                   <option value="60-90s">60-90s</option>
@@ -404,10 +761,171 @@ export default function ToolFacebook() {
         </div>
       )}
 
+      {activeTab === 'display' && (
+        <div className="card">
+          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '1rem' }}>
+            <h3>Chữ tiêu đề trên video Facebook</h3>
+            <button className="btn btn-success" onClick={handleSaveChannelProfile} disabled={!selectedChannel}>
+              <Save size={18} /> Lưu cấu hình
+            </button>
+          </div>
+          <p style={{ color: 'var(--text-secondary)', marginBottom: '1rem', fontSize: '0.85rem' }}>
+            Tiêu đề hiển thị xuyên suốt video. Ở đoạn có Frame Title nó dùng "Vị trí Y
+            trên Frame Title"; khi video chuyển sang Frame Content nó tự chuyển xuống
+            "Vị trí Y trên Frame Content". Chữ dài sẽ tự xuống dòng và tự thu nhỏ, không
+            bị cắt bằng dấu ba chấm.
+          </p>
+
+          <div className="form-group" style={{ marginBottom: '1rem' }}>
+            <label className="form-label">Chọn ID kênh đích:</label>
+            <select className="form-select" value={selectedChannel} onChange={e => handleChannelSelect(e.target.value)}>
+              <option value="">-- Chọn kênh --</option>
+              {uniqueChannels.map(ch => <option key={ch} value={ch}>{ch}</option>)}
+            </select>
+          </div>
+
+          {!selectedChannel ? (
+            <p style={{ color: 'var(--text-secondary)' }}>Hãy chọn kênh để cấu hình chữ.</p>
+          ) : (
+            <>
+              <div
+                style={{
+                  marginBottom: '1.25rem',
+                  padding: '1rem',
+                  border: '1px solid var(--border)',
+                  borderRadius: '12px',
+                  background: 'rgba(15, 23, 42, 0.28)'
+                }}
+              >
+                <div style={{ display: 'flex', justifyContent: 'space-between', gap: '0.75rem', alignItems: 'center', flexWrap: 'wrap', marginBottom: '1rem' }}>
+                  <div>
+                    <strong style={{ display: 'block' }}>Xem trước và kéo title trực tiếp</strong>
+                    <span style={{ color: 'var(--text-secondary)', fontSize: '0.82rem' }}>
+                      Kéo khung chữ để đổi vị trí; kéo ô vuông góc phải dưới để phóng to hoặc thu nhỏ.
+                    </span>
+                  </div>
+                  <div role="tablist" aria-label="Chọn khung xem trước title Facebook" style={{ display: 'flex', gap: '0.5rem' }}>
+                    <button
+                      type="button"
+                      role="tab"
+                      aria-selected={titlePreviewMode === 'intro'}
+                      className={`tiktok-btn ${titlePreviewMode === 'intro' ? 'tiktok-btn--primary' : 'tiktok-btn--outline'}`}
+                      onClick={() => setTitlePreviewMode('intro')}
+                    >
+                      Frame Title
+                    </button>
+                    <button
+                      type="button"
+                      role="tab"
+                      aria-selected={titlePreviewMode === 'content'}
+                      className={`tiktok-btn ${titlePreviewMode === 'content' ? 'tiktok-btn--primary' : 'tiktok-btn--outline'}`}
+                      onClick={() => setTitlePreviewMode('content')}
+                    >
+                      Frame Content
+                    </button>
+                  </div>
+                </div>
+
+                <TitlePositionEditor
+                  channelId={selectedChannel}
+                  frameUrl={`/api/article/channel-image/${encodeURIComponent(selectedChannel)}/${titlePreviewMode === 'intro' ? 'frame_intro.png' : 'frame_content.png'}`}
+                  sampleText={titlePreviewMode === 'intro' ? 'TITLE FACEBOOK - KHUNG MỞ ĐẦU' : 'TITLE FACEBOOK - KHUNG NỘI DUNG'}
+                  yStart={titlePreviewMode === 'intro' ? facebookIntroY : facebookContentY}
+                  xOffset={facebookTitleXOffset}
+                  boxWidth={facebookTitleWidth}
+                  fontSize={facebookTitleSize}
+                  color={String(channelConfig.text_color || '#ffffff')}
+                  onChange={(updates) => handleFacebookTitleEditorChange(updates, titlePreviewMode)}
+                />
+
+                {titlePreviewMode === 'content' && (
+                  <div style={{ display: 'flex', alignItems: 'center', gap: '0.75rem', marginTop: '0.9rem', flexWrap: 'wrap' }}>
+                    <span style={{ color: 'var(--text-secondary)', fontSize: '0.82rem' }}>
+                      {rawContentY > 0
+                        ? 'Frame Content đang dùng vị trí riêng đã khóa.'
+                        : 'Frame Content đang dùng vị trí tự động thấp hơn Frame Title.'}
+                    </span>
+                    {rawContentY > 0 && (
+                      <button
+                        type="button"
+                        className="tiktok-btn tiktok-btn--outline"
+                        onClick={() => handleConfigField('text_y_content', 0)}
+                      >
+                        Dùng lại vị trí tự động
+                      </button>
+                    )}
+                  </div>
+                )}
+              </div>
+
+              <div className="grid" style={{ gridTemplateColumns: 'repeat(auto-fit, minmax(260px, 1fr))' }}>
+              <div className="form-group">
+                <label className="form-label">Vị trí Y trên Frame Title (0 - 1):</label>
+                <input
+                  type="number" className="form-input" step="0.01" min="0" max="1"
+                  value={channelConfig.text_y1 ?? 0.73}
+                  onChange={e => handleConfigField('text_y1', parseFloat(e.target.value) || 0)}
+                />
+                <small style={{ color: 'var(--text-secondary)' }}>0.73 = 73% chiều cao khung.</small>
+              </div>
+
+              <div className="form-group">
+                <label className="form-label">Vị trí Y trên Frame Content (0 - 1):</label>
+                <input
+                  type="number" className="form-input" step="0.01" min="0" max="1"
+                  value={channelConfig.text_y_content ?? 0}
+                  onChange={e => handleConfigField('text_y_content', parseFloat(e.target.value) || 0)}
+                />
+                <small style={{ color: 'var(--text-secondary)' }}>
+                  Để 0 = tự đặt thấp hơn Frame Title một khoảng.
+                </small>
+              </div>
+
+              <div className="form-group">
+                <label className="form-label">Vị trí X từ mép trái (px):</label>
+                <input
+                  type="number" className="form-input" step="1"
+                  value={channelConfig.text_x ?? 0}
+                  onChange={e => handleConfigField('text_x', parseInt(e.target.value) || 0)}
+                />
+              </div>
+
+              <div className="form-group">
+                <label className="form-label">Cỡ chữ:</label>
+                <input
+                  type="number" className="form-input" step="1" min="20" max="120"
+                  value={channelConfig.text_size ?? 50}
+                  onChange={e => handleConfigField('text_size', parseInt(e.target.value) || 50)}
+                />
+              </div>
+
+              <div className="form-group">
+                <label className="form-label">Màu chữ:</label>
+                <input
+                  type="color" className="form-input" style={{ height: '42px', padding: '4px' }}
+                  value={channelConfig.text_color ?? '#ffffff'}
+                  onChange={e => handleConfigField('text_color', e.target.value)}
+                />
+              </div>
+
+              <div className="form-group">
+                <label className="form-label">Bề rộng vùng chữ (0 - 1):</label>
+                <input
+                  type="number" className="form-input" step="0.01" min="0.2" max="1"
+                  value={channelConfig.text_w ?? 0.85}
+                  onChange={e => handleConfigField('text_w', parseFloat(e.target.value) || 0.85)}
+                />
+              </div>
+              </div>
+            </>
+          )}
+        </div>
+      )}
+
       {activeTab === 'prompt' && (
         <div className="card">
           <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '1rem' }}>
-            <h3>🧠 Chỉnh sửa Prompt Kịch Bản Facebook</h3>
+            <h3>Chỉnh sửa Prompt Kịch Bản Facebook</h3>
             <button className="btn btn-primary" onClick={handleSavePrompt}>
               <Save size={18} /> Lưu Prompt
             </button>
@@ -427,7 +945,7 @@ export default function ToolFacebook() {
 
       {activeTab === 'voice' && (
         <div className="card">
-          <h3>⚙️ Cài đặt Voice ID mặc định (Toàn cục)</h3>
+          <h3>Cài đặt Voice ID mặc định (Toàn cục)</h3>
           <div className="grid" style={{ gridTemplateColumns: '1fr 1fr', marginTop: '1.5rem', gap: '1rem' }}>
             <div className="form-group">
               <label className="form-label">Tích cực:</label>

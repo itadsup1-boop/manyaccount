@@ -20,11 +20,16 @@ for d in [FRAME_DIR, LOGO_DIR, FONT_DIR]:
     if not os.path.exists(d): os.makedirs(d)
 
 from shared.services.supabase_api import SupabaseAPI
+from shared.core.ai_provider_factory import get_configured_ai_provider, save_configured_ai_provider
 from shared.core.context import AccountContext
 from shared.core.worker import handle_tts_and_update_sheet
 from shared.core.pipeline_state import PipelineLifecycle, PipelineStageError
 from shared.core.quality_log import append_quality_event
 from shared.core.video_qa import run_video_qa
+from shared.core.social_quality_gate import (
+    evaluate_social_render_contract,
+    summarize_social_render_contract,
+)
 
 try:
     from modules.video_handler import download_tiktok_video
@@ -57,6 +62,20 @@ class AutoCloneWorkerPage:
         self.control_frame = ctk.CTkFrame(self.parent)
         self.control_frame.pack(fill="x", pady=10)
 
+        # --- Chọn AI Provider ---
+        self.ai_label = ctk.CTkLabel(self.control_frame, text="🤖 Chọn AI Engine:", font=ctk.CTkFont(weight="bold"))
+        self.ai_label.pack(side="left", padx=15, pady=10)
+
+        current_provider = "Gemini (Web)" if get_configured_ai_provider() == "gemini" else "ChatGPT"
+        self.ai_provider_var = ctk.StringVar(value=current_provider)
+        self.ai_provider_selector = ctk.CTkSegmentedButton(
+            self.control_frame,
+            values=["ChatGPT", "Gemini (Web)"],
+            variable=self.ai_provider_var,
+            command=self.on_ai_provider_change
+        )
+        self.ai_provider_selector.pack(side="left", padx=10, pady=10)
+
         self.btn_toggle = ctk.CTkButton(
             self.control_frame,
             text="▶️ BẬT TREO AUTO",
@@ -65,7 +84,12 @@ class AutoCloneWorkerPage:
             height=40,
             command=self.toggle_auto
         )
-        self.btn_toggle.pack(pady=10)
+        self.btn_toggle.pack(side="right", padx=15, pady=10)
+
+    def on_ai_provider_change(self, value):
+        provider_key = "gemini" if "gemini" in value.lower() else "chatgpt"
+        save_configured_ai_provider(provider_key)
+        self.log(f"⚙️ Đã chuyển đổi AI Provider sang: {value.upper()}")
 
         ctk.CTkLabel(self.parent, text="📋 Nhật ký hoạt động (Logs):", font=ctk.CTkFont(weight="bold")).pack(anchor="w")
 
@@ -246,6 +270,18 @@ class AutoCloneWorkerPage:
             self.log("🎬 [6/6] Đang Render & Edit Video...")
             assets_conf = render_settings.get("assets", {})
 
+            # Older Sheet rows may store beats as a JSON string.  Preserve the
+            # structured plan when present; the renderer will create sentence
+            # beats from script_text when this field is absent.
+            row_beats = row_data.get("beats")
+            if isinstance(row_beats, str):
+                try:
+                    row_beats = json.loads(row_beats)
+                except (TypeError, ValueError):
+                    row_beats = None
+            if not isinstance(row_beats, list):
+                row_beats = None
+
             def download_if_missing(folder_type, local_dir, file_name):
                 if not file_name: return None
                 full_path = os.path.join(local_dir, file_name)
@@ -257,12 +293,36 @@ class AutoCloneWorkerPage:
             download_if_missing("logo", LOGO_DIR, assets_conf.get("logo_filename"))
             download_if_missing("font", FONT_DIR, render_settings.get("text_overlay_settings", {}).get("font_filename"))
 
-            final_path = create_video_from_source_video(
+            render_contract = evaluate_social_render_contract(
+                source_type="tiktok",
+                source_url=vid_url,
+                title=row_data.get("title_text", ""),
+                script=row_data.get("content_text", ""),
+                frame_mode=bool(t_frame_path or c_frame_path),
+                title_frame_available=bool(t_frame_path),
+                content_frame_available=bool(c_frame_path),
+                subtitle_style=row_data.get("subtitle_style", "keyword_highlight"),
+                threshold=int(os.environ.get("SOCIAL_RENDER_THRESHOLD", "70")),
+            )
+            if not render_contract.passed:
+                raise PipelineStageError(
+                    "validated",
+                    "SOCIAL_RENDER_CONTRACT_FAILED",
+                    summarize_social_render_contract(render_contract),
+                    retryable=False,
+                )
+
+            render_result = create_video_from_source_video(
                 audio_url=local_content,
                 source_video_url=paths['original'],
                 title_audio_url=local_title,
                 title_tiktok=row_data.get("title_text", "Video Viral"),
-                content_text=row_data.get("title_text", ""),
+                content_text=row_data.get("content_text", ""),
+                beats=row_beats,
+                script_text=row_data.get("content_text", ""),
+                subtitle_style=row_data.get(
+                    "subtitle_style", "keyword_highlight",
+                ),
                 script_url=sheet_url,
                 row_index=row_data['row'],
                 tiktok_id=clean_tid,
@@ -276,6 +336,12 @@ class AutoCloneWorkerPage:
                 music_mood=row_data.get("music_mood"),
                 music_energy=row_data.get("music_energy", 2),
                 is_sensitive=row_data.get("is_sensitive", False),
+                have_frame=bool(row_data.get("have_frame")),
+                frame_end_sec=row_data.get("detected_competitor_frame_end_sec"),
+            )
+            final_path = (
+                render_result.get("final_path")
+                if isinstance(render_result, dict) else render_result
             )
             if not final_path or not os.path.exists(final_path):
                 raise PipelineStageError(
@@ -283,13 +349,24 @@ class AutoCloneWorkerPage:
                 )
             lifecycle.advance("rendered")
 
+            render_subtitle_path = (
+                render_result.get("subtitle_ass_path", "")
+                if isinstance(render_result, dict) else ""
+            )
+            render_watermark_detected = (
+                bool(render_result.get("watermark_detected"))
+                if isinstance(render_result, dict) else False
+            )
             qa_result = run_video_qa(
                 final_path,
-                watermark_detected=bool(
-                    task.get("watermark_detected")
-                    or paths.get("watermark_detected")
-                ),
+                subtitle_ass_path=render_subtitle_path or "",
+                watermark_detected=render_watermark_detected,
             )
+            if render_subtitle_path and os.path.exists(render_subtitle_path):
+                try:
+                    os.remove(render_subtitle_path)
+                except OSError:
+                    pass
             if not qa_result.passed:
                 raise PipelineStageError(
                     "qa_passed",

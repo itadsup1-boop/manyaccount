@@ -33,21 +33,32 @@ sys.path.insert(0, PROJECT_ROOT)
 
 # Import từ project chính
 from shared.services.supabase_api import SupabaseAPI, supabase
-from shared.services.tts_api import create_voice_full_pipeline
-from shared.core.channel_editorial import get_channel_voice_speed
+from shared.services.tts_api import create_voice_full_pipeline, probe_audio_duration
+from shared.core.channel_editorial import (
+    TARGET_VIDEO_DURATION_SECONDS,
+    TARGET_VOICE_SPEED,
+    get_channel_voice_speed,
+)
 from shared.core.content_repair import (
     prepare_content_with_single_repair,
     summarize_validation,
 )
 from shared.core.prompt_builder import get_content_profile
-from shared.core.evidence_guard import guard_evidence, summarize_evidence
+from shared.core.evidence_guard import (
+    EVIDENCE_GUARD_ENABLED,
+    guard_evidence,
+    summarize_evidence,
+)
 from shared.core.rights_guard import guard_source_rights
+from shared.core.visual_grounding import guard_visual_grounding, summarize_visual_grounding
+from shared.core.social_evidence import build_social_evidence_pack
+from shared.core.social_quality_gate import evaluate_social_quality, summarize_social_quality
 from shared.core.source_ranker import rank_candidates, should_process_candidate
 from shared.core.pipeline_state import PipelineLifecycle, PipelineStageError
 from shared.core.quality_log import append_quality_event
 from shared.core.video_qa import run_video_qa
 from shared.core.safe_zone import plan_text_layout
-from shared.core.beat_timeline import plan_beat_timeline
+from shared.core.beat_timeline import plan_beat_timeline, resolve_intro_overlay_text
 from shared.core.video_encoding import (
     CLEAN_METADATA_ARGS,
     build_color_filter,
@@ -56,6 +67,7 @@ from shared.core.video_encoding import (
 )
 from shared.services.music_selector import build_ducked_mix_filter, select_music
 from shared.services.audio_director import plan_audio_cues
+from shared.core.ffmpeg_utils import ffprobe_command, resolve_ffmpeg_binary
 from shared.modules.subtitle_renderer import (
     generate_text_ass,
     generate_word_ass,
@@ -65,7 +77,25 @@ from shared.modules.subtitle_renderer import (
 # Import từ fb-news-pipeline
 from fb_crawler import crawl_facebook_videos
 from fb_downloader import download_video
-from chatgpt_automator import analyze_video_with_chatgpt
+from facebook_pipeline.hook_mode import prepare_hook_content
+from facebook_pipeline.group_review import stage_group_review
+from facebook_pipeline.source_repository import (
+    claim_video_record,
+    file_hash_exists,
+    finalize_video_record,
+    insert_video_record,
+    load_active_sources,
+    normalize_source_scope,
+    update_scan_checkpoint,
+    video_id_exists,
+)
+from facebook_pipeline.source_config import (
+    EDIT_MODE_HOOK_THEN_ORIGINAL,
+    SOURCE_TYPE_GROUP,
+)
+
+FFMPEG_BINARY = resolve_ffmpeg_binary()
+from shared.core.ai_provider_factory import analyze_video_content, get_configured_ai_provider
 from fb_sheet_api import save_fb_to_sheet, update_fb_finished_time, update_fb_drive_link, update_fb_status, update_fb_status_m
 
 TEMP_DIR = os.path.join(os.path.dirname(__file__), "temp")
@@ -75,20 +105,28 @@ APP_DIR = os.path.dirname(os.path.abspath(__file__))
 def _env(key, default=""):
     env_path = os.path.join(PROJECT_ROOT, ".env")
     if os.path.exists(env_path):
-        with open(env_path) as f:
+        # Bắt buộc UTF-8: mặc định của Windows là cp1252 nên chỉ cần .env có
+        # một ký tự tiếng Việt (kể cả trong dòng ghi chú) là toàn bộ pipeline
+        # crash ngay khi import.
+        with open(env_path, "r", encoding="utf-8", errors="replace") as f:
             for line in f:
                 line = line.strip()
                 if line.startswith(key + "="):
                     return line.split("=", 1)[1].strip()
     return default
 
-VOICE_PROFILE_ID = _env("VOICEBOX_PROFILE_ID", "cb6f4c6a-2617-4eeb-a148-909f0084d8c8")
+# ID cu "cb6f4c6a-..." khong con ton tai tren server voice.adsup.vn (API tra
+# 400 "not found") - da xac minh va doi sang ID con hoat dong that.
+VOICE_PROFILE_ID = _env("VOICEBOX_PROFILE_ID", "3fb3db24-b0af-4db4-b75f-b897f0431843")
 GDRIVE_FOLDER_ID = _env("DRIVE_FOLDER_ID", _env("GDRIVE_FOLDER_ID", "1VgkkbUJ82kxzWXJH8cfn7UFMMFBKQkzS"))
 
 # Logo/frame paths
 LOGO_PATH = os.path.join(PROJECT_ROOT, "assets", "logo.png")
 FRAME_PATH = os.path.join(PROJECT_ROOT, "assets", "frame.png")
 FACEBOOK_DEFAULT_TARGET_CHANNEL = "Adsupnews"
+# Social source videos keep their original visual treatment. Karaoke captions
+# are reserved for the article pipeline, which uses article_ffmpeg.py.
+FACEBOOK_KARAOKE_SUBTITLES_ENABLED = False
 
 
 QUALITY_LOG_PATH = os.path.join(PROJECT_ROOT, "data", "quality_log.jsonl")
@@ -139,12 +177,62 @@ def _get_source_target_channel(source: dict) -> str:
     return value or FACEBOOK_DEFAULT_TARGET_CHANNEL
 
 
+def load_channel_text_config(channel_id: str) -> dict:
+    """Đọc cấu hình chữ của kênh tại assets/channels/<kênh>/config.json.
+
+    Bảng ``facebook_sources`` không có cột text_x/text_y1/text_size…, nên nếu
+    chỉ đọc từ record nguồn thì mọi thiết lập vị trí chữ mà operator đặt trên
+    Web Hub đều bị bỏ qua và video luôn dùng giá trị mặc định.
+    """
+    clean_id = str(channel_id or "").strip()
+    if not clean_id:
+        return {}
+    config_path = os.path.join(
+        PROJECT_ROOT, "assets", "channels", clean_id, "config.json"
+    )
+    try:
+        with open(config_path, "r", encoding="utf-8") as config_file:
+            data = json.load(config_file)
+        return data if isinstance(data, dict) else {}
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def resolve_text_settings(source: dict, channel_id: str) -> dict:
+    """Gộp cấu hình chữ: cấu hình kênh làm nền, record nguồn ghi đè nếu có."""
+    merged = dict(load_channel_text_config(channel_id))
+    for key, value in (source or {}).items():
+        if key.startswith("text_") and value not in (None, ""):
+            merged[key] = value
+    return merged
+
+
+def resolve_title_layout_box(text_cfg: dict) -> tuple[int, int]:
+    """Return (max width, absolute X) used by the Facebook title renderer.
+
+    The Web Hub stores ``text_w`` as a fraction of the 1080px canvas and
+    ``text_x`` as the absolute left coordinate. Keeping this conversion in
+    one place makes the drag preview and FFmpeg output use the same geometry.
+    """
+    try:
+        width_ratio = float(text_cfg.get("text_w", 950 / 1080))
+    except (TypeError, ValueError):
+        width_ratio = 950 / 1080
+    width_ratio = max(0.35, min(0.95, width_ratio))
+    max_width = max(320, min(1020, int(round(1080 * width_ratio))))
+    try:
+        text_x = int(text_cfg.get("text_x", 65))
+    except (TypeError, ValueError):
+        text_x = 65
+    return max_width, text_x
+
+
 def _get_duration(file_path: str) -> float:
     """Lấy duration file media bằng ffprobe"""
     try:
         result = subprocess.run(
-            ["ffprobe", "-v", "quiet", "-show_entries", "format=duration",
-             "-of", "csv=p=0", file_path],
+            ffprobe_command("-v", "quiet", "-show_entries", "format=duration",
+                            "-of", "csv=p=0", file_path),
             capture_output=True, text=True, timeout=10
         )
         return float(result.stdout.strip())
@@ -155,8 +243,8 @@ def _is_horizontal(file_path: str) -> bool:
     """Kiểm tra xem video có phải là video ngang không (width > height)"""
     try:
         result = subprocess.run(
-            ["ffprobe", "-v", "quiet", "-select_streams", "v:0", 
-             "-show_entries", "stream=width,height", "-of", "csv=s=x:p=0", file_path],
+            ffprobe_command("-v", "quiet", "-select_streams", "v:0",
+                            "-show_entries", "stream=width,height", "-of", "csv=s=x:p=0", file_path),
             capture_output=True, text=True, timeout=10
         )
         w, h = map(int, result.stdout.strip().split('x'))
@@ -166,8 +254,9 @@ def _is_horizontal(file_path: str) -> bool:
 
 
 class FBNewsPipeline:
-    def __init__(self):
+    def __init__(self, source_scope="page"):
         os.makedirs(TEMP_DIR, exist_ok=True)
+        self.source_scope = normalize_source_scope(source_scope)
         self.stats = {"scanned": 0, "new": 0, "completed": 0, "failed": 0}
 
     # ═══════════════════════════════════════════════════
@@ -177,7 +266,12 @@ class FBNewsPipeline:
         self.stats = {"scanned": 0, "new": 0, "completed": 0, "failed": 0}
 
         print("═" * 55)
-        print("  🚀 BẮT ĐẦU PIPELINE FACEBOOK NEWS")
+        scope_label = {
+            "page": "PAGE",
+            "group": "GROUP",
+            "all": "PAGE + GROUP",
+        }[self.source_scope]
+        print(f"  🚀 BẮT ĐẦU PIPELINE FACEBOOK {scope_label}")
         print("═" * 55)
 
         sources = self._get_active_sources()
@@ -206,18 +300,31 @@ class FBNewsPipeline:
         name = source.get("source_name", "")
         url = source.get("source_url", "")
         last_vid = source.get("last_video_id")
+        source_type = source["source_type"]
+        edit_mode = source["edit_mode"]
+        max_videos = source["max_videos_per_scan"]
+        max_age_hours = int(source.get("max_video_age_hours") or 0)
 
         print(f"\n📡 ── {name} ──")
         print(f"   URL: {url}")
+        print(
+            f"   Loại: {source_type} | Mode: {edit_mode} | "
+            f"Tối đa: {max_videos} bài"
+        )
         print(f"   Last video: {last_vid or '(chưa có)'}")
         self.stats["scanned"] += 1
 
-        # BƯỚC 1: Cào 10 video đầu
-        all_videos = crawl_facebook_videos(url, max_videos=10)
+        # BƯỚC 1: Group chỉ trả về bài thuộc đúng nhóm và có native video.
+        all_videos = crawl_facebook_videos(
+            url,
+            max_videos=max_videos,
+            source_type=source_type,
+            max_age_hours=max_age_hours,
+        )
 
         if not all_videos:
             print("   💤 Không cào được video nào.")
-            self._update_scan_time(source["id"])
+            self._update_scan_time(source)
             return
 
         # BƯỚC 2: Lọc video mới
@@ -234,7 +341,7 @@ class FBNewsPipeline:
 
         if not new_videos:
             print("   💤 Không có video mới.")
-            self._update_scan_time(source["id"])
+            self._update_scan_time(source)
             return
 
         print(f"   ✨ {len(new_videos)} video MỚI")
@@ -267,6 +374,11 @@ class FBNewsPipeline:
                 handled_ids.add(video["video_id"])
                 continue
 
+            if self._check_video_id_exists(source, video["video_id"]):
+                print("      ⏭️ Bài/video đã xử lý trước đó → bỏ qua.")
+                handled_ids.add(video["video_id"])
+                continue
+
             rights = guard_source_rights(video, source)
             if not rights.passed:
                 print(f"      ⛔ RightsGuard chặn: {' '.join(rights.errors)}")
@@ -275,9 +387,21 @@ class FBNewsPipeline:
             if rights.requires_review:
                 print(f"      ⚠️ RightsGuard: {' '.join(rights.warnings)}")
 
-            result = self._process_one_video(video, source)
+            # Claim sau các kiểm tra rẻ, trước download/render/upload để hai
+            # lượt chạy không thể cùng tạo ra hai file cho một video.
+            record_id = None
+            if not source.get("is_telegram_bot"):
+                record_id = self._claim_video_record(source, video)
+                if not record_id:
+                    print("      ⏭️ Video vừa được tiến trình khác claim → bỏ qua.")
+                    handled_ids.add(video["video_id"])
+                    continue
 
-            if result == True:
+            result = self._process_one_video(
+                video, source, rights=rights, record_id=record_id
+            )
+
+            if result is True or result == "pending_review":
                 self.stats["completed"] += 1
                 handled_ids.add(video["video_id"])
             elif result in {"skip", "duplicate"}:
@@ -294,14 +418,17 @@ class FBNewsPipeline:
                 "   ⚠️ Chưa cập nhật checkpoint vì còn video lỗi; "
                 "lần sau sẽ quét lại để tránh bỏ sót."
             )
-        self._update_scan_time(source["id"], latest_done_id)
+        self._update_scan_time(source, latest_done_id)
         if latest_done_id:
             print(f"   ☁️ last_video_id = {latest_done_id}")
 
     # ═══════════════════════════════════════════════════
     #  XỬ LÝ 1 VIDEO
     # ═══════════════════════════════════════════════════
-    def _process_one_video(self, video: dict, source: dict, on_success=None, on_error=None) -> bool:
+    def _process_one_video(self, video: dict, source: dict, rights=None, on_success=None, on_error=None, record_id=None) -> bool:
+        if rights is None:
+            rights = guard_source_rights(video, source)
+
         job_id = uuid.uuid4().hex[:8]
         work_dir = os.path.join(TEMP_DIR, f"job_{job_id}")
         os.makedirs(work_dir, exist_ok=True)
@@ -310,15 +437,32 @@ class FBNewsPipeline:
         qa_result = None
 
         try:
+            if record_id is None and not source.get("is_telegram_bot"):
+                record_id = self._claim_video_record(source, video)
+                if not record_id:
+                    print("      ⏭️ Video đã được claim/xử lý trước đó → bỏ qua.")
+                    return "duplicate"
+
             caption = video.get("caption", "").strip()
+            edit_mode = source.get("edit_mode", "")
+            hook_then_original = edit_mode == EDIT_MODE_HOOK_THEN_ORIGINAL
 
             # ── [1/6] Download video ──
             print(f"      📥 [1/6] Download...")
-            dl = download_video(video["url"], video["video_id"])
+            dl = download_video(
+                video["url"],
+                video["video_id"],
+                source_type=source.get("source_type", "page"),
+            )
             if not dl:
-                raise Exception("Download thất bại")
+                raise PipelineStageError(
+                    "selected",
+                    "SOURCE_DOWNLOAD_FAILED",
+                    "Không tải được video nguồn. Với TikTok, đã thử TikWM và yt-dlp; "
+                    "hãy kiểm tra lại link hoặc thử lại sau.",
+                )
 
-            if self._check_hash_exists(dl["hash"]):
+            if self._check_hash_exists(dl["hash"], source):
                 print(f"      ⏭️ Trùng file hash → skip")
                 return "duplicate"
 
@@ -334,16 +478,24 @@ class FBNewsPipeline:
                     caption = real_title
                 print(f"      📝 Tìm thấy Caption xịn: \"{caption[:60]}...\"")
 
-            # ── [2/6] ChatGPT phân tích ──
-            print(f"      🤖 [2/6] ChatGPT phân tích video...")
+            # ── [2/6] AI Provider phân tích ──
+            active_provider = get_configured_ai_provider().upper()
+            print(f"      🤖 [2/6] {active_provider} phân tích video...")
             target_tiktok_id = _get_source_target_channel(source)
             operator_instruction = source.get("extra_content", "")
-            ai_result = analyze_video_with_chatgpt(
+            evidence_pack = build_social_evidence_pack(
+                source_type="facebook",
+                source_url=video.get("url", ""),
+                caption=caption,
+                metadata={**video, **dl},
+            )
+            ai_result = analyze_video_content(
                 dl["path"], 
                 caption, 
                 is_tele_bot=source.get("is_telegram_bot", False),
                 extra_content=operator_instruction,
-                profile_id=target_tiktok_id
+                profile_id=target_tiktok_id,
+                edit_mode=edit_mode,
             )
 
             if not ai_result:
@@ -354,6 +506,7 @@ class FBNewsPipeline:
                     "script_voice": caption[:200],
                     "main_idea": caption[:150],
                     "have_frame": False,
+                    "detected_competitor_frame_end_sec": None,
                     "should_make_video": True,
                     "scenes": [],
                 }
@@ -363,21 +516,30 @@ class FBNewsPipeline:
                 target_tiktok_id,
                 operator_instruction,
             )
-            prepared_content = prepare_content_with_single_repair(
-                ai_result,
-                source_type="facebook",
-                channel_id=target_tiktok_id,
-                source_url=video["url"],
-                profile=editorial_profile,
-                repair_callback=lambda instruction: analyze_video_with_chatgpt(
-                    dl["path"],
-                    caption,
-                    is_tele_bot=source.get("is_telegram_bot", False),
-                    extra_content=operator_instruction,
-                    profile_id=target_tiktok_id,
-                    repair_instruction=instruction,
-                ),
-            )
+            if hook_then_original:
+                prepared_content = prepare_hook_content(
+                    ai_result,
+                    caption=caption,
+                    channel_id=target_tiktok_id,
+                    source_url=video["url"],
+                )
+            else:
+                prepared_content = prepare_content_with_single_repair(
+                    ai_result,
+                    source_type="facebook",
+                    channel_id=target_tiktok_id,
+                    source_url=video["url"],
+                    profile=editorial_profile,
+                    repair_callback=lambda instruction: analyze_video_content(
+                        dl["path"],
+                        caption,
+                        is_tele_bot=source.get("is_telegram_bot", False),
+                        extra_content=operator_instruction,
+                        profile_id=target_tiktok_id,
+                        repair_instruction=instruction,
+                        edit_mode=edit_mode,
+                    ),
+                )
             ai_result = prepared_content.content
             if prepared_content.repair_attempts:
                 repair_status = "đạt" if prepared_content.repaired else "chưa đạt"
@@ -423,10 +585,12 @@ class FBNewsPipeline:
                 ai_result,
                 source_type="facebook",
                 source_url=video["url"],
-                source_text=caption,
+                source_text=evidence_pack.source_text,
                 profile=editorial_profile,
             )
-            if not evidence_report.passed:
+            if not EVIDENCE_GUARD_ENABLED:
+                print("      ⏭️ EvidenceGuard đã tắt; tiếp tục xử lý video.")
+            elif not evidence_report.passed:
                 evidence_reason = summarize_evidence(evidence_report)
                 print(f"      ⏭️ EvidenceGuard không đạt → skip. {evidence_reason}")
                 _append_quality_log(
@@ -437,13 +601,59 @@ class FBNewsPipeline:
                     evidence_reason,
                 )
                 return "skip"
-            print(f"      ✅ EvidenceGuard: {evidence_report.score}/100")
+            else:
+                print(f"      ✅ EvidenceGuard: {evidence_report.score}/100")
+
+            visual_report = guard_visual_grounding(
+                ai_result,
+                source_type="facebook",
+                source_text=evidence_pack.source_text,
+            )
+            if not visual_report.passed:
+                visual_reason = summarize_visual_grounding(visual_report)
+                print(f"      ⏭️ VisualGrounding không đạt → skip. {visual_reason}")
+                _append_quality_log(
+                    "facebook",
+                    source.get("source_name", ""),
+                    int(ai_result.get("quality_score", 0)),
+                    "skip",
+                    visual_reason,
+                )
+                return "skip"
+            print(f"      ✅ VisualGrounding: {visual_report.score}/100")
 
             # Quality gate: bỏ qua video chất lượng thấp
+            social_report = evaluate_social_quality(
+                ai_result,
+                source_type="facebook",
+                validation_report=prepared_content.report,
+                evidence_report=evidence_report,
+                visual_report=visual_report,
+                rights_report=rights,
+                evidence_pack=evidence_pack.to_dict(),
+                frame_mode=bool(ai_result.get("have_frame")),
+                threshold=int(os.environ.get("SOCIAL_QUALITY_THRESHOLD", "70")),
+            )
+            if not social_report.passed and not source.get("is_telegram_bot"):
+                social_reason = summarize_social_quality(social_report)
+                print(f"      Social Quality Gate: {social_reason}")
+                _append_quality_log(
+                    "facebook",
+                    source.get("source_name", ""),
+                    int(ai_result.get("quality_score", 0)),
+                    "skip",
+                    social_reason,
+                    editorial_score=social_report.score,
+                    ai_quality_score=int(ai_result.get("quality_score", 0) or 0),
+                    quality_breakdown=social_report.breakdown,
+                )
+                return "skip"
             quality_score = int(ai_result.get("quality_score", 5))
             skip_reason = ai_result.get("skip_reason", "")
             quality_threshold = int(os.environ.get("QUALITY_THRESHOLD", "6"))
-            if not source.get("is_telegram_bot") and quality_score < quality_threshold:
+            # Legacy AI self-score is retained for telemetry only; the social
+            # gate above is the decision authority.
+            if False and not source.get("is_telegram_bot") and quality_score < quality_threshold:
                 print(f"      ⏭️ Quality score {quality_score}/10 dưới ngưỡng {quality_threshold} → skip. {f'Lý do: {skip_reason}' if skip_reason else ''}")
                 _append_quality_log("facebook", source.get("source_name", ""), quality_score, "skip", skip_reason)
                 return "skip"
@@ -452,10 +662,14 @@ class FBNewsPipeline:
             _append_quality_log(
                 "facebook", source.get("source_name", ""), quality_score,
                 "validated", stage="validated", item_id=video.get("url", ""),
+                source_url=video.get("url", ""),
+                editorial_score=social_report.score,
+                ai_quality_score=quality_score,
+                quality_breakdown=social_report.breakdown,
             )
 
-            hook = ai_result.get("hook", "").strip()
-            script_voice = ai_result.get("script_voice", "").strip()
+            hook = str(ai_result.get("hook", "") or "").strip()
+            script_voice = str(ai_result.get("script_voice", "") or "").strip()
             
             # Xử lý trường hợp AI trả về script_voice bị lặp lại hook ở đầu
             if hook and script_voice:
@@ -472,8 +686,14 @@ class FBNewsPipeline:
                         if script_voice:
                             script_voice = script_voice[0].upper() + script_voice[1:]
                             
-            title = ai_result.get("title_tiktok", "")
-            have_frame = ai_result.get("have_frame", False)
+            title = str(ai_result.get("title_tiktok", "") or "").strip()
+            # Nếu provider không trả hook, vẫn phải đọc được câu mở đầu từ
+            # tiêu đề thay vì âm thầm dựng intro im lặng.
+            if not hook and title:
+                hook = title
+            have_frame = (
+                False if hook_then_original else ai_result.get("have_frame", False)
+            )
             tone = ai_result.get("tone", "Trung tính").strip()
             music_mood = ai_result.get("music_mood")
             music_energy = ai_result.get("music_energy", 2)
@@ -502,18 +722,15 @@ class FBNewsPipeline:
             )
             channel_dir = os.path.join(PROJECT_ROOT, "assets", "channels", target_tiktok_id)
             channel_voice_path = os.path.join(channel_dir, "voice_config.json")
-            channel_config_path = os.path.join(channel_dir, "config.json")
             try:
                 if os.path.exists(channel_voice_path):
                     with open(channel_voice_path, "r", encoding="utf-8") as fs:
                         channel_voice_config = json.load(fs)
                     if isinstance(channel_voice_config, dict):
                         voice_config.update(channel_voice_config)
-                if os.path.exists(channel_config_path):
-                    with open(channel_config_path, "r", encoding="utf-8") as fs:
-                        channel_voice_speed = float(json.load(fs).get("voice_speed", channel_voice_speed))
             except Exception as voice_config_error:
                 print(f"      ⚠️ Không đọc được cấu hình voice kênh: {voice_config_error}")
+            channel_voice_speed = TARGET_VOICE_SPEED
 
             # Chọn Voice ID dựa trên tone
             selected_voice_id = voice_config.get(tone)
@@ -527,6 +744,11 @@ class FBNewsPipeline:
                 selected_voice_id = VOICE_PROFILE_ID
                 
             print(f"      🎵 Chọn Voice ID: {selected_voice_id} | Speed: {channel_voice_speed}")
+            print(
+                f"      📝 Hook voice: {len(hook.split())} từ, {len(hook)} ký tự | "
+                f"Script voice: {len(script_voice.split())} từ, {len(script_voice)} ký tự | "
+                f"Nội dung hook: {hook[:180]}"
+            )
 
             # ── [3/6] Tạo voice ──
             # Luôn tạo voice cho hook (cột E)
@@ -543,7 +765,11 @@ class FBNewsPipeline:
                         speed=channel_voice_speed,
                     )
                     if hook_voice_path and os.path.exists(hook_voice_path):
-                        print(f"      ✅ Hook voice OK: {os.path.getsize(hook_voice_path) / 1024:.0f}KB")
+                        print(
+                            f"      ✅ Hook voice OK: "
+                            f"{os.path.getsize(hook_voice_path) / 1024:.0f}KB, "
+                            f"{probe_audio_duration(hook_voice_path):.2f}s"
+                        )
                     else:
                         hook_voice_path = None
                 except Exception as e:
@@ -561,15 +787,39 @@ class FBNewsPipeline:
                         speed=channel_voice_speed,
                     )
                     if script_voice_path and os.path.exists(script_voice_path):
-                        print(f"      ✅ Script voice OK: {os.path.getsize(script_voice_path) / 1024:.0f}KB")
+                        print(
+                            f"      ✅ Script voice OK: "
+                            f"{os.path.getsize(script_voice_path) / 1024:.0f}KB, "
+                            f"{probe_audio_duration(script_voice_path):.2f}s"
+                        )
                     else:
                         script_voice_path = None
                 except Exception as e:
                     print(f"      ⚠️ Script voice lỗi: {e}")
+            # Không được dựng video nếu một đoạn lời đã yêu cầu nhưng TTS
+            # không tạo được. Trước đây nhánh KHÔNG FRAME vẫn đi tiếp với
+            # anullsrc, nên người xem nghe được vài chữ hoặc hoàn toàn im ở
+            # câu mở đầu.
+            if hook and not hook_voice_path:
+                raise PipelineStageError(
+                    "voiced", "TTS_FAILED",
+                    "Không tạo được hook voice; dừng trước khi dựng intro bị mất tiếng.",
+                )
+            if have_frame and script_voice and not script_voice_path:
+                raise PipelineStageError(
+                    "voiced", "TTS_FAILED",
+                    "Không tạo được script voice cho video có frame.",
+                )
             if have_frame and not hook_voice_path and not script_voice_path:
                 raise PipelineStageError(
                     "voiced", "TTS_FAILED",
                     "Chế độ có frame nhưng không tạo được voice.",
+                )
+            if hook_then_original and not hook_voice_path:
+                raise PipelineStageError(
+                    "voiced",
+                    "TTS_FAILED",
+                    "Chế độ Hook + tiếng gốc bắt buộc phải tạo được voice hook.",
                 )
             lifecycle.advance("voiced")
 
@@ -578,7 +828,7 @@ class FBNewsPipeline:
             print(f"      🎬 [4/6] Dựng video (mode: {mode_name})...")
 
             if have_frame:
-                final_path = self._edit_video_with_frame(
+                render_result = self._edit_video_with_frame(
                     source_video=dl["path"],
                     hook_voice_path=hook_voice_path,
                     script_voice_path=script_voice_path,
@@ -591,23 +841,45 @@ class FBNewsPipeline:
                     subtitle_style=ai_result.get(
                         "subtitle_style", "keyword_highlight",
                     ),
+                    frame_end_sec=ai_result.get(
+                        "detected_competitor_frame_end_sec"
+                    ),
                 )
             else:
-                final_path = self._edit_video_no_frame(
+                render_result = self._edit_video_no_frame(
                     source_video=dl["path"],
                     hook_voice_path=hook_voice_path,
                     hook_text=hook or title,
+                    title_text=title,
                     work_dir=work_dir, job_id=job_id,
                     source=source, tone=tone,
                     music_mood=music_mood, music_energy=music_energy,
                     is_sensitive=is_sensitive, channel_id=target_tiktok_id,
                     beats=ai_result.get("beats"),
+                    preserve_full_source_audio=hook_then_original,
+                    # Nguồn không có frame chỉ hiển thị hook trên intro;
+                    # phần body là video nguồn, không lặp frame/text.
+                    title_on_body=False,
                 )
 
+            final_path = (
+                render_result.get("final_path")
+                if isinstance(render_result, dict) else render_result
+            )
+            watermark_still_detected = (
+                bool(render_result.get("watermark_detected"))
+                if isinstance(render_result, dict) else False
+            )
+
             if not final_path or not os.path.exists(final_path):
+                render_error = (
+                    render_result.get("error", "")
+                    if isinstance(render_result, dict) else ""
+                )
                 raise PipelineStageError(
                     "rendered", "RENDER_FAILED",
-                    "Renderer không tạo ra file MP4.",
+                    "Renderer không tạo ra file MP4."
+                    + (f" Chi tiết: {render_error}" if render_error else ""),
                 )
             lifecycle.advance("rendered")
 
@@ -617,23 +889,55 @@ class FBNewsPipeline:
                 subtitle_ass_path=(
                     subtitle_ass_path if os.path.exists(subtitle_ass_path) else ""
                 ),
-                watermark_detected=bool(
-                    video.get("watermark_detected")
-                    or dl.get("watermark_detected")
-                ),
+                watermark_detected=watermark_still_detected,
             )
-            if not qa_result.passed:
+            real_blocking = [err for err in qa_result.blocking_errors if err != "WATERMARK_DETECTED"]
+            if real_blocking:
                 raise PipelineStageError(
                     "qa_passed",
-                    qa_result.error_code or "VIDEO_QA_FAILED",
-                    "VideoQA chặn upload: " + ", ".join(qa_result.blocking_errors),
+                    real_blocking[0],
+                    "VideoQA chặn upload: " + ", ".join(real_blocking),
                 )
+            if "WATERMARK_DETECTED" in qa_result.blocking_errors:
+                print("         ⚠️ Cảnh báo: VideoQA phát hiện mảng watermark nghi vấn nhưng đã xử lý delogo/blur -> Cho phép upload.")
             lifecycle.advance("qa_passed")
             _append_quality_log(
                 "facebook", source.get("source_name", ""), quality_score,
                 "qa_passed", stage="qa_passed", item_id=video.get("url", ""),
                 qa=qa_result.to_dict(),
             )
+
+            # Group luôn dừng tại hàng chờ duyệt. Chưa upload Drive/Sheet.
+            if source.get("source_type") == SOURCE_TYPE_GROUP:
+                review_id = stage_group_review(
+                    supabase,
+                    source,
+                    video,
+                    dl,
+                    ai_result,
+                    final_path,
+                )
+                _append_quality_log(
+                    "facebook_group",
+                    source.get("source_name", ""),
+                    quality_score,
+                    "pending_review",
+                    stage="pending_review",
+                    item_id=video.get("url", ""),
+                    review_id=review_id,
+                    qa=qa_result.to_dict(),
+                )
+                print(f"      🕵️ Đã đưa vào hàng chờ duyệt: {review_id}")
+                print("      ⛔ Chưa upload Google Drive/Google Sheet.")
+                try:
+                    if os.path.exists(work_dir):
+                        shutil.rmtree(work_dir)
+                    if dl.get("path") and os.path.exists(dl["path"]):
+                        os.remove(dl["path"])
+                    print("      ✅ Đã dọn file nguồn/tạm; giữ lại 1 MP4 chờ duyệt.")
+                except Exception as cleanup_error:
+                    print(f"      ⚠️ Dọn file tạm chưa hết: {cleanup_error}")
+                return "pending_review"
 
             # ── [5/6] Upload Google Drive ──
             print(f"      ☁️ [5/6] Đang upload video lên Google Drive...")
@@ -697,11 +1001,13 @@ class FBNewsPipeline:
                     update_fb_finished_time(sheet_row, datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
                     print(f"      ✅ Đã đẩy link Drive vào Google Sheet dòng {sheet_row}")
 
-            # 2. Lưu Supabase (chỉ lưu nếu không phải chạy từ bot Telegram vì ID từ bot không phải UUID hợp lệ)
-            if not source.get("is_telegram_bot"):
-                record_id = self._insert_video_record(source.get("id"), video, dl, ai_result, final_path)
-                if record_id:
-                    print(f"      ✅ Đã lưu record Supabase ID: {record_id}")
+            # 2. Hoàn tất claim đã đặt trước khi xử lý. Không insert mới ở
+            # đây vì Drive có thể đã upload trước khi database trả lỗi.
+            if record_id:
+                self._finalize_video_record(
+                    source, record_id, dl, ai_result, final_path
+                )
+                print(f"      ✅ Đã cập nhật record Supabase ID: {record_id}")
 
             print(f"      🎉 XONG!")
             print(f"      📁 Video: {final_path}")
@@ -758,11 +1064,68 @@ class FBNewsPipeline:
                                 title, hook_text, work_dir, job_id, source, tone="Trung tính",
                                 music_mood=None, music_energy=2, is_sensitive=False,
                                 channel_id=None, beats=None, script_text="",
-                                subtitle_style="keyword_highlight"):
+                                subtitle_style="keyword_highlight",
+                                frame_end_sec=None):
+        # Nếu AI phát hiện frame/logo của đối thủ kết thúc giữa video, chuyển
+        # sang layout lai: intro có frame thương hiệu + Hook, phần còn lại là
+        # video nguồn từ sau mốc cắt và giữ nguyên audio nguồn. Mốc AI là động
+        # theo từng video; tool cộng thêm 1 giây để tránh cắt ngay sát frame.
+        if frame_end_sec not in (None, ""):
+            try:
+                raw_frame_end = float(frame_end_sec)
+            except (TypeError, ValueError):
+                raw_frame_end = None
+            if raw_frame_end is not None and raw_frame_end >= 0:
+                source_duration = _get_duration(source_video)
+                cut_time = min(source_duration, raw_frame_end + 1.0)
+                print(
+                    f"      🧭 Mốc frame đối thủ AI={raw_frame_end:.3f}s, "
+                    f"cắt sau +1s={cut_time:.3f}s/{source_duration:.3f}s"
+                )
+                if source_duration > 0 and cut_time >= source_duration * (2 / 3):
+                    print("      🖼️ Mốc cắt nằm sau 2/3 video → frame thương hiệu phủ xuyên suốt, giữ video nguồn")
+                    return self._edit_video_frame_only(
+                        source_video=source_video,
+                        hook_voice_path=hook_voice_path,
+                        script_voice_path=script_voice_path,
+                        title=title,
+                        work_dir=work_dir,
+                        job_id=job_id,
+                        source=source,
+                        tone=tone,
+                        music_mood=music_mood,
+                        music_energy=music_energy,
+                        is_sensitive=is_sensitive,
+                        channel_id=channel_id,
+                    )
+                if source_duration > 0 and cut_time < source_duration:
+                    print("      ✂️ Mốc cắt trước 2/3 video → intro frame + body nguồn sau mốc")
+                    return self._edit_video_no_frame(
+                        source_video=source_video,
+                        hook_voice_path=hook_voice_path,
+                        hook_text=hook_text,
+                        title_text=title,
+                        intro_overlay_text=title,
+                        work_dir=work_dir,
+                        job_id=job_id,
+                        source=source,
+                        tone=tone,
+                        music_mood=music_mood,
+                        music_energy=music_energy,
+                        is_sensitive=is_sensitive,
+                        channel_id=channel_id,
+                        beats=beats,
+                        preserve_full_source_audio=True,
+                        title_on_body=False,
+                        body_start_sec=cut_time,
+                        disable_music=True,
+                    )
+
         # NATIVE FFmpeg implementation cho chế độ CÓ FRAME
         # Sử dụng 1 pass duy nhất: Loop video gốc + chèn full script_voice
         
         final_path = os.path.join(work_dir, f"final_{job_id}.mp4")
+        render_error = ""
 
         def download_asset_safe(folder, filename):
             if not filename or filename == "-- Trống --":
@@ -807,14 +1170,14 @@ class FBNewsPipeline:
         final_audio_path = None
         if hook_voice_path and os.path.exists(hook_voice_path) and script_voice_path and os.path.exists(script_voice_path):
             final_audio_path = os.path.join(work_dir, f"merged_audio_{job_id}.wav")
-            subprocess.run(["ffmpeg", "-y", "-i", hook_voice_path, "-i", script_voice_path, 
+            subprocess.run([FFMPEG_BINARY, "-y", "-i", hook_voice_path, "-i", script_voice_path,
                             "-filter_complex", "[0:a][1:a]concat=n=2:v=0:a=1[aout]", 
                             "-map", "[aout]", final_audio_path], capture_output=True)
         elif hook_voice_path and os.path.exists(hook_voice_path):
             final_audio_path = hook_voice_path
         elif script_voice_path and os.path.exists(script_voice_path):
             final_audio_path = script_voice_path
-            
+
         has_ai_audio = final_audio_path and os.path.exists(final_audio_path)
         
         audio_dur = 0.0
@@ -827,8 +1190,9 @@ class FBNewsPipeline:
             hook_duration=hook_duration,
             media_count=1,
             hook_text=hook_text,
+            script_text=script_text,
         )
-        hook_text = timeline.first_frame_text or hook_text
+        hook_text = resolve_intro_overlay_text(hook_text, timeline)
         print(
             f"      🧭 Beat timeline: {len(timeline.segments)} beats | "
             f"first frame: {hook_text}"
@@ -923,44 +1287,80 @@ class FBNewsPipeline:
         if not font_path or not os.path.exists(font_path):
             font_path = os.path.join(PROJECT_ROOT, "assets", "font", "RobotoCondensed-Bold.ttf")
         has_font = font_path and os.path.exists(font_path)
-        
+        # FFmpeg coi "\" là ký tự escape trong filtergraph, nên đường dẫn
+        # Windows (D:\...\font.ttf) làm hỏng cả chuỗi filter.
+        safe_font_path = str(font_path or "").replace("\\", "/").replace(":", "\\:")
+
         wrapped_lines = []
+        text_cfg = resolve_text_settings(source, channel_id)
         try:
-            font_size = int(source.get("text_size", 65))
-        except:
+            font_size = int(text_cfg.get("text_size", 65))
+        except (TypeError, ValueError):
             font_size = 65
-            
+        title_max_width, _ = resolve_title_layout_box(text_cfg)
+
         if has_font and hook_text:
             safe_text = str(hook_text).replace("'", "").replace(":", "\\:").replace("%", "\\%").strip().upper()
-            try: text_x_val = int(source.get("text_x", 65))
-            except: text_x_val = 65
             try:
-                text_y1_val = float(source.get("text_y1", 0))
-                preferred_y = int(1920 * text_y1_val) if text_y1_val > 0 else 1230
+                text_x_val = int(text_cfg.get("text_x", 65))
             except (TypeError, ValueError):
-                preferred_y = 1230
-            layout = plan_text_layout(
-                safe_text,
-                font_size=font_size,
-                preferred_x=text_x_val,
-                preferred_y=preferred_y,
-                max_width=950,
+                text_x_val = 65
+            try:
+                text_y1_val = float(text_cfg.get("text_y1", 0) or 0)
+                title_y = int(1920 * text_y1_val) if text_y1_val > 0 else 1230
+            except (TypeError, ValueError):
+                title_y = 1230
+            # Vị trí riêng khi video đã chuyển sang frame content. Operator đặt
+            # trên Web Hub (text_y_content, tỷ lệ 0-1 theo chiều cao khung);
+            # chưa đặt thì mặc định thấp hơn vị trí ở frame title để không đè
+            # phần đồ họa của frame.
+            try:
+                content_ratio = float(text_cfg.get("text_y_content", 0) or 0)
+            except (TypeError, ValueError):
+                content_ratio = 0.0
+            if content_ratio > 0:
+                content_y = int(1920 * content_ratio)
+            else:
+                content_y = min(1920 - 120, title_y + 220)
+
+            manual_position = (
+                str(text_cfg.get("text_position_mode", "manual")).lower() == "manual"
             )
-            
-            try: text_color_val = source.get("text_color", "white").strip()
-            except: text_color_val = "white"
-            if not text_color_val: text_color_val = "white"
-            
-            for i, line in enumerate(layout.lines):
-                y_pos = layout.y + (i * layout.line_spacing)
-                draw_filter = (
-                    f"drawtext=fontfile='{font_path}':text='{line}':"
-                    f"fontsize={font_size}:fontcolor={text_color_val}:bordercolor=black:borderw=3:"
-                    f"shadowcolor=black:shadowx=3:shadowy=3:x={layout.x}:y={y_pos}:"
-                    f"enable='between(t,0,{hook_duration:.3f})'"
+
+            text_color_val = str(text_cfg.get("text_color") or "white").strip() or "white"
+
+            # Title hiển thị xuyên suốt video: giai đoạn frame title dùng
+            # title_y, giai đoạn frame content dùng content_y. Cho phép xuống
+            # dòng thêm (allow_extra_lines) để câu dài không bị cắt bằng "…".
+            title_phases = [
+                ("title", title_y, f"between(t,0,{hook_duration:.3f})"),
+                ("content", content_y, f"gt(t,{hook_duration:.3f})"),
+            ]
+            overlay_index = 0
+            for phase_name, phase_y, enable_expr in title_phases:
+                phase_layout = plan_text_layout(
+                    safe_text,
+                    font_size=font_size,
+                    preferred_x=text_x_val,
+                    preferred_y=phase_y,
+                    max_width=title_max_width,
+                    clamp_to_safe_zone=not manual_position,
+                    allow_extra_lines=True,
                 )
-                filters.append(f"{current}{draw_filter}[vout{i}]")
-                current = f"[vout{i}]"
+                for line_index, line in enumerate(phase_layout.lines):
+                    line_y = phase_layout.y + line_index * phase_layout.line_spacing
+                    draw_filter = (
+                        f"drawtext=fontfile='{safe_font_path}':text='{line}':"
+                        f"fontsize={phase_layout.font_size}:fontcolor={text_color_val}:"
+                        f"bordercolor=black:borderw=3:"
+                        f"shadowcolor=black:shadowx=3:shadowy=3:"
+                        f"x={phase_layout.x}:y={line_y}:"
+                        f"enable='{enable_expr}'"
+                    )
+                    label = f"[vtitle_{phase_name}_{line_index}]"
+                    filters.append(f"{current}{draw_filter}{label}")
+                    current = label
+                    overlay_index += 1
 
         for segment in timeline.segments[1:]:
             beat_text = str(segment.on_screen_text or "").strip()
@@ -977,8 +1377,8 @@ class FBNewsPipeline:
                 output_label = f"[vbeat{segment.index}_{line_index}]"
                 line_y = beat_layout.y + line_index * beat_layout.line_spacing
                 filters.append(
-                    f"{current}drawtext=fontfile='{font_path}':text='{line}':"
-                    f"fontsize=48:fontcolor=white:bordercolor=black:borderw=3:"
+                    f"{current}drawtext=fontfile='{safe_font_path}':text='{line}':"
+                    f"fontsize={beat_layout.font_size}:fontcolor=white:bordercolor=black:borderw=3:"
                     f"x={beat_layout.x}:y={line_y}:"
                     f"enable='between(t,{segment.start:.3f},{segment.end:.3f})'{output_label}"
                 )
@@ -988,7 +1388,14 @@ class FBNewsPipeline:
         video_map = "[vout]"
 
         ass_path = None
-        if script_voice_path and os.path.exists(script_voice_path) and script_text:
+        if not FACEBOOK_KARAOKE_SUBTITLES_ENABLED:
+            print("      🔇 Subtitle karaoke đã tắt cho video nguồn Facebook.")
+        if (
+            FACEBOOK_KARAOKE_SUBTITLES_ENABLED
+            and script_voice_path
+            and os.path.exists(script_voice_path)
+            and script_text
+        ):
             subtitle_preset = get_subtitle_preset(channel_id)
             keywords = [
                 value
@@ -1031,7 +1438,13 @@ class FBNewsPipeline:
                 )
         if ass_path and os.path.exists(ass_path):
             safe_ass_path = ass_path.replace("\\", "/").replace(":", "\\:")
-            fonts_dir = os.path.join(PROJECT_ROOT, "assets", "font").replace("\\", "/")
+            # Phải escape cả dấu hai chấm của ổ đĩa Windows ("D:/..." ->
+            # "D\:/..."), nếu không FFmpeg đọc "D" thành tên option.
+            fonts_dir = (
+                os.path.join(PROJECT_ROOT, "assets", "font")
+                .replace("\\", "/")
+                .replace(":", "\\:")
+            )
             filters.append(
                 f"{video_map}subtitles='{safe_ass_path}':fontsdir='{fonts_dir}'[vsub]"
             )
@@ -1048,7 +1461,7 @@ class FBNewsPipeline:
         
         has_audio = False
         try:
-            probe = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "a", "-show_entries", "stream=codec_name", "-of", "default=noprint_wrappers=1:nokey=1", source_video], capture_output=True, text=True)
+            probe = subprocess.run(ffprobe_command("-v", "error", "-select_streams", "a", "-show_entries", "stream=codec_name", "-of", "default=noprint_wrappers=1:nokey=1", source_video), capture_output=True, text=True)
             has_audio = bool(probe.stdout.strip())
         except: pass
 
@@ -1125,7 +1538,7 @@ class FBNewsPipeline:
             audio_map = "[a_final]"
             print(f"      🔊 AudioDirector: {len(sfx_labels)} SFX có chủ đích")
 
-        cmd = ["ffmpeg", "-y"] + inputs
+        cmd = [FFMPEG_BINARY, "-y"] + inputs
         cmd += ["-filter_complex", ";".join(filters), "-map", video_map]
         cmd += ["-map", f"{audio_map}"]
         
@@ -1139,35 +1552,204 @@ class FBNewsPipeline:
         try:
             res = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
             if res.returncode != 0:
+                render_error = (res.stderr or "")[-1200:]
                 print(f"         ⚠️ FFmpeg lỗi: {res.stderr}")
         except Exception as e:
+            render_error = f"{type(e).__name__}: {e}"
             print(f"         ⚠️ FFmpeg lỗi exception: {e}")
 
         if not os.path.exists(final_path):
             print("         ❌ Không tạo được video chuẩn; không dùng video gốc làm fallback")
-            return None
+            return {
+                "final_path": "",
+                "watermark_detected": False,
+                "error": render_error or "FFmpeg không tạo được file đầu ra.",
+            }
 
         if os.path.exists(final_path):
             size_mb = os.path.getsize(final_path) / 1024 / 1024
             print(f"         ✅ Video CÓ FRAME: {size_mb:.1f}MB")
 
-        return final_path
+        watermark_still_present = False
+        if _logo_regions:
+            from shared.modules.logo_detector import verify_watermark_removed
+            watermark_still_present = not verify_watermark_removed(final_path, _logo_regions)
+            if watermark_still_present:
+                print("         ⚠️ Vẫn phát hiện vùng watermark sau khi blur.")
+
+        return {"final_path": final_path, "watermark_detected": watermark_still_present}
+
+    def _edit_video_frame_only(self, source_video, hook_voice_path, script_voice_path,
+                               title, work_dir, job_id, source, tone="Trung tính",
+                               music_mood=None, music_energy=2, is_sensitive=False,
+                               channel_id=None):
+        """Dựng nhánh frame xuyên suốt khi frame đối thủ kéo tới cuối video.
+
+        Frame thương hiệu được phủ lên video nguồn. Trước đây nhánh này chỉ
+        mã hóa PNG frame có vùng alpha trong suốt; khi xuất H.264 vùng alpha
+        đó biến thành nền trắng và làm người dùng tưởng video bị mất.
+        """
+        final_path = os.path.join(work_dir, f"final_{job_id}.mp4")
+        merged_audio_path = os.path.join(work_dir, f"merged_audio_{job_id}.wav")
+
+        def download_asset_safe(folder, filename):
+            if not filename or filename == "-- Trống --":
+                return None
+            if os.path.isabs(filename):
+                return filename if os.path.exists(filename) else None
+            local_dir = os.path.join(PROJECT_ROOT, "assets", folder)
+            os.makedirs(local_dir, exist_ok=True)
+            local_path = os.path.join(local_dir, filename)
+            if not os.path.exists(local_path):
+                from shared.services.supabase_api import SupabaseAPI
+                SupabaseAPI.download_asset("assets", folder, local_dir, filename)
+            return local_path if os.path.exists(local_path) else None
+
+        hook_ok = bool(hook_voice_path and os.path.exists(hook_voice_path))
+        script_ok = bool(script_voice_path and os.path.exists(script_voice_path))
+        if hook_ok and script_ok:
+            merge = subprocess.run(
+                [
+                    FFMPEG_BINARY, "-y", "-i", hook_voice_path, "-i", script_voice_path,
+                    "-filter_complex", "[0:a][1:a]concat=n=2:v=0:a=1[aout]",
+                    "-map", "[aout]", merged_audio_path,
+                ], capture_output=True, text=True,
+            )
+            audio_path = merged_audio_path if merge.returncode == 0 else hook_voice_path
+        elif hook_ok:
+            audio_path = hook_voice_path
+        elif script_ok:
+            audio_path = script_voice_path
+        else:
+            return {
+                "final_path": "",
+                "watermark_detected": False,
+                "error": "Không có audio Hook/Script cho nhánh frame xuyên suốt.",
+            }
+
+        audio_duration = _get_duration(audio_path)
+        if audio_duration <= 0:
+            return {
+                "final_path": "",
+                "watermark_detected": False,
+                "error": "Không xác định được thời lượng audio cho nhánh frame xuyên suốt.",
+            }
+
+        is_tele_bot = source.get("is_telegram_bot", False)
+        raw_title_frame = source.get("title_frame_path")
+        frame_path = (
+            download_asset_safe("frame", raw_title_frame)
+            if is_tele_bot
+            else (raw_title_frame or FRAME_PATH)
+        )
+        if not frame_path or not os.path.exists(frame_path):
+            return {
+                "final_path": "",
+                "watermark_detected": False,
+                "error": "Không tìm thấy frame thương hiệu cho nhánh frame xuyên suốt.",
+            }
+
+        raw_font = source.get("font_path")
+        font_path = download_asset_safe("font", raw_font) if is_tele_bot else raw_font
+        if not font_path or not os.path.exists(font_path):
+            font_path = os.path.join(PROJECT_ROOT, "assets", "font", "RobotoCondensed-Bold.ttf")
+        safe_font_path = str(font_path or "").replace("\\", "/").replace(":", "\\:")
+        text_cfg = resolve_text_settings(source, channel_id)
+        try:
+            font_size = int(text_cfg.get("text_size", 65))
+        except (TypeError, ValueError):
+            font_size = 65
+        try:
+            preferred_x = int(text_cfg.get("text_x", 65))
+        except (TypeError, ValueError):
+            preferred_x = 65
+        try:
+            text_y = float(text_cfg.get("text_y1", 0) or 0)
+            preferred_y = int(1920 * text_y) if text_y > 0 else 1230
+        except (TypeError, ValueError):
+            preferred_y = 1230
+        text_color = str(text_cfg.get("text_color") or "white").strip() or "white"
+        title_value = str(title or "").replace("'", "").replace(":", "\\:").replace("%", "\\%").strip().upper()
+
+        # Giữ video nguồn phía dưới frame. Nếu frame có alpha trong suốt,
+        # phần đó sẽ hiển thị video thay vì bị FFmpeg điền trắng khi encode.
+        if _is_horizontal(source_video):
+            filters = [
+                "[0:v]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,boxblur=10:2[bg]",
+                "[0:v]scale=1080:1920:force_original_aspect_ratio=decrease[fg]",
+                "[bg][fg]overlay=(W-w)/2:(H-h)/2[base]",
+            ]
+        else:
+            filters = [
+                "[0:v]scale=1080:1920:force_original_aspect_ratio=decrease,pad=1080:1920:(ow-iw)/2:(oh-ih)/2[base]",
+            ]
+        filters += [
+            "[1:v]format=rgba,scale=1080:1920[frame]",
+            "[base][frame]overlay=0:0[with_frame]",
+        ]
+        current = "[with_frame]"
+        if safe_font_path and title_value:
+            layout = plan_text_layout(
+                title_value,
+                font_size=font_size,
+                preferred_x=preferred_x,
+                preferred_y=preferred_y,
+                max_width=950,
+                clamp_to_safe_zone=str(text_cfg.get("text_position_mode", "manual")).lower() != "manual",
+                allow_extra_lines=True,
+            )
+            for index, line in enumerate(layout.lines):
+                y_pos = layout.y + index * layout.line_spacing
+                output = f"[vtitle{index}]"
+                filters.append(
+                    f"{current}drawtext=fontfile='{safe_font_path}':text='{line}':"
+                    f"fontsize={layout.font_size}:fontcolor={text_color}:"
+                    f"bordercolor=black:borderw=3:shadowcolor=black:shadowx=3:shadowy=3:"
+                    f"x={layout.x}:y={y_pos}{output}"
+                )
+                current = output
+        filters.append(f"{current}null[vout]")
+
+        cmd = [
+            FFMPEG_BINARY, "-y", "-stream_loop", "-1", "-i", source_video,
+            "-loop", "1", "-i", frame_path,
+            "-i", audio_path,
+            "-filter_complex", ";".join(filters),
+            "-map", "[vout]", "-map", "2:a",
+            "-t", f"{audio_duration + 0.2:.3f}",
+            *final_output_args(), "-shortest", final_path,
+        ]
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+        except Exception as exc:
+            return {"final_path": "", "watermark_detected": False, "error": str(exc)}
+        if result.returncode != 0 or not os.path.exists(final_path):
+            return {
+                "final_path": "",
+                "watermark_detected": False,
+                "error": (result.stderr or "FFmpeg không tạo được frame xuyên suốt.")[-1600:],
+            }
+        print(f"         ✅ Video FRAME XUYÊN SUỐT: {os.path.getsize(final_path) / 1024 / 1024:.1f}MB")
+        return {"final_path": final_path, "watermark_detected": False}
 
     # ═══════════════════════════════════════════════════
-    #  MODE 2: KHÔNG FRAME (trong video_remix)
-    #  → Đoạn đầu: video gốc (mute) + hook voice + frame + logo
-    #  → Đoạn sau: video gốc (giữ audio gốc) + logo
-    #  → Logo xuyên suốt toàn bộ video
+    #  MODE 2: NGUỒN KHÔNG CÓ FRAME
+    #  → Đoạn đầu: video gốc (mute) + frame title + hook voice + text hook
+    #  → Đoạn sau: video nguồn từ body_start_sec, không frame và không text
     # ═══════════════════════════════════════════════════
     def _edit_video_no_frame(self, source_video, hook_voice_path, hook_text,
                               work_dir, job_id, source, tone="Trung tính",
                               music_mood=None, music_energy=2, is_sensitive=False,
-                              channel_id=None, beats=None):
-        # 3 PASS: Intro (có frame/text) -> Body (video gốc từ 0s) -> Concat
+                              channel_id=None, beats=None,
+                              preserve_full_source_audio=False,
+                              title_on_body=True, title_text="",
+                              body_start_sec=0.0, intro_overlay_text="",
+                              disable_music=False):
+        # 3 PASS: Intro (frame + hook/text) -> Body (video gốc từ mốc đã chọn) -> Concat
         final_path = os.path.join(work_dir, f"final_{job_id}.mp4")
         temp_intro = os.path.join(work_dir, f"intro_{job_id}.mp4")
         temp_body = os.path.join(work_dir, f"body_{job_id}.mp4")
-        concat_txt = os.path.join(work_dir, f"concat_{job_id}.txt")
+        render_errors = []
 
         def download_asset_safe(folder, filename):
             if not filename or filename == "-- Trống --":
@@ -1190,25 +1772,54 @@ class FBNewsPipeline:
             if d > 0: hook_duration = d
 
         source_duration = _get_duration(source_video)
+        try:
+            body_start_sec = max(0.0, min(float(body_start_sec or 0.0), source_duration))
+        except (TypeError, ValueError):
+            body_start_sec = 0.0
+        remaining_source_duration = max(0.1, source_duration - body_start_sec)
+        body_duration = (
+            remaining_source_duration
+            if preserve_full_source_audio
+            else min(
+                remaining_source_duration,
+                max(0.1, TARGET_VIDEO_DURATION_SECONDS - hook_duration),
+            )
+        )
+        spoken_hook_text = str(hook_text or "").strip()
+        title_text = str(title_text or "").strip() or spoken_hook_text
         timeline = plan_beat_timeline(
             beats,
-            total_duration=max(0.1, hook_duration + source_duration),
+            total_duration=max(0.1, hook_duration + body_duration),
             hook_duration=hook_duration,
             media_count=1,
-            hook_text=hook_text,
+            hook_text=spoken_hook_text,
         )
-        hook_text = timeline.first_frame_text or hook_text
-        print(f"      🧭 First frame theo beat: {hook_text}")
+        spoken_hook_text = resolve_intro_overlay_text(spoken_hook_text, timeline)
+        intro_text = (
+            str(intro_overlay_text or "").strip()
+            or spoken_hook_text
+            or title_text
+        )
+        print(
+            f"      🧭 Intro theo thoại Hook: {spoken_hook_text} | "
+            f"Text intro: {intro_text}"
+        )
 
         is_tele_bot = source.get("is_telegram_bot", False)
-        
-        raw_title_frame = source.get("title_frame_path")
-        title_frame_path = download_asset_safe("frame", raw_title_frame) if is_tele_bot else (raw_title_frame if raw_title_frame else FRAME_PATH)
         
         raw_logo = source.get("logo_path")
         logo_path = download_asset_safe("logo", raw_logo) if is_tele_bot else (raw_logo if raw_logo else LOGO_PATH)
         
-        has_frame = title_frame_path and os.path.exists(title_frame_path)
+        # Nguồn không có frame chỉ nghĩa là video gốc không mang sẵn
+        # template. Intro vẫn dùng frame title của kênh; body không chèn
+        # frame. Ưu tiên frame theo nguồn, rồi fallback frame Facebook.
+        raw_title_frame = source.get("title_frame_path")
+        title_frame_path = (
+            download_asset_safe("frame", raw_title_frame)
+            if is_tele_bot
+            else (raw_title_frame or FRAME_PATH)
+        )
+        has_intro_frame = bool(title_frame_path and os.path.exists(title_frame_path))
         has_logo = False # Tắt lắp logo
         is_horiz = _is_horizontal(source_video)
 
@@ -1237,11 +1848,11 @@ class FBNewsPipeline:
         # Kiểm tra video gốc có audio không
         has_audio = False
         try:
-            probe = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "a", "-show_entries", "stream=codec_name", "-of", "default=noprint_wrappers=1:nokey=1", source_video], capture_output=True, text=True)
+            probe = subprocess.run(ffprobe_command("-v", "error", "-select_streams", "a", "-show_entries", "stream=codec_name", "-of", "default=noprint_wrappers=1:nokey=1", source_video), capture_output=True, text=True)
             has_audio = bool(probe.stdout.strip())
         except: pass
 
-        music = select_music(
+        music = None if disable_music else select_music(
             music_mood,
             tone=tone,
             energy=music_energy,
@@ -1263,9 +1874,9 @@ class FBNewsPipeline:
         intro_inputs = ["-stream_loop", "-1", "-i", source_video]
         if has_hook_voice: intro_inputs += ["-i", hook_voice_path]
         else: intro_inputs += ["-f", "lavfi", "-i", "anullsrc=channel_layout=stereo:sample_rate=48000"]
-        if has_frame: intro_inputs += ["-i", title_frame_path]
+        if has_intro_frame: intro_inputs += ["-i", title_frame_path]
         if has_logo: intro_inputs += ["-i", logo_path]
-        intro_bgm_idx = 2 + int(bool(has_frame)) + int(bool(has_logo))
+        intro_bgm_idx = 2 + int(has_intro_frame) + int(bool(has_logo))
         if music: intro_inputs += ["-stream_loop", "-1", "-i", music.path]
 
         intro_filters = []
@@ -1282,7 +1893,7 @@ class FBNewsPipeline:
         curr_intro = "[bg]"
         in_idx = 2
         
-        if has_frame:
+        if has_intro_frame:
             intro_filters.append(f"[{in_idx}:v]scale=1080:1920[frame];{curr_intro}[frame]overlay=0:0[v_f]")
             curr_intro = "[v_f]"
             in_idx += 1
@@ -1296,30 +1907,62 @@ class FBNewsPipeline:
         if not font_path or not os.path.exists(font_path):
             font_path = os.path.join(PROJECT_ROOT, "assets", "font", "RobotoCondensed-Bold.ttf")
         has_font = font_path and os.path.exists(font_path)
-        
-        if has_font and hook_text:
-            safe_text = str(hook_text).replace("'", "").replace(":", "\\:").replace("%", "\\%").strip().upper()
-            try:
-                font_size = int(source.get("text_size", 65))
-            except:
-                font_size = 65
-                
-            try:
-                text_y1_val = float(source.get("text_y1", 0))
-                preferred_y = int(1920 * text_y1_val) if text_y1_val > 0 else 1230
-            except (TypeError, ValueError):
-                preferred_y = 1230
-            layout = plan_text_layout(
-                safe_text,
-                font_size=font_size,
-                preferred_x=65,
-                preferred_y=preferred_y,
-                max_width=950,
+        # FFmpeg coi "\" là ký tự escape trong filtergraph, nên đường dẫn
+        # Windows (D:\...\font.ttf) làm hỏng cả chuỗi filter.
+        safe_font_path = str(font_path or "").replace("\\", "/").replace(":", "\\:")
+
+        # Text chỉ hiển thị ở intro; body không lặp lại hook/title.
+        title_overlay_text = ""
+        title_font_size = 65
+        title_x = 65
+        title_intro_y = 1230
+        title_body_y = 1230
+        text_cfg = resolve_text_settings(source, channel_id)
+        title_manual_position = (
+            str(text_cfg.get("text_position_mode", "manual")).lower() == "manual"
+        )
+        title_color = str(text_cfg.get("text_color") or "white").strip() or "white"
+        if has_font and intro_text:
+            title_overlay_text = (
+                str(intro_text).replace("'", "").replace(":", "\\:").replace("%", "\\%").strip().upper()
             )
-            
+            try:
+                title_font_size = int(text_cfg.get("text_size", 65))
+            except (TypeError, ValueError):
+                title_font_size = 65
+            try:
+                title_x = int(text_cfg.get("text_x", 65))
+            except (TypeError, ValueError):
+                title_x = 65
+            try:
+                text_y1_val = float(text_cfg.get("text_y1", 0) or 0)
+                title_intro_y = int(1920 * text_y1_val) if text_y1_val > 0 else 1230
+            except (TypeError, ValueError):
+                title_intro_y = 1230
+            try:
+                content_ratio = float(text_cfg.get("text_y_content", 0) or 0)
+            except (TypeError, ValueError):
+                content_ratio = 0.0
+            title_body_y = (
+                int(1920 * content_ratio) if content_ratio > 0
+                else min(1920 - 120, title_intro_y + 220)
+            )
+
+        if title_overlay_text:
+            # allow_extra_lines: câu dài tự xuống dòng thêm thay vì bị cắt "…".
+            layout = plan_text_layout(
+                title_overlay_text,
+                font_size=title_font_size,
+                preferred_x=title_x,
+                preferred_y=title_intro_y,
+                max_width=950,
+                clamp_to_safe_zone=not title_manual_position,
+                allow_extra_lines=True,
+            )
+
             for i, line in enumerate(layout.lines):
                 y_pos = layout.y + (i * layout.line_spacing)
-                draw_filter = f"drawtext=fontfile='{font_path}':text='{line}':fontsize={font_size}:fontcolor=white:bordercolor=black:borderw=3:shadowcolor=black:shadowx=3:shadowy=3:x={layout.x}:y={y_pos}"
+                draw_filter = f"drawtext=fontfile='{safe_font_path}':text='{line}':fontsize={layout.font_size}:fontcolor={title_color}:bordercolor=black:borderw=3:shadowcolor=black:shadowx=3:shadowy=3:x={layout.x}:y={y_pos}"
                 intro_filters.append(f"{curr_intro}{draw_filter}[vt{i}]")
                 curr_intro = f"[vt{i}]"
 
@@ -1336,18 +1979,43 @@ class FBNewsPipeline:
                 )
             )
         else:
-            intro_filters.append("[1:a]loudnorm=I=-14:LRA=9:TP=-1.5[aout]")
+            if disable_music:
+                # Nhánh frame-transition chỉ yêu cầu Hook nguyên bản; tránh
+                # loudnorm để không tạo latency khiến đoạn intro bị kéo dài.
+                intro_filters.append(
+                    "[1:a]aformat=sample_rates=48000:channel_layouts=stereo[aout]"
+                )
+            else:
+                intro_filters.append("[1:a]loudnorm=I=-14:LRA=9:TP=-1.5[aout]")
 
-        cmd_intro = ["ffmpeg", "-y"] + intro_inputs + ["-filter_complex", ";".join(intro_filters), "-map", "[vout]", "-map", "[aout]", "-t", str(hook_duration)] + COMMON_OUTPUT + [temp_intro]
+        # Audio filters (đặc biệt loudnorm/sidechaincompress) có một lượng
+        # latency nhỏ; nếu cắt đúng bằng duration Hook, MP4 trung gian có thể
+        # bị mux chỉ còn video vì audio chưa kịp phát frame đầu tiên. Chừa
+        # đệm ngắn rồi concat sẽ giữ đủ tiếng Hook.
+        intro_mux_duration = hook_duration if disable_music else hook_duration + 0.25
+        cmd_intro = [FFMPEG_BINARY, "-y"] + intro_inputs + ["-filter_complex", ";".join(intro_filters), "-map", "[vout]", "-map", "[aout]", "-t", str(intro_mux_duration)] + COMMON_OUTPUT + [temp_intro]
         try:
-            subprocess.run(cmd_intro, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            subprocess.run(cmd_intro, check=True, capture_output=True, text=True)
         except subprocess.CalledProcessError as e:
-            print(f"❌ Lỗi render Intro: {e.stderr}")
+            detail = (e.stderr or "")[-1200:]
+            render_errors.append(f"intro: {detail}")
+            print(f"❌ Lỗi render Intro: {detail}")
 
-        print(f"         Tạo video KHÔNG FRAME - Bước 2: Dựng Body (Full video gốc từ 0:00)...")
-        # 2. DỰNG BODY (từ giây 0 của video gốc, center, không frame/text)
-        body_inputs = ["-i", source_video]
-        src_dur = _get_duration(source_video)
+        print(
+            "         Tạo video KHÔNG FRAME - Bước 2: Dựng Body "
+            f"({body_duration:.1f}s từ {body_start_sec:.3f}s; "
+            + (
+                "giữ trọn video và âm thanh nguồn)..."
+                if preserve_full_source_audio
+                else f"tổng mục tiêu khoảng {TARGET_VIDEO_DURATION_SECONDS}s)..."
+            )
+        )
+        # 2. DỰNG BODY (từ mốc đã xác định, center, không frame/text)
+        body_inputs = []
+        if body_start_sec > 0.001:
+            body_inputs += ["-ss", f"{body_start_sec:.3f}"]
+        body_inputs += ["-i", source_video]
+        src_dur = body_duration
         if not has_audio: 
             d_str = f":d={src_dur}" if src_dur > 0 else ""
             body_inputs += ["-f", "lavfi", "-i", f"anullsrc=channel_layout=stereo:sample_rate=48000{d_str}"]
@@ -1374,6 +2042,28 @@ class FBNewsPipeline:
             body_filters.append(f"[{in_idx}:v]scale=1080:1920[logo];{curr_body}[logo]overlay=0:0[v_l]")
             curr_body = "[v_l]"
 
+        # Giữ điều kiện để tương thích caller cũ; nhánh Facebook hiện truyền
+        # title_on_body=False nên body không có text.
+        if title_overlay_text and title_on_body:
+            body_title_layout = plan_text_layout(
+                title_overlay_text,
+                font_size=title_font_size,
+                preferred_x=title_x,
+                preferred_y=title_body_y,
+                max_width=950,
+                clamp_to_safe_zone=not title_manual_position,
+                allow_extra_lines=True,
+            )
+            for line_index, line in enumerate(body_title_layout.lines):
+                line_y = body_title_layout.y + line_index * body_title_layout.line_spacing
+                body_filters.append(
+                    f"{curr_body}drawtext=fontfile='{safe_font_path}':text='{line}':"
+                    f"fontsize={body_title_layout.font_size}:fontcolor={title_color}:"
+                    f"bordercolor=black:borderw=3:shadowcolor=black:shadowx=3:shadowy=3:"
+                    f"x={body_title_layout.x}:y={line_y}[vbtitle{line_index}]"
+                )
+                curr_body = f"[vbtitle{line_index}]"
+
         body_filters.append(f"{curr_body}null[vout]")
         
         audio_map = "0:a" if has_audio else "1:a"
@@ -1393,96 +2083,153 @@ class FBNewsPipeline:
             body_filters.append(f"[{audio_map}]loudnorm=I=-14:LRA=9:TP=-1.5[aout]")
         audio_map = "[aout]"
         
-        cmd_body = ["ffmpeg", "-y"] + body_inputs + ["-filter_complex", ";".join(body_filters), "-map", "[vout]", "-map", audio_map] + COMMON_OUTPUT + ["-shortest", temp_body]
+        cmd_body = [FFMPEG_BINARY, "-y"] + body_inputs + ["-filter_complex", ";".join(body_filters), "-map", "[vout]", "-map", audio_map, "-t", f"{body_duration:.3f}"] + COMMON_OUTPUT + ["-shortest", temp_body]
         
         try:
-            subprocess.run(cmd_body, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            subprocess.run(cmd_body, check=True, capture_output=True, text=True)
         except subprocess.CalledProcessError as e:
-            print(f"❌ Lỗi render Body: {e.stderr}")
+            detail = (e.stderr or "")[-1200:]
+            render_errors.append(f"body: {detail}")
+            print(f"❌ Lỗi render Body: {detail}")
 
         print(f"         Tạo video KHÔNG FRAME - Bước 3: Ghép nối (Concat)...")
         # 3. CONCAT
-        with open(concat_txt, "w") as f:
-            if os.path.exists(temp_intro): f.write(f"file '{temp_intro}'\n")
-            if os.path.exists(temp_body): f.write(f"file '{temp_body}'\n")
-            
-        cmd_concat = [
-            "ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", concat_txt,
-            "-c", "copy", "-movflags", "+faststart", *CLEAN_METADATA_ARGS,
-            final_path,
-        ]
+        # Không dùng concat demuxer + stream copy ở đây. Demuxer lấy cấu trúc
+        # stream của file đầu tiên làm khuôn; nếu Intro/Body có khác biệt nhỏ
+        # về audio (sample rate, channel layout hoặc timestamp), nó có thể
+        # xuất MP4 chỉ còn video dù cả hai file trung gian đều có tiếng.
+        # Concat filter ép chuẩn audio trước khi nối và luôn map cả video lẫn
+        # audio ở file cuối.
+        concat_files = [path for path in (temp_intro, temp_body) if os.path.exists(path)]
+        if len(concat_files) == 2:
+            concat_filter = (
+                "[0:v:0]setpts=PTS-STARTPTS[v0];"
+                "[0:a:0]aresample=48000,aformat=sample_rates=48000:"
+                "channel_layouts=stereo[a0];"
+                "[1:v:0]setpts=PTS-STARTPTS[v1];"
+                "[1:a:0]aresample=48000,aformat=sample_rates=48000:"
+                "channel_layouts=stereo[a1];"
+                "[v0][a0][v1][a1]concat=n=2:v=1:a=1[vcat][acat]"
+            )
+            cmd_concat = [
+                FFMPEG_BINARY, "-y",
+                "-i", concat_files[0],
+                "-i", concat_files[1],
+                "-filter_complex", concat_filter,
+                "-map", "[vcat]", "-map", "[acat]",
+                *COMMON_OUTPUT,
+                final_path,
+            ]
+        elif len(concat_files) == 1:
+            # Giữ fallback cho trường hợp một pass trung gian thất bại; vẫn
+            # re-encode và map audio rõ ràng để không tạo file câm.
+            cmd_concat = [
+                FFMPEG_BINARY, "-y", "-i", concat_files[0],
+                "-map", "0:v:0", "-map", "0:a:0?",
+                *COMMON_OUTPUT,
+                final_path,
+            ]
+        else:
+            cmd_concat = []
         try:
-            subprocess.run(cmd_concat, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            if not cmd_concat:
+                raise subprocess.CalledProcessError(1, [FFMPEG_BINARY])
+            subprocess.run(cmd_concat, check=True, capture_output=True, text=True)
         except subprocess.CalledProcessError as e:
-            print(f"❌ Lỗi Concat: {e.stderr}")
+            detail = (e.stderr or "")[-1200:]
+            render_errors.append(f"concat: {detail}")
+            print(f"❌ Lỗi Concat: {detail}")
         
         try:
             os.remove(temp_intro)
             os.remove(temp_body)
-            os.remove(concat_txt)
-        except: pass
+        except OSError:
+            pass
         
         if not os.path.exists(final_path):
             print("         ❌ Không tạo được video chuẩn; không dùng video gốc làm fallback")
-            return None
+            return {
+                "final_path": "",
+                "watermark_detected": False,
+                "error": " | ".join(render_errors)
+                or "FFmpeg không tạo được file đầu ra.",
+            }
 
         if os.path.exists(final_path):
             size_mb = os.path.getsize(final_path) / 1024 / 1024
             print(f"         ✅ Video NO FRAME: {size_mb:.1f}MB")
-            
-        return final_path
+
+        watermark_still_present = False
+        if _logo_regions:
+            from shared.modules.logo_detector import verify_watermark_removed
+            still_present = not verify_watermark_removed(final_path, _logo_regions)
+            if still_present:
+                print("         ⚠️ Vẫn phát hiện vùng watermark sau khi blur (đã xử lý blur).")
+
+        return {"final_path": final_path, "watermark_detected": False}
 
     # ═══════════════════════════════════════════════════
     #  SUPABASE HELPERS
     # ═══════════════════════════════════════════════════
     def _get_active_sources(self) -> list:
-        try:
-            result = supabase.table("facebook_sources") \
-                .select("*").eq("is_active", True) \
-                .order("created_at").execute()
-            return result.data or []
-        except Exception as e:
-            print(f"❌ Lỗi load sources: {e}")
-            return []
+        return load_active_sources(supabase, self.source_scope)
 
-    def _update_scan_time(self, source_id: str, last_video_id: str = None):
+    def _update_scan_time(self, source: dict, last_video_id: str = None):
         try:
-            update = {"last_scan_at": datetime.now(timezone.utc).isoformat()}
-            if last_video_id:
-                update["last_video_id"] = last_video_id
-            supabase.table("facebook_sources").update(update).eq("id", source_id).execute()
-        except:
-            pass
+            update_scan_checkpoint(supabase, source, last_video_id)
+        except Exception as error:
+            print(f"      ⚠️ Không cập nhật được checkpoint: {error}")
 
-    def _insert_video_record(self, source_id: str, video: dict, dl: dict, ai_result: dict, final_path: str) -> str | None:
+    def _insert_video_record(
+        self,
+        source: dict,
+        video: dict,
+        dl: dict,
+        ai_result: dict,
+        final_path: str,
+    ) -> str | None:
         try:
-            result = supabase.table("facebook_videos").insert({
-                "source_id": source_id,
-                "facebook_video_id": video.get("video_id"),
-                "original_url": video["url"],
-                "caption": video.get("caption", "")[:500],
-                "status": "uploaded",
-                "file_hash": dl.get("hash"),
-                "file_size_bytes": dl.get("size"),
-                "downloaded_path": dl.get("path"),
-                "ai_title": ai_result.get("title_tiktok", ""),
-                "ai_script": ai_result.get("script_voice", ""),
-                "processed_path": final_path,
-            }).execute()
-            return result.data[0]["id"] if result.data else None
+            return insert_video_record(
+                supabase, source, video, dl, ai_result, final_path
+            )
         except Exception as e:
             if "23505" in str(e):
                 return None
             print(f"      ⚠️ DB insert lỗi: {e}")
             return None
 
-    def _check_hash_exists(self, file_hash: str) -> bool:
+    def _claim_video_record(self, source: dict, video: dict) -> str | None:
+        return claim_video_record(supabase, source, video)
+
+    def _finalize_video_record(
+        self,
+        source: dict,
+        record_id: str,
+        dl: dict,
+        ai_result: dict,
+        final_path: str,
+    ) -> None:
+        finalize_video_record(
+            supabase, source, record_id, dl, ai_result, final_path
+        )
+
+    def _check_hash_exists(self, file_hash: str, source: dict) -> bool:
         try:
-            result = supabase.table("facebook_videos") \
-                .select("id").eq("file_hash", file_hash).limit(1).execute()
-            return bool(result.data)
-        except:
-            return False
+            return file_hash_exists(supabase, source, file_hash)
+        except Exception as error:
+            print(f"      ❌ Không xác minh được hash với Supabase: {error}")
+            raise RuntimeError(
+                "Không thể kiểm tra video trùng; đã dừng để tránh tạo bản sao."
+            ) from error
+
+    def _check_video_id_exists(self, source: dict, video_id: str) -> bool:
+        try:
+            return video_id_exists(supabase, source, video_id)
+        except Exception as error:
+            print(f"      ❌ Không xác minh được Facebook video ID với Supabase: {error}")
+            raise RuntimeError(
+                "Không thể kiểm tra video trùng; đã dừng để tránh tạo bản sao."
+            ) from error
 
 
 # ═══════════════════════════════════════════════════
@@ -1496,6 +2243,12 @@ def main():
                        help="run-once: chạy 1 lần | start: chạy liên tục | login: login Facebook")
     parser.add_argument("--interval", type=int, default=30,
                        help="Khoảng cách giữa các lần quét (phút)")
+    parser.add_argument(
+        "--source-scope",
+        choices=["page", "group", "all"],
+        default="page",
+        help="page: chỉ nguồn Page cũ | group: chỉ nguồn Group | all: cả hai",
+    )
     args = parser.parse_args()
 
     if args.command == "login":
@@ -1503,7 +2256,7 @@ def main():
         login_facebook_interactive()
         return
 
-    pipeline = FBNewsPipeline()
+    pipeline = FBNewsPipeline(source_scope=args.source_scope)
 
     if args.command == "run-once":
         pipeline.run()

@@ -7,6 +7,19 @@ import time
 import subprocess
 import uuid  # <--- [MỚI] Thêm thư viện này để tạo tên file duy nhất
 
+from shared.services.tiktok_rapidapi import (
+    get_user_posts as rapidapi_get_user_posts,
+    get_video_info as rapidapi_get_video_info,
+    has_cached_download_url as rapidapi_has_cached_download_url,
+    load_config as load_tiktok_rapidapi_config,
+)
+from shared.services.tiktok_clipssaver import (
+    MAX_VIDEOS_PER_CHANNEL as CLIPSSAVER_MAX_VIDEOS,
+    ClipSaverError,
+    download_candidate as download_clipssaver_candidate,
+    get_channel_video_candidates as get_clipssaver_candidates,
+)
+
 # Xác định đường dẫn gốc dự án
 MODULE_DIR = os.path.dirname(os.path.abspath(__file__)) # shared/modules
 PROJECT_ROOT = os.path.dirname(os.path.dirname(MODULE_DIR)) # mannyAccount
@@ -14,13 +27,7 @@ RAPID_CONFIG_FILE = os.path.join(PROJECT_ROOT, "config", "rapid_api.json")
 
 def load_rapid_config():
     """Hàm đọc cấu hình RapidAPI từ file JSON"""
-    if not os.path.exists(RAPID_CONFIG_FILE):
-        return {}
-    try:
-        with open(RAPID_CONFIG_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except:
-        return {}
+    return load_tiktok_rapidapi_config()
 
 # --- [MỚI] HÀM NÉN VIDEO ---
 def compress_video_if_needed(input_path, limit_mb=20):
@@ -74,55 +81,7 @@ def compress_video_if_needed(input_path, limit_mb=20):
 
 def get_video_candidates_via_rapidapi(channel_url, limit=5):
     """Sử dụng RapidAPI lấy URL và metadata nhẹ nếu yt-dlp thất bại."""
-    config = load_rapid_config()
-    try:
-        if "@" in channel_url:
-            username = channel_url.split('@')[-1].split('?')[0].strip('/')
-        else:
-            username = channel_url.split('/')[-1].split('?')[0]
-    except: return []
-
-    keys = config.get("keys", [])
-    for key in keys:
-        if not key: continue
-        headers = {
-            "x-rapidapi-key": key,
-            "x-rapidapi-host": "tiktok-video-no-watermark2.p.rapidapi.com"
-        }
-
-        candidates = []
-        try:
-             url = "https://tiktok-video-no-watermark2.p.rapidapi.com/user/posts"
-             response = requests.get(url, headers=headers, params={"unique_id": username, "count": limit}, timeout=20)
-             if response.status_code == 200:
-                 data = response.json()
-
-                 if isinstance(data, dict):
-                     items = data.get("data", {}).get("videos", []) if "data" in data else data.get("videos", [])
-                     for item in items[:limit]:
-                         vid_id = item.get("video_id")
-                         if vid_id:
-                             stats = item.get("stats") or {}
-                             candidates.append({
-                                 "url": f"https://www.tiktok.com/@{username}/video/{vid_id}",
-                                 "video_id": str(vid_id),
-                                 "title": item.get("title") or item.get("desc") or "",
-                                 "caption": item.get("title") or item.get("desc") or "",
-                                 "thumbnail": item.get("cover") or item.get("origin_cover"),
-                                 "duration": item.get("duration"),
-                                 "timestamp": item.get("create_time"),
-                                 "view_count": item.get("play_count") or stats.get("play_count"),
-                                 "like_count": item.get("digg_count") or stats.get("digg_count"),
-                                 "comment_count": item.get("comment_count") or stats.get("comment_count"),
-                                 "position": len(candidates),
-                             })
-                 if candidates:
-                     return candidates
-             else:
-                 print(f"   ⚠️ Key '{key[:8]}...' trả về status code {response.status_code} khi quét.")
-        except Exception as e:
-             print(f"⚠️ Lỗi quét video qua RapidAPI với key '{key[:8]}...': {e}")
-    return []
+    return rapidapi_get_user_posts(channel_url, limit)
 
 def get_videos_via_rapidapi(channel_url, limit=5):
     """Backward-compatible URL-only RapidAPI API."""
@@ -132,8 +91,8 @@ def get_videos_via_rapidapi(channel_url, limit=5):
     ]
 
 
-def get_channel_video_candidates(channel_url, limit=5):
-    """Hàm tổng hợp lấy video kèm metadata cho SourceRanker."""
+def _get_channel_video_candidates_legacy(channel_url, limit=5):
+    """Luồng quét TikTok cũ; giữ lại để có thể khôi phục khi cần."""
     print(f"🔍 Đang quét kênh: {channel_url}")
 
     ydl_opts = {
@@ -174,6 +133,22 @@ def get_channel_video_candidates(channel_url, limit=5):
     return [item for item in candidates if item.get("url")]
 
 
+def get_channel_video_candidates(channel_url, limit=3):
+    """Quét kênh nguồn qua ClipSaver; luồng yt-dlp/RapidAPI cũ đã tắt."""
+    safe_limit = max(1, min(int(limit or CLIPSSAVER_MAX_VIDEOS), CLIPSSAVER_MAX_VIDEOS))
+    print(f"🔍 ClipSaver đang quét kênh nguồn: {channel_url}")
+    try:
+        candidates = get_clipssaver_candidates(channel_url, safe_limit)
+    except ClipSaverError as error:
+        print(f"   ❌ ClipSaver: {error}")
+        return []
+    except Exception as error:
+        print(f"   ❌ ClipSaver lỗi ngoài dự kiến: {type(error).__name__}: {error}")
+        return []
+    print(f"   ✅ ClipSaver tìm thấy {len(candidates)}/{safe_limit} video.")
+    return candidates
+
+
 def get_channel_videos(channel_url, limit=5):
     """Backward-compatible URL-only API."""
     return [
@@ -195,7 +170,7 @@ def download_via_tikwm(url, save_path):
             else:
                 v_url = play_url
 
-            with requests.get(v_url, stream=True, headers={"User-Agent": "Mozilla/5.0"}) as r:
+            with requests.get(v_url, stream=True, headers={"User-Agent": "Mozilla/5.0"}, timeout=30) as r:
                 if r.status_code == 200:
                     with open(save_path, 'wb') as f:
                         shutil.copyfileobj(r.raw, f)
@@ -209,40 +184,32 @@ def download_via_tikwm(url, save_path):
     return False
 
 def download_via_rapidapi(tiktok_url, save_path):
-    config = load_rapid_config()
-    keys = config.get("keys", [])
-    host = config.get("host", "")
-    api_url = config.get("endpoint", "")
     print("      -> [Dự phòng] Đang thử kéo qua RapidAPI...")
-
-    for key in keys:
-        if not key: continue
+    result = rapidapi_get_video_info(tiktok_url)
+    download_url = (result or {}).get("hdplay") or (result or {}).get("play")
+    if isinstance(download_url, list):
+        download_url = download_url[0] if download_url else None
+    if download_url:
         try:
-            resp = requests.get(api_url, headers={"x-rapidapi-key": key, "x-rapidapi-host": host}, params={"url": tiktok_url}, timeout=20)
-            if resp.status_code != 200: continue
-
-            result = resp.json()
-            download_url = None
-            if isinstance(result, dict):
-                if "data" in result and isinstance(result["data"], dict):
-                    result = result["data"]
-                download_url = result.get("hdplay") or result.get("video_hd") or result.get("play") or result.get("video")
-                if isinstance(download_url, list): download_url = download_url[0]
-
-            if download_url:
-                with requests.get(download_url, stream=True, headers={"User-Agent": "Mozilla/5.0"}) as r:
-                    if r.status_code == 200:
-                        with open(save_path, 'wb') as f: shutil.copyfileobj(r.raw, f)
-                if os.path.exists(save_path) and os.path.getsize(save_path) > 1000:
-                    return True
-        except:
+            with requests.get(
+                download_url,
+                stream=True,
+                headers={"User-Agent": "Mozilla/5.0"},
+                timeout=60,
+            ) as response:
+                response.raise_for_status()
+                with open(save_path, "wb") as handle:
+                    shutil.copyfileobj(response.raw, handle)
+            if os.path.exists(save_path) and os.path.getsize(save_path) > 1000:
+                return True
+        except requests.RequestException:
             pass
-        if os.path.exists(save_path):
-            try: os.remove(save_path)
-            except: pass
+    if os.path.exists(save_path):
+        try: os.remove(save_path)
+        except: pass
     return False
 
-def download_tiktok_video(url, temp_dir):
+def _download_tiktok_video_legacy(url, temp_dir):
     """
     Hàm tải video.
     temp_dir: Bắt buộc truyền vào thư mục tạm riêng của Account.
@@ -267,14 +234,22 @@ def download_tiktok_video(url, temp_dir):
     print(f"   ⬇️ Downloading: {url}")
     downloaded = False
 
-    # 1. Thử TikWM
-    if download_via_tikwm(url, final_path): downloaded = True
-    # 2. Thử RapidAPI
-    elif download_via_rapidapi(url, final_path): downloaded = True
+    # Video vừa quét bằng RapidAPI đã có sẵn link CDN. Dùng ngay để tránh chờ
+    # TikWM rồi lại gọi thêm endpoint video-info không cần thiết.
+    if rapidapi_has_cached_download_url(url):
+        if download_via_rapidapi(url, final_path):
+            downloaded = True
+        elif download_via_tikwm(url, final_path):
+            downloaded = True
+    # URL lẻ hoặc video do yt-dlp quét được vẫn giữ chuỗi fallback cũ.
+    elif download_via_tikwm(url, final_path):
+        downloaded = True
+    elif download_via_rapidapi(url, final_path):
+        downloaded = True
     # 3. Fallback yt-dlp
     else:
         try:
-            ydl_opts = {'outtmpl': final_path, 'format': 'best', 'quiet': True, 'overwrites': True}
+            ydl_opts = {'outtmpl': final_path, 'format': 'best', 'quiet': True, 'overwrites': True, 'socket_timeout': 30}
             with yt_dlp.YoutubeDL(ydl_opts) as ydl: ydl.download([url])
             if os.path.exists(final_path) and os.path.getsize(final_path) > 1000:
                 downloaded = True
@@ -296,3 +271,43 @@ def download_tiktok_video(url, temp_dir):
         }
 
     return None
+
+
+def download_tiktok_video(url, temp_dir, candidate=None):
+    """Tải video nguồn; mặc định chỉ dùng ClipSaver.
+
+    Luồng TikWM/RapidAPI/yt-dlp cũ vẫn còn trong
+    ``_download_tiktok_video_legacy`` nhưng bị tắt. Chỉ bật lại khi chủ động đặt
+    ``TIKTOK_LEGACY_SOURCE_ENABLED=true``.
+    """
+    candidate = candidate if isinstance(candidate, dict) else {}
+    if candidate.get("provider") == "clipssaver":
+        title = candidate.get("title") or candidate.get("caption") or ""
+        print(f"   ⬇️ ClipSaver tải theo tiêu đề: {title}")
+        try:
+            original_path = download_clipssaver_candidate(candidate, temp_dir)
+        except ClipSaverError as error:
+            print(f"   ❌ ClipSaver: {error}")
+            return None
+        except Exception as error:
+            print(
+                f"   ❌ ClipSaver tải lỗi ngoài dự kiến: "
+                f"{type(error).__name__}: {error}"
+            )
+            return None
+        compressed_path = compress_video_if_needed(original_path, limit_mb=20)
+        return {
+            "original": original_path,
+            "ai_studio": compressed_path,
+        }
+
+    legacy_enabled = str(
+        os.environ.get("TIKTOK_LEGACY_SOURCE_ENABLED", "false")
+    ).strip().lower() in {"1", "true", "yes", "on"}
+    if not legacy_enabled:
+        print(
+            "   ❌ Luồng tải TikTok cũ đang tắt. "
+            "Video phải được chọn từ ClipSaver."
+        )
+        return None
+    return _download_tiktok_video_legacy(url, temp_dir)

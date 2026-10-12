@@ -12,6 +12,18 @@ import sys
 import json
 from datetime import datetime
 
+from facebook_pipeline.auth import facebook_login_status, login_facebook_interactive
+from facebook_pipeline.source_config import (
+    EDIT_MODE_FULL_AI,
+    EDIT_MODE_HOOK_THEN_ORIGINAL,
+    EDIT_MODE_LABELS,
+    SOURCE_TYPE_GROUP,
+    SOURCE_TYPE_LABELS,
+    SOURCE_TYPE_PAGE,
+    sanitize_group_source_payload,
+    sanitize_page_source_payload,
+)
+
 # ═══════════════════════════════════════════════════════════
 #  CẤU HÌNH
 # ═══════════════════════════════════════════════════════════
@@ -22,7 +34,7 @@ ENV_FILE = os.path.join(os.path.dirname(os.path.dirname(APP_DIR)), ".env")
 def load_env():
     env = {}
     if os.path.exists(ENV_FILE):
-        with open(ENV_FILE, "r") as f:
+        with open(ENV_FILE, "r", encoding="utf-8", errors="replace") as f:
             for line in f:
                 line = line.strip()
                 if line and not line.startswith("#") and "=" in line:
@@ -156,7 +168,7 @@ class FBNewsApp(ctk.CTk):
             add_frame,
             text="➕ Thêm nguồn Facebook mới",
             font=ctk.CTkFont(size=15, weight="bold"),
-        ).grid(row=0, column=0, columnspan=6, sticky="w", padx=15, pady=(12, 8))
+        ).grid(row=0, column=0, columnspan=9, sticky="w", padx=15, pady=(12, 8))
 
         ctk.CTkLabel(add_frame, text="Tên:", font=ctk.CTkFont(size=13)).grid(row=1, column=0, padx=(15, 5), pady=8)
         self.input_name = ctk.CTkEntry(add_frame, width=200, placeholder_text="VD: VTV24 News", height=35)
@@ -166,12 +178,40 @@ class FBNewsApp(ctk.CTk):
         self.input_url = ctk.CTkEntry(add_frame, width=380, placeholder_text="https://facebook.com/page-name", height=35)
         self.input_url.grid(row=1, column=3, padx=5, pady=8)
 
-        ctk.CTkLabel(add_frame, text="Max giờ:", font=ctk.CTkFont(size=13)).grid(row=1, column=4, padx=(15, 5), pady=8)
+        ctk.CTkLabel(add_frame, text="Max giờ:", font=ctk.CTkFont(size=13)).grid(row=1, column=4, padx=(10, 5), pady=8)
         self.input_max_age = ctk.CTkEntry(add_frame, width=60, height=35)
         self.input_max_age.insert(0, "48")
         self.input_max_age.grid(row=1, column=5, padx=5, pady=8)
 
-        ctk.CTkLabel(add_frame, text="Delogo:", font=ctk.CTkFont(size=13)).grid(row=1, column=6, padx=(15, 5), pady=8)
+        ctk.CTkLabel(add_frame, text="Loại:", font=ctk.CTkFont(size=13)).grid(row=2, column=0, padx=(15, 5), pady=8)
+        self.source_type_var = ctk.StringVar(value=SOURCE_TYPE_LABELS[SOURCE_TYPE_PAGE])
+        self.input_source_type = ctk.CTkOptionMenu(
+            add_frame,
+            variable=self.source_type_var,
+            values=list(SOURCE_TYPE_LABELS.values()),
+            width=150,
+            command=self._on_source_type_change,
+        )
+        self.input_source_type.grid(row=2, column=1, padx=5, pady=8)
+
+        ctk.CTkLabel(add_frame, text="Chế độ:", font=ctk.CTkFont(size=13)).grid(row=2, column=2, padx=(10, 5), pady=8)
+        self.edit_mode_var = ctk.StringVar(value=EDIT_MODE_LABELS[EDIT_MODE_FULL_AI])
+        self.input_edit_mode = ctk.CTkOptionMenu(
+            add_frame,
+            variable=self.edit_mode_var,
+            values=list(EDIT_MODE_LABELS.values()),
+            width=220,
+        )
+        self.input_edit_mode.grid(row=2, column=3, padx=5, pady=8)
+        self.input_edit_mode.configure(state="disabled")
+
+        ctk.CTkLabel(add_frame, text="Số bài:", font=ctk.CTkFont(size=13)).grid(row=2, column=4, padx=(10, 5), pady=8)
+        self.input_max_videos = ctk.CTkEntry(add_frame, width=60, height=35)
+        self.input_max_videos.insert(0, "5")
+        self.input_max_videos.grid(row=2, column=5, padx=5, pady=8)
+        self.input_max_videos.configure(state="disabled")
+
+        ctk.CTkLabel(add_frame, text="Delogo:", font=ctk.CTkFont(size=13)).grid(row=1, column=6, padx=(10, 5), pady=8)
         self.input_delogo = ctk.CTkEntry(add_frame, width=150, placeholder_text="VD: x=683:y=231:w=280:h=85", height=35)
         self.input_delogo.grid(row=1, column=7, padx=5, pady=8)
 
@@ -181,7 +221,19 @@ class FBNewsApp(ctk.CTk):
             font=ctk.CTkFont(weight="bold"),
             command=self._add_source,
         )
-        self.btn_add.grid(row=1, column=8, padx=(10, 15), pady=8)
+        self.btn_add.grid(row=2, column=7, padx=5, pady=8)
+
+        login_text = "✅ Facebook đã login" if facebook_login_status()["logged_in"] else "🔑 Login Facebook"
+        self.btn_fb_login = ctk.CTkButton(
+            add_frame,
+            text=login_text,
+            width=150,
+            height=35,
+            fg_color=COLORS["primary"],
+            hover_color=COLORS["primary_hover"],
+            command=self._login_facebook,
+        )
+        self.btn_fb_login.grid(row=2, column=8, padx=(5, 15), pady=8)
 
         # ── DANH SÁCH NGUỒN ──
         list_frame = ctk.CTkFrame(self, fg_color=COLORS["bg_card"], corner_radius=12)
@@ -191,11 +243,12 @@ class FBNewsApp(ctk.CTk):
         list_header = ctk.CTkFrame(list_frame, fg_color="transparent")
         list_header.pack(fill="x", padx=15, pady=(12, 5))
 
-        ctk.CTkLabel(
+        self.source_list_title = ctk.CTkLabel(
             list_header,
-            text="📋 Nguồn đang theo dõi",
+            text="📄 Nguồn Page đang theo dõi",
             font=ctk.CTkFont(size=15, weight="bold"),
-        ).pack(side="left")
+        )
+        self.source_list_title.pack(side="left")
 
         btn_row = ctk.CTkFrame(list_header, fg_color="transparent")
         btn_row.pack(side="right")
@@ -315,6 +368,43 @@ class FBNewsApp(ctk.CTk):
             json.dump(data, f, ensure_ascii=False, indent=2)
         self.log("✅ Đã lưu cấu hình Voice toàn cục thành công.")
 
+    def _on_source_type_change(self, selected_label):
+        is_group = selected_label == SOURCE_TYPE_LABELS[SOURCE_TYPE_GROUP]
+        if is_group:
+            self.edit_mode_var.set(EDIT_MODE_LABELS[EDIT_MODE_HOOK_THEN_ORIGINAL])
+            self.input_edit_mode.configure(state="normal")
+            self.input_max_videos.configure(state="normal")
+            self.input_url.configure(
+                placeholder_text="https://facebook.com/groups/123456789"
+            )
+            self.source_list_title.configure(text="👥 Nguồn Group đang theo dõi")
+        else:
+            self.edit_mode_var.set(EDIT_MODE_LABELS[EDIT_MODE_FULL_AI])
+            self.input_edit_mode.configure(state="disabled")
+            self.input_max_videos.configure(state="disabled")
+            self.input_url.configure(
+                placeholder_text="https://facebook.com/page-name"
+            )
+            self.source_list_title.configure(text="📄 Nguồn Page đang theo dõi")
+        self._load_sources()
+
+    def _login_facebook(self):
+        self.btn_fb_login.configure(state="disabled", text="⏳ Đang chờ đăng nhập...")
+        self.log("🔑 Đang mở cửa sổ Facebook; hệ thống sẽ tự lưu phiên sau khi đăng nhập.")
+
+        def worker():
+            try:
+                status = login_facebook_interactive()
+                message = "✅ Đăng nhập Facebook thành công." if status["logged_in"] else "⚠️ Chưa xác nhận được đăng nhập."
+                self.after(0, lambda: self.log(message))
+                self.after(0, lambda: self.btn_fb_login.configure(state="normal", text="✅ Facebook đã login"))
+            except Exception as error:
+                error_message = str(error)
+                self.after(0, lambda message=error_message: self.log(f"❌ Login Facebook lỗi: {message}"))
+                self.after(0, lambda: self.btn_fb_login.configure(state="normal", text="🔑 Login Facebook"))
+
+        threading.Thread(target=worker, daemon=True).start()
+
     #  THÊM NGUỒN
     # ═══════════════════════════════════════════════════════
     def _add_source(self):
@@ -322,6 +412,14 @@ class FBNewsApp(ctk.CTk):
         url = self.input_url.get().strip()
         max_age_str = self.input_max_age.get().strip()
         delogo_val = self.input_delogo.get().strip()
+        source_type = next(
+            key for key, label in SOURCE_TYPE_LABELS.items()
+            if label == self.source_type_var.get()
+        )
+        edit_mode = next(
+            key for key, label in EDIT_MODE_LABELS.items()
+            if label == self.edit_mode_var.get()
+        )
 
         if not name or not url:
             self.log("❌ Vui lòng điền đầy đủ Tên và URL.")
@@ -341,10 +439,8 @@ class FBNewsApp(ctk.CTk):
         except:
             pass
 
-        url = url.rstrip("/")
-        
         try:
-            result = supabase_client.table("facebook_sources").insert({
+            raw_payload = {
                 "source_name": name,
                 "source_url": url,
                 "platform": "facebook",
@@ -352,13 +448,37 @@ class FBNewsApp(ctk.CTk):
                 "max_video_age_hours": max_age,
                 "scan_interval_min": 30,
                 "delogo": delogo_val
-            }).execute()
+            }
+            if source_type == SOURCE_TYPE_GROUP:
+                raw_payload.update({
+                    "edit_mode": edit_mode,
+                    "max_videos_per_scan": self.input_max_videos.get().strip(),
+                    "platform": "facebook_group",
+                })
+                payload = sanitize_group_source_payload(raw_payload)
+                table_name = "facebook_group_sources"
+            else:
+                payload = sanitize_page_source_payload(raw_payload)
+                table_name = "facebook_sources"
+            existing = (
+                supabase_client.table(table_name)
+                .select("id")
+                .eq("source_url", payload["source_url"])
+                .eq("is_active", True)
+                .limit(1)
+                .execute()
+            )
+            if existing.data:
+                raise ValueError("Nguồn Facebook này đã tồn tại và đang được bật.")
+            result = supabase_client.table(table_name).insert(payload).execute()
 
             if result.data:
                 self.log(f"✅ Đã thêm: {name} → {url}")
                 self.input_name.delete(0, "end")
                 self.input_url.delete(0, "end")
                 self.input_delogo.delete(0, "end")
+                self.input_max_videos.delete(0, "end")
+                self.input_max_videos.insert(0, "5")
                 self._load_sources()
             else:
                 self.log("❌ Thêm nguồn thất bại!")
@@ -377,7 +497,16 @@ class FBNewsApp(ctk.CTk):
             return
 
         try:
-            result = supabase_client.table("facebook_sources").select("*").order("created_at").execute()
+            source_type = next(
+                key for key, label in SOURCE_TYPE_LABELS.items()
+                if label == self.source_type_var.get()
+            )
+            table_name = (
+                "facebook_group_sources"
+                if source_type == SOURCE_TYPE_GROUP
+                else "facebook_sources"
+            )
+            result = supabase_client.table(table_name).select("*").order("created_at").execute()
             sources = result.data or []
             self.sources_data = sources
 
@@ -387,9 +516,9 @@ class FBNewsApp(ctk.CTk):
             if not sources:
                 self.source_list.insert("end", "  📭 Chưa có nguồn nào. Thêm nguồn Facebook ở phía trên.\n")
             else:
-                header = f"  {'#':<4} {'Tên nguồn':<22} {'URL':<38} {'On':<5} {'Max h':<7} {'Delogo':<22} {'Quét cuối'}\n"
+                header = f"  {'#':<4} {'Tên nguồn':<18} {'Loại':<7} {'Chế độ':<20} {'Số':<4} {'URL':<32} {'On':<4} {'Quét cuối'}\n"
                 self.source_list.insert("end", header)
-                self.source_list.insert("end", "  " + "─" * 125 + "\n")
+                self.source_list.insert("end", "  " + "─" * 120 + "\n")
 
                 for i, s in enumerate(sources, 1):
                     active = "✅" if s.get("is_active") else "❌"
@@ -401,12 +530,16 @@ class FBNewsApp(ctk.CTk):
                         except:
                             last_scan = str(last_scan)[:16]
 
-                    name = (s.get("source_name") or "")[:21]
-                    url = (s.get("source_url") or "")[:37]
-                    delogo_text = (s.get("delogo") or "")[:21]
-                    if not delogo_text:
-                        delogo_text = "Không"
-                    line = f"  {i:<4} {name:<22} {url:<38} {active:<5} {s.get('max_video_age_hours', 48):<7} {delogo_text:<22} {last_scan}\n"
+                    name = (s.get("source_name") or "")[:17]
+                    raw_url = s.get("source_url") or ""
+                    url = raw_url[:31]
+                    record_type = source_type
+                    edit_mode = s.get("edit_mode") or (
+                        EDIT_MODE_HOOK_THEN_ORIGINAL if record_type == SOURCE_TYPE_GROUP else EDIT_MODE_FULL_AI
+                    )
+                    mode_text = "Hook + tiếng gốc" if edit_mode == EDIT_MODE_HOOK_THEN_ORIGINAL else "Full AI"
+                    max_videos = s.get("max_videos_per_scan", 5) if record_type == SOURCE_TYPE_GROUP else 10
+                    line = f"  {i:<4} {name:<18} {record_type:<7} {mode_text:<20} {max_videos:<4} {url:<32} {active:<4} {last_scan}\n"
                     self.source_list.insert("end", line)
 
             self.source_list.configure(state="disabled")
@@ -435,7 +568,16 @@ class FBNewsApp(ctk.CTk):
             matched = [s for s in self.sources_data if s.get("source_url") == source_url]
             if matched:
                 sid = matched[0]["id"]
-                supabase_client.table("facebook_sources").delete().eq("id", sid).execute()
+                source_type = next(
+                    key for key, label in SOURCE_TYPE_LABELS.items()
+                    if label == self.source_type_var.get()
+                )
+                table_name = (
+                    "facebook_group_sources"
+                    if source_type == SOURCE_TYPE_GROUP
+                    else "facebook_sources"
+                )
+                supabase_client.table(table_name).delete().eq("id", sid).execute()
                 self.log(f"🗑️ Đã xóa: {matched[0].get('source_name')}")
                 self._load_sources()
             else:
@@ -522,7 +664,18 @@ class FBNewsApp(ctk.CTk):
         try:
             # Dùng cùng Python interpreter đang chạy GUI
             python_exe = sys.executable
-            cmd = [python_exe, "-u", "fb_pipeline.py", mode]
+            source_scope = next(
+                key for key, label in SOURCE_TYPE_LABELS.items()
+                if label == self.source_type_var.get()
+            )
+            cmd = [
+                python_exe,
+                "-u",
+                "fb_pipeline.py",
+                mode,
+                "--source-scope",
+                source_scope,
+            ]
             self.log(f"🖥️ Lệnh: {' '.join(cmd)}")
 
             self.process = subprocess.Popen(

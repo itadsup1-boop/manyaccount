@@ -1,6 +1,7 @@
-import { useState, useEffect } from 'react';
-import { Play, Square, Plus, RefreshCw, Key, Upload, Trash2, Save, Search, ExternalLink } from 'lucide-react';
+import { useState, useEffect, useRef } from 'react';
+import { Play, Square, Plus, RefreshCw, Key, Upload, Trash2, Save, Search, ExternalLink, ShieldAlert } from 'lucide-react';
 import VisualTextEditor from '../components/VisualTextEditor';
+import { useAuth } from '../context/AuthContext';
 
 const defaultContentProfile: Record<string, string> = {
   channel_name: '',
@@ -24,9 +25,11 @@ function normalizeContentProfile(profile?: Record<string, string>) {
 }
 
 export default function ToolArticle() {
+  const { isAdmin } = useAuth();
   const [activeTab, setActiveTab] = useState('pipeline');
   const [isRunning, setIsRunning] = useState(false);
   const [logs, setLogs] = useState<string[]>(['[Hệ thống] Sẵn sàng khởi động Tool Tin Tức...']);
+  const terminalRef = useRef<HTMLDivElement>(null);
   const [promptContent, setPromptContent] = useState('');
   const [processedLinks, setProcessedLinks] = useState<any[]>([]);
   const [processedCount, setProcessedCount] = useState(0);
@@ -52,6 +55,27 @@ export default function ToolArticle() {
   });
   
   const [library, setLibrary] = useState<{frames: string[], logos: string[]}>({ frames: [], logos: [] });
+  const [aiProvider, setAiProvider] = useState<string>('chatgpt');
+
+  useEffect(() => {
+    fetch('/api/ai/provider')
+      .then(res => res.json())
+      .then(data => { if (data.provider) setAiProvider(data.provider); })
+      .catch(() => {});
+  }, []);
+
+  const handleSetAiProvider = (provider: string) => {
+    setAiProvider(provider);
+    fetch('/api/ai/provider', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ provider }),
+    });
+  };
+
+  const handleOpenGeminiChrome = () => {
+    fetch('/api/gemini/chrome', { method: 'POST' });
+  };
 
   const fetchSources = () => {
     fetch(`/api/article/sources`)
@@ -59,7 +83,12 @@ export default function ToolArticle() {
       .then(data => {
         if (!data.error) {
           setSources(data);
-          const channels = Array.from(new Set(data.map((item: any) => item.id_tiktok).filter(Boolean)));
+          // Article Chrome có thể được login trước khi kênh có nguồn danh mục
+          // trong bảng article_sources. Luôn cho phép chọn profile Adsupnews.
+          const channels = Array.from(new Set([
+            'Adsupnews',
+            ...data.map((item: any) => item.id_tiktok).filter(Boolean),
+          ]));
           setUniqueChannels(channels as string[]);
         }
       })
@@ -118,7 +147,17 @@ export default function ToolArticle() {
   const handleOpenChrome = () => {
     const channel = (document.getElementById("chromeChannelSelect") as HTMLSelectElement)?.value;
     if (!channel || channel === '-- Chọn kênh để đăng nhập ChatGPT --') return;
-    fetch(`/api/article/chrome/${channel}`, { method: 'POST' });
+    fetch(`/api/article/chrome/${encodeURIComponent(channel)}`, { method: 'POST' })
+      .then(async response => {
+        const data = await response.json().catch(() => ({}));
+        if (!response.ok || data.status === 'error') {
+          throw new Error(data.error || `Không mở được Chrome (HTTP ${response.status})`);
+        }
+        alert(`✅ Đã gửi lệnh mở Chrome Article cho kênh ${channel}.`);
+      })
+      .catch(error => {
+        alert(`❌ ${error.message}`);
+      });
   };
 
   const fetchArticleLogs = () => {
@@ -140,6 +179,12 @@ export default function ToolArticle() {
     const interval = setInterval(fetchArticleLogs, 1000);
     return () => clearInterval(interval);
   }, [isRunning]);
+
+  useEffect(() => {
+    if (terminalRef.current) {
+      terminalRef.current.scrollTop = terminalRef.current.scrollHeight;
+    }
+  }, [logs]);
 
   const handleStart = () => {
     setIsRunning(true);
@@ -240,7 +285,35 @@ export default function ToolArticle() {
 
   return (
     <div>
-      <h2 className="page-title">Tool Video Tin Tức Tự Động</h2>
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '1rem', flexWrap: 'wrap', gap: '10px' }}>
+        <h2 className="page-title" style={{ margin: 0 }}>Tool Video Tin Tức Tự Động</h2>
+        <div style={{ display: 'flex', alignItems: 'center', gap: '8px', background: 'rgba(255,255,255,0.06)', borderRadius: '8px', padding: '4px 10px' }}>
+          <span style={{ fontSize: '13px', fontWeight: 600, color: 'var(--text-secondary)' }}>🤖 AI Engine:</span>
+          <button
+            type="button"
+            className={`btn ${aiProvider === 'chatgpt' ? 'btn-primary' : 'btn-ghost'}`}
+            style={{ padding: '3px 10px', fontSize: '12px', borderRadius: '6px' }}
+            onClick={() => handleSetAiProvider('chatgpt')}
+          >
+            ChatGPT
+          </button>
+          <button
+            type="button"
+            className={`btn ${aiProvider === 'gemini' ? 'btn-primary' : 'btn-ghost'}`}
+            style={{ padding: '3px 10px', fontSize: '12px', borderRadius: '6px' }}
+            onClick={() => handleSetAiProvider('gemini')}
+          >
+            Gemini (Web)
+          </button>
+        </div>
+      </div>
+
+      {!isAdmin && (
+        <div style={{ background: 'rgba(59, 130, 246, 0.1)', border: '1px solid rgba(59, 130, 246, 0.3)', marginBottom: '1rem', padding: '0.75rem 1rem', borderRadius: '10px', color: '#93c5fd', fontSize: '0.85rem', display: 'flex', alignItems: 'center', gap: '8px' }}>
+          <ShieldAlert size={18} />
+          <span>Bạn đang ở chế độ <strong>Người dùng (User Role)</strong>. Các thao tác điều khiển bot, đổi AI Engine hoặc sửa cấu hình chỉ dành cho Admin.</span>
+        </div>
+      )}
       
       <div className="tab-headers">
         <button className={`tab-header ${activeTab === 'pipeline' ? 'active' : ''}`} onClick={() => setActiveTab('pipeline')}>📰 Pipeline</button>
@@ -324,7 +397,7 @@ export default function ToolArticle() {
                 </button>
               </div>
               
-              <div className="terminal" style={{ maxHeight: '300px', overflowY: 'auto' }}>
+              <div ref={terminalRef} className="terminal" style={{ maxHeight: '300px', overflowY: 'auto' }}>
                 {logs.map((log, idx) => (
                   <p key={idx}>{log}</p>
                 ))}
@@ -424,17 +497,34 @@ export default function ToolArticle() {
 
         {/* ═══ TAB 2: CHROME ═══ */}
         {activeTab === 'chrome' && (
-          <div className="card">
-            <h3>🌐 Quản lý Trình duyệt ChatGPT</h3>
-            <div className="form-row" style={{ marginTop: '1.5rem' }}>
-              <div className="form-group" style={{ flex: 1 }}>
-                <select id="chromeChannelSelect" className="form-select" defaultValue="-- Chọn kênh để đăng nhập ChatGPT --">
-                  <option>-- Chọn kênh để đăng nhập ChatGPT --</option>
-                  {uniqueChannels.map(ch => <option key={ch} value={ch}>{ch}</option>)}
-                </select>
+          <div style={{ display: 'flex', flexDirection: 'column', gap: '1.25rem' }}>
+            <div className="card">
+              <h3>🌐 Quản lý Trình duyệt Gemini Web (Dùng chung)</h3>
+              <p style={{ color: 'var(--text-secondary)', marginTop: '0.5rem', fontSize: '0.85rem' }}>
+                Đăng nhập tài khoản Google trên Gemini Web 1 lần duy nhất cho toàn hệ thống.
+              </p>
+              <div style={{ marginTop: '1rem' }}>
+                <button className="btn btn-primary" onClick={handleOpenGeminiChrome}>
+                  <Key size={18} /> Mở Gemini Web Đăng Nhập
+                </button>
               </div>
-              <div className="form-group">
-                <button className="btn btn-success" onClick={handleOpenChrome}><Key size={18} /> Mở Chrome Đăng Nhập</button>
+            </div>
+
+            <div className="card">
+              <h3>🌐 Quản lý Trình duyệt ChatGPT cho Article</h3>
+              <p style={{ color: 'var(--text-secondary)', marginTop: '0.5rem', fontSize: '0.85rem' }}>
+                Profile Chrome Article riêng theo từng kênh, không dùng chung với Facebook hoặc TikTok.
+              </p>
+              <div className="form-row" style={{ marginTop: '1.5rem' }}>
+                <div className="form-group" style={{ flex: 1 }}>
+                  <select id="chromeChannelSelect" className="form-select" defaultValue="-- Chọn kênh để đăng nhập ChatGPT --">
+                    <option>-- Chọn kênh để đăng nhập ChatGPT --</option>
+                    {uniqueChannels.map(ch => <option key={ch} value={ch}>{ch}</option>)}
+                  </select>
+                </div>
+                <div className="form-group">
+                  <button className="btn btn-success" onClick={handleOpenChrome}><Key size={18} /> Mở Chrome Article</button>
+                </div>
               </div>
             </div>
           </div>

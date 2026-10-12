@@ -62,9 +62,21 @@ class SupabaseAPI:
     @staticmethod
     def get_account_by_id(tiktok_id):
         try:
-            res = supabase.table("accounts").select("*").eq("tiktok_id", tiktok_id).single().execute()
-            return SupabaseAPI.attach_tiktok_content_profiles(res.data)
-        except:
+            # Do not use ``single()`` here: a transient 0-row response or a
+            # duplicate legacy row makes Supabase raise and the worker used to
+            # report only the misleading "config not found" message.  Taking
+            # the first matching row keeps the worker resilient while still
+            # preserving the active-account check in the scheduler.
+            res = supabase.table("accounts").select("*").eq("tiktok_id", tiktok_id).execute()
+            rows = res.data or []
+            if not rows:
+                return None
+            return SupabaseAPI.attach_tiktok_content_profiles(rows[0])
+        except Exception as exc:
+            print(
+                f"⚠️ Supabase get_account_by_id({tiktok_id}) lỗi: "
+                f"{type(exc).__name__}: {exc}"
+            )
             return None
 
     @staticmethod
@@ -152,7 +164,7 @@ class SupabaseAPI:
             return os.path.join(local_dir, file_name)
 
     @classmethod
-    def get_list_storage_files(cls, bucket_name, folder_name):
+    def get_list_storage_files(cls, bucket_name, folder_name, *, quiet=False):
         try:
             import sys
             current_module = sys.modules[__name__]
@@ -166,5 +178,6 @@ class SupabaseAPI:
                     return [f.get('name') for f in res if isinstance(f, dict) and f.get('name') and f.get('name') != '.emptyFolderPlaceholder']
             return []
         except Exception as e:
-            print(f"Lỗi đọc Storage Supabase: {e}")
+            if not quiet:
+                print(f"Lỗi đọc Storage Supabase: {e}")
             return []
