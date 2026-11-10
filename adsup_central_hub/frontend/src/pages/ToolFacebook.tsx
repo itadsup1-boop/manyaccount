@@ -123,7 +123,8 @@ export default function ToolFacebook() {
     source_name: '',
     source_url: '',
     max_video_age_hours: 48,
-    delogo: ''
+    delogo: '',
+    hide_chrome: false
   });
   const [selectedChannel, setSelectedChannel] = useState(FACEBOOK_DEFAULT_CHANNEL_ID);
   const [channelConfig, setChannelConfig] = useState<any>({ content_profile: defaultContentProfile });
@@ -265,7 +266,8 @@ export default function ToolFacebook() {
           source_name: '',
           source_url: '',
           max_video_age_hours: 48,
-          delogo: ''
+          delogo: '',
+          hide_chrome: false
         });
         setEditingSourceId(null);
         fetchSources();
@@ -282,7 +284,8 @@ export default function ToolFacebook() {
       source_name: source.source_name || '',
       source_url: source.source_url || '',
       max_video_age_hours: source.max_video_age_hours ?? 48,
-      delogo: source.delogo || ''
+      delogo: source.delogo || '',
+      hide_chrome: !!source.hide_chrome
     });
   };
 
@@ -293,7 +296,8 @@ export default function ToolFacebook() {
       source_name: '',
       source_url: '',
       max_video_age_hours: 48,
-      delogo: ''
+      delogo: '',
+      hide_chrome: false
     });
   };
 
@@ -597,6 +601,15 @@ export default function ToolFacebook() {
                 <input type="text" className="form-input" placeholder="x=683:y=231:w=280:h=85" value={newSource.delogo} onChange={e => setNewSource({...newSource, delogo: e.target.value})} />
               </div>
             </div>
+            <div className="form-group" style={{ marginTop: '1rem' }}>
+              <label style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', cursor: 'pointer' }}>
+                <input type="checkbox" checked={newSource.hide_chrome} onChange={e => setNewSource({...newSource, hide_chrome: e.target.checked})} />
+                <span>Ẩn Chrome (chạy ngầm không hiển thị cửa sổ)</span>
+              </label>
+              <p style={{ color: 'var(--text-secondary)', marginTop: '0.35rem', fontSize: '0.8rem' }}>
+                Chrome vẫn mở ChatGPT tạo kịch bản như bình thường nhưng chạy ẩn. Kênh cần đăng nhập ChatGPT trước rồi mới bật được.
+              </p>
+            </div>
             <div style={{ display: 'flex', gap: '0.75rem', marginTop: '1.5rem' }}>
               <button className="btn btn-primary" style={{ flex: 1, justifyContent: 'center' }} onClick={handleAddSource}>
                 {editingSourceId ? <Save size={18} /> : <Plus size={18} />}
@@ -625,6 +638,7 @@ export default function ToolFacebook() {
                     <th style={{ padding: '0.5rem' }}>URL</th>
                     <th style={{ padding: '0.5rem' }}>Max Giờ</th>
                     <th style={{ padding: '0.5rem' }}>Delogo</th>
+                    <th style={{ padding: '0.5rem' }}>Ẩn Chrome</th>
                     <th style={{ padding: '0.5rem' }}>Hành động</th>
                   </tr>
                 </thead>
@@ -636,6 +650,7 @@ export default function ToolFacebook() {
                       <td style={{ padding: '0.5rem', color: 'var(--info)' }}>{s.source_url}</td>
                       <td style={{ padding: '0.5rem' }}>{s.max_video_age_hours}</td>
                       <td style={{ padding: '0.5rem', color: 'var(--text-secondary)' }}>{s.delogo || 'Không'}</td>
+                      <td style={{ padding: '0.5rem' }}>{s.hide_chrome ? 'Có' : 'Không'}</td>
                       <td style={{ padding: '0.5rem' }}>
                         <button className="btn" style={{ background: 'transparent', color: 'var(--info)', padding: '0.25rem' }} onClick={() => handleEditSource(s)}>
                           <Pencil size={16} />
@@ -647,7 +662,7 @@ export default function ToolFacebook() {
                     </tr>
                   ))}
                   {sources.length === 0 && (
-                    <tr><td colSpan={6} style={{ padding: '1rem', textAlign: 'center', color: 'var(--text-secondary)' }}>Chưa có nguồn Page.</td></tr>
+                    <tr><td colSpan={7} style={{ padding: '1rem', textAlign: 'center', color: 'var(--text-secondary)' }}>Chưa có nguồn Page.</td></tr>
                   )}
                 </tbody>
               </table>

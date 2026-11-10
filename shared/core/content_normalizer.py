@@ -285,11 +285,15 @@ def _normalize_fact_sheet(raw: Mapping[str, Any]) -> dict[str, Any]:
             values = [values]
         if not isinstance(values, list):
             values = []
-        return [
-            _text(item)
-            for item in values
-            if _text(item)
-        ]
+        result: list[str] = []
+        for item in values:
+            if isinstance(item, Mapping):
+                text_val = _text(item.get("text") or item.get("claim") or item.get("fact") or "")
+            else:
+                text_val = _text(item)
+            if text_val:
+                result.append(text_val)
+        return result
 
     return {
         "who": _text_list("who"),
@@ -362,7 +366,7 @@ def _normalize_beats(raw: Mapping[str, Any]) -> list[dict[str, Any]]:
             {
                 "beat_number": index + 1,
                 "role": role,
-                "duration_hint": _float(item.get("duration_hint"), 2.5, 0.8, 8.0),
+                "duration_hint": _float(item.get("duration_hint") if item.get("duration_hint") not in (None, "") else ((_optional_float(item.get("end_sec")) - _optional_float(item.get("start_sec"))) if (_optional_float(item.get("start_sec")) is not None and _optional_float(item.get("end_sec")) is not None and _optional_float(item.get("end_sec")) > _optional_float(item.get("start_sec"))) else None), 2.5, 0.8, 15.0),
                 "voice_over": _text(item.get("voice_over")),
                 "visual_query": _text(
                     item.get("visual_query")
@@ -374,6 +378,11 @@ def _normalize_beats(raw: Mapping[str, Any]) -> list[dict[str, Any]]:
                 "transition": _text(item.get("transition") or "cut").lower(),
                 "sfx": _text(item.get("sfx")),
                 "must_show": must_show,
+                "visual_fallback": _text(item.get("visual_fallback")),
+                "start_sec": _optional_float(item.get("start_sec")),
+                "end_sec": _optional_float(item.get("end_sec")),
+                "source_fact_ids": [_text(v) for v in _list(item.get("source_fact_ids")) if _text(v)],
+                "asset_ids": [_text(v) for v in _list(item.get("asset_ids")) if _text(v)],
             }
         )
     return normalized

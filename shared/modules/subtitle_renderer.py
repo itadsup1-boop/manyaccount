@@ -339,17 +339,43 @@ def generate_text_ass(
             adaptive_long_caption=adaptive_long_caption,
         )
 
-        word_duration = duration / len(words)
-        elapsed = 0.0
-        lines = []
+        from types import SimpleNamespace
 
-        for chunk in chunk_phrase_words(words, max_words=words_per_line):
-            start = time_offset + elapsed
-            line_duration = word_duration * len(chunk)
-            end = start + line_duration + 0.08
+        def _spoken_word_weight(word: str) -> float:
+            token = str(word or '').strip()
+            if not token:
+                return 1.0
+            weight = 1.0
+            digits = re.findall(r'\d', token)
+            if digits:
+                weight += min(len(digits), 6) * 0.45
+            if '/' in token or '%' in token:
+                weight += 0.6
+            stripped = token.rstrip('.,!?;:–—')
+            if '.' in stripped or '-' in stripped:
+                weight += 0.7
+            if token.endswith(('.', '!', '?', ';', ':')):
+                weight += 0.75
+            elif token.endswith((',', '–', '—')):
+                weight += 0.35
+            return weight
+
+        weights = [_spoken_word_weight(w) for w in words]
+        total_weight = sum(weights) or float(len(words))
+        timed_words = []
+        cursor = 0.0
+        for w, weight in zip(words, weights):
+            w_dur = duration * (weight / total_weight)
+            timed_words.append(SimpleNamespace(word=w, start=cursor, end=cursor + w_dur))
+            cursor += w_dur
+
+        lines = []
+        for chunk in chunk_phrase_words(timed_words, max_words=words_per_line):
+            start = time_offset + float(chunk[0].start)
+            end = time_offset + float(chunk[-1].end)
             karaoke_text = format_ass_phrase(
                 chunk,
-                word_duration_cs=max(8, int(word_duration * 100)),
+                word_duration_cs=None,
                 primary_color=hex_color,
                 highlight_color=highlight_color,
                 keywords=keywords,
@@ -358,7 +384,6 @@ def generate_text_ass(
             lines.append(
                 f"Dialogue: 0,{_format_ass_time(start)},{_format_ass_time(end)},Default,,0,0,0,,{karaoke_text.strip()}"
             )
-            elapsed += line_duration
 
         with open(output_ass, "w", encoding="utf-8") as f:
             f.write(_get_ass_header(

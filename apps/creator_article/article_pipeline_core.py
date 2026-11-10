@@ -63,6 +63,8 @@ def load_env():
                 if line and not line.startswith("#") and "=" in line:
                     key, val = line.split("=", 1)
                     env[key.strip()] = val.strip()
+                    if val.strip():
+                        os.environ.setdefault(key.strip(), val.strip())
     return env
 
 ENV = load_env()
@@ -296,6 +298,50 @@ def _append_quality_log(
     except Exception:
         pass
 
+
+def _save_production_job_snapshot(
+    id_tiktok: str,
+    article_url: str,
+    ai_result: dict,
+    editorial_profile: dict,
+):
+    """Lưu JSON kịch bản khoá vào job store để luồng dựng video mới dùng.
+
+    Trả về ``(job_id, report)`` hoặc ``(None, None)`` nếu có lỗi lưu job.
+    """
+    try:
+        from adsup_central_hub.backend.production_jobs import save_job
+        from shared.core.locked_script import build_storyboard, validate_locked_script
+
+        channel = str(id_tiktok or "").replace("@", "").strip()
+        report = validate_locked_script(
+            ai_result, profile=editorial_profile, channel_id=channel
+        )
+        storyboard = build_storyboard(ai_result, report=report)
+        status = "imported" if report.passed else "blocked"
+        job_id, created = save_job(
+            ai_result,
+            channel_id=channel,
+            validation=report.to_dict(),
+            storyboard=storyboard,
+            status=status,
+            source_url=article_url,
+        )
+        state = "mới" if created else "đã tồn tại"
+        print(
+            f"   [KÊNH {id_tiktok}] 🗂️ Production job {job_id} ({state}), "
+            f"status={status}, beats={report.beat_count}, "
+            f"duration_hint={report.total_hint_seconds:.1f}s"
+        )
+        if not report.passed:
+            for issue in report.errors:
+                print(f"      ⛔ {issue.code}: {issue.message}")
+        return job_id, report
+    except Exception as exc:
+        print(f"   [KÊNH {id_tiktok}] ⚠️ Không lưu được production job: {exc}")
+        return None, None
+
+
 class ArticlePipelineCore:
     def __init__(self):
         self.cat_crawler = CategoryCrawler()
@@ -475,7 +521,12 @@ class ArticlePipelineCore:
                         print(f"[KÊNH {id_tiktok}] ⏭️ Link vừa được lưu bởi tiến trình khác, bỏ qua: {processed_url}")
                         continue
 
-                    result = self.process_single_article(id_tiktok, sid, article_url)
+                    result = self.process_single_article(
+                        id_tiktok,
+                        sid,
+                        article_url,
+                        hide_chrome=bool(source.get("hide_chrome", False)),
+                    )
                     
                     if not result:
                         print(
@@ -540,6 +591,7 @@ class ArticlePipelineCore:
         manual_approval=False,
         on_success=None,
         on_error=None,
+        hide_chrome=False,
     ):
         """Xử lý 1 bài báo từ A-Z. Trả về True nếu upload thành công, False nếu lỗi."""
         if self._is_article_processed(article_url):
@@ -608,6 +660,8 @@ class ArticlePipelineCore:
                 article_url=article_url,
                 id_tiktok=id_tiktok,
                 extra_content=operator_instruction,
+                hide_chrome=hide_chrome,
+                article_data=article_data,
             )
             if not ai_result:
                 raise PipelineStageError(
@@ -638,6 +692,8 @@ class ArticlePipelineCore:
                     id_tiktok=id_tiktok,
                     extra_content=operator_instruction,
                     repair_instruction=instruction,
+                    hide_chrome=hide_chrome,
+                    article_data=article_data,
                 ),
             )
             ai_result = prepared_content.content
@@ -680,6 +736,10 @@ class ArticlePipelineCore:
                     **source_metadata,
                 )
                 return "skipped"
+
+            prod_job_id, prod_report = _save_production_job_snapshot(
+                id_tiktok, article_url, ai_result, editorial_profile
+            )
 
             topic_fit = ai_result.get("topic_fit", True)
             # TẠM THỜI TẮT LỌC NỘI DUNG THEO YÊU CẦU
@@ -899,271 +959,346 @@ class ArticlePipelineCore:
                 **source_metadata,
             )
 
-            # 3. Gom ảnh gốc & Tìm thêm ảnh
-            # Giữ ảnh lead vì thường là ảnh đúng nhân vật/sự kiện nhất.
-            _trace_pipeline_step(id_tiktok, article_url, "media_assets", "started")
-            downloaded_imgs = article_data.get("images", [])[:7]
-            downloaded_image_assets = [
-                asset for asset in (article_data.get("image_assets") or [])
-                if isinstance(asset, dict)
-            ][:7]
-            asset_by_path = {
-                str(asset.get("path") or asset.get("local_path")): asset
-                for asset in downloaded_image_assets
-                if str(asset.get("path") or asset.get("local_path") or "").strip()
-            }
-            for image_path in downloaded_imgs:
-                asset_by_path.setdefault(
-                    str(image_path),
-                    {
-                        "path": image_path,
-                        "source_url": article_data.get("source_url") or article_url,
-                        "source_name": article_data.get("source_name") or "article",
-                        "rights_status": "unknown",
-                    },
+            use_production_pipeline = bool(
+                prod_job_id
+                and isinstance(ai_result.get("beats"), list)
+                and len(ai_result.get("beats") or []) > 0
+                and (prod_report is None or prod_report.passed)
+            )
+            if use_production_pipeline:
+                print(
+                    f"   [KÊNH {id_tiktok}] 🎬 Sử dụng luồng dựng video mới (media_planner -> video_renderer -> final_video) cho job {prod_job_id}..."
                 )
-            downloaded_videos = article_data.get("videos", [])
-            
-            if not downloaded_imgs:
-                print(f"   [KÊNH {id_tiktok}] ⚠️ Bài báo không có ảnh gốc, sẽ tìm toàn bộ ảnh từ DuckDuckGo...")
-            
-            # 9-10 ảnh giúp video 22-30 giây đổi hình gần mỗi 2-3 giây.
-            TARGET_IMAGES = 10
-            if len(downloaded_imgs) < TARGET_IMAGES:
-                scenes = ai_result.get("scenes", [])
-                search_prompts = [s.get("visual_description", "") for s in scenes if len(s.get("visual_description", "")) > 10]
-                needed = TARGET_IMAGES - len(downloaded_imgs)
-                if search_prompts:
-                    search_prompts = search_prompts[:needed]
-                    print(f"   [KÊNH {id_tiktok}] 🔎 Thiếu ảnh, đang tìm thêm {needed} ảnh từ DuckDuckGo...")
-                    extra_imgs = self.img_searcher.download_missing_images(
-                        search_prompts, job_dir, channel_id=id_tiktok,
+                from adsup_central_hub.backend.production_jobs import set_job_status
+                from apps.creator_article.final_video import render_final_video
+                from apps.creator_article.media_planner import plan_media_for_job
+
+                _trace_pipeline_step(id_tiktok, article_url, "media_assets", "started")
+                try:
+                    plan_res = plan_media_for_job(prod_job_id)
+                except Exception as plan_err:
+                    raise PipelineStageError(
+                        "rendered",
+                        "MEDIA_PLAN_FAILED",
+                        f"Lỗi lập kế hoạch tư liệu cho job {prod_job_id}: {plan_err}",
+                    ) from plan_err
+
+                plan_summary = (plan_res.get("plan") or {}).get("summary") or {}
+                plan_status = (plan_res.get("plan") or {}).get("status") or "ready"
+                set_job_status(prod_job_id, f"assets_{plan_status}")
+                print(
+                    f"   [KÊNH {id_tiktok}] 📦 Media Plan ({plan_status}): "
+                    f"broll={plan_summary.get('broll', 0)}, "
+                    f"data_graphic={plan_summary.get('data_graphic', 0)}, "
+                    f"map_graphic={plan_summary.get('map_graphic', 0)}, "
+                    f"quote_card={plan_summary.get('quote_card', 0)}, "
+                    f"fact_card={plan_summary.get('fact_card', 0)}, "
+                    f"fallback={plan_summary.get('no_asset_found', 0)}"
+                )
+                if plan_status == "graphics_only":
+                    raise PipelineStageError(
+                        "rendered",
+                        "MEDIA_ASSETS_MISSING",
+                        "Media plan hiện không có B-roll/ảnh thật (graphics_only); đã chặn xuất video toàn chữ.",
                     )
-                    downloaded_imgs.extend(extra_imgs)
-                    for asset in getattr(self.img_searcher, "last_download_metadata", []):
-                        if isinstance(asset, dict):
-                            asset_path = str(asset.get("path") or asset.get("local_path") or "")
-                            if asset_path:
-                                asset_by_path[asset_path] = asset
-                    for image_path in downloaded_imgs:
-                        asset_by_path.setdefault(
-                            str(image_path),
-                            {
-                                "path": image_path,
-                                "source_url": article_data.get("source_url") or article_url,
-                                "source_name": article_data.get("source_name") or "article",
-                                "rights_status": "unknown",
-                            },
+                _trace_pipeline_step(
+                    id_tiktok,
+                    article_url,
+                    "media_assets",
+                    "completed",
+                    metadata=plan_summary,
+                )
+                _trace_pipeline_step(
+                    id_tiktok,
+                    article_url,
+                    "image_rights",
+                    "completed",
+                    metadata={"status": "strict_manifest_verified"},
+                )
+
+                _trace_pipeline_step(id_tiktok, article_url, "voice", "started")
+                _trace_pipeline_step(id_tiktok, article_url, "render", "started")
+                try:
+                    final_res = render_final_video(prod_job_id)
+                except Exception as render_err:
+                    err_text = str(render_err)
+                    if err_text.startswith("TTS_FAILED"):
+                        raise PipelineStageError(
+                            "voiced", "TTS_FAILED", err_text
+                        ) from render_err
+                    if err_text.startswith("QA_FAILED"):
+                        raise PipelineStageError(
+                            "qa_passed", "VIDEO_QA_FAILED", err_text
+                        ) from render_err
+                    raise PipelineStageError(
+                        "rendered",
+                        "RENDER_FAILED",
+                        f"Lỗi dựng final_video ({prod_job_id}): {render_err}",
+                    ) from render_err
+
+                set_job_status(prod_job_id, "final_ready")
+                final_report = final_res.get("report") or {}
+                voice_meta = final_report.get("voice") or {}
+                _trace_pipeline_step(
+                    id_tiktok,
+                    article_url,
+                    "voice",
+                    "completed",
+                    metadata=voice_meta,
+                )
+                lifecycle.advance("voiced")
+
+                output_video_path = os.path.join(
+                    job_dir, f"final_{id_tiktok}_{int(time.time())}.mp4"
+                )
+                shutil.copy2(final_res["output_path"], output_video_path)
+                lifecycle.advance("rendered")
+                _trace_pipeline_step(
+                    id_tiktok,
+                    article_url,
+                    "render",
+                    "completed",
+                    metadata={"output": output_video_path, "job_id": prod_job_id},
+                )
+
+                _trace_pipeline_step(id_tiktok, article_url, "video_qa", "started")
+                qa_result = run_video_qa(output_video_path)
+                if not qa_result.passed:
+                    _trace_pipeline_step(
+                        id_tiktok,
+                        article_url,
+                        "video_qa",
+                        "failed",
+                        message=", ".join(qa_result.blocking_errors),
+                        error_code=qa_result.error_code or "VIDEO_QA_FAILED",
+                    )
+                    raise PipelineStageError(
+                        "qa_passed",
+                        qa_result.error_code or "VIDEO_QA_FAILED",
+                        "VideoQA chặn upload: " + ", ".join(qa_result.blocking_errors),
+                    )
+                lifecycle.advance("qa_passed")
+                _trace_pipeline_step(
+                    id_tiktok,
+                    article_url,
+                    "video_qa",
+                    "completed",
+                    metadata=qa_result.to_dict(),
+                )
+                _append_quality_log(
+                    "article", id_tiktok, quality_score, "qa_passed",
+                    stage="qa_passed", item_id=article_url,
+                    qa=qa_result.to_dict(),
+                    **source_metadata,
+                )
+            else:
+                # 3. Gom ảnh gốc & Tìm thêm ảnh (Fallback khi kịch bản cũ không có beats)
+                _trace_pipeline_step(id_tiktok, article_url, "media_assets", "started")
+                downloaded_imgs = article_data.get("images", [])[:7]
+                downloaded_image_assets = [
+                    asset for asset in (article_data.get("image_assets") or [])
+                    if isinstance(asset, dict)
+                ][:7]
+                asset_by_path = {
+                    str(asset.get("path") or asset.get("local_path")): asset
+                    for asset in downloaded_image_assets
+                    if str(asset.get("path") or asset.get("local_path") or "").strip()
+                }
+                for image_path in downloaded_imgs:
+                    asset_by_path.setdefault(
+                        str(image_path),
+                        {
+                            "path": image_path,
+                            "source_url": article_data.get("source_url") or article_url,
+                            "source_name": article_data.get("source_name") or "article",
+                            "rights_status": "unknown",
+                        },
+                    )
+                downloaded_videos = article_data.get("videos", [])
+
+                if not downloaded_imgs:
+                    print(f"   [KÊNH {id_tiktok}] ⚠️ Bài báo không có ảnh gốc, sẽ tìm toàn bộ ảnh từ DuckDuckGo...")
+
+                TARGET_IMAGES = 10
+                if len(downloaded_imgs) < TARGET_IMAGES:
+                    scenes = ai_result.get("scenes", [])
+                    beats = ai_result.get("beats", [])
+                    search_prompts = [
+                        str(s.get("visual_description") or "").strip()
+                        for s in scenes
+                        if isinstance(s, dict) and len(str(s.get("visual_description") or "").strip()) > 10
+                    ]
+                    if not search_prompts and isinstance(beats, list):
+                        for beat in beats:
+                            if not isinstance(beat, dict):
+                                continue
+                            vq = str(beat.get("visual_query") or "").strip()
+                            if len(vq) > 8 and not vq.upper().startswith(("DATA GRAPHIC:", "MAP GRAPHIC:")):
+                                search_prompts.append(vq)
+                    needed = TARGET_IMAGES - len(downloaded_imgs)
+                    if search_prompts:
+                        search_prompts = search_prompts[:needed]
+                        print(f"   [KÊNH {id_tiktok}] 🔎 Thiếu ảnh, đang tìm thêm {needed} ảnh từ DuckDuckGo...")
+                        extra_imgs = self.img_searcher.download_missing_images(
+                            search_prompts, job_dir, channel_id=id_tiktok,
                         )
-            
-            if not downloaded_imgs:
-                raise PipelineStageError(
-                    "rendered", "MEDIA_ASSETS_MISSING",
-                    "Không tìm được ảnh phù hợp để dựng video.",
-                )
-            
-            downloaded_image_assets = [
-                asset_by_path[str(image_path)]
-                for image_path in downloaded_imgs
-                if str(image_path) in asset_by_path
-            ]
-            _trace_pipeline_step(
-                id_tiktok,
-                article_url,
-                "media_assets",
-                "completed",
-                metadata={"images": len(downloaded_imgs), "videos": len(downloaded_videos)},
-            )
-            _trace_pipeline_step(id_tiktok, article_url, "image_rights", "started")
-            image_rights_report = guard_image_assets(downloaded_image_assets)
-            source_metadata.update({"image_rights": image_rights_report.to_dict()})
-            _trace_pipeline_step(
-                id_tiktok,
-                article_url,
-                "image_rights",
-                "completed" if image_rights_report.passed else "failed",
-                message="; ".join(image_rights_report.errors),
-                metadata={"status": image_rights_report.status},
-            )
-            if image_rights_report.warnings:
-                print(
-                    f"   [KÊNH {id_tiktok}] ⚠️ Image rights review: "
-                    + "; ".join(image_rights_report.warnings)
-                )
-            if not image_rights_report.passed:
-                raise PipelineStageError(
-                    "selected",
-                    "IMAGE_RIGHTS_FAILED",
-                    "Image rights không đạt: " + "; ".join(image_rights_report.errors),
-                    retryable=False,
-                )
+                        downloaded_imgs.extend(extra_imgs)
+                        for asset in getattr(self.img_searcher, "last_download_metadata", []):
+                            if isinstance(asset, dict):
+                                asset_path = str(asset.get("path") or asset.get("local_path") or "")
+                                if asset_path:
+                                    asset_by_path[asset_path] = asset
+                        for image_path in downloaded_imgs:
+                            asset_by_path.setdefault(
+                                str(image_path),
+                                {
+                                    "path": image_path,
+                                    "source_url": article_data.get("source_url") or article_url,
+                                    "source_name": article_data.get("source_name") or "article",
+                                    "rights_status": "unknown",
+                                },
+                            )
 
-            print(f"   [KÊNH {id_tiktok}] 📸 Tổng số ảnh để làm video: {len(downloaded_imgs)}, Số video: {len(downloaded_videos)}")
-            
-            # 4. Sinh Voice
-            print(f"   [KÊNH {id_tiktok}] 🗣️ Bắt đầu sinh Voice OmniVoice...")
-            _trace_pipeline_step(id_tiktok, article_url, "voice", "started")
-            # The opening voice is the AI hook (not the raw source title).  Keep
-            # the text stable and visible in logs so a short TTS response can be
-            # distinguished from an intentionally short hook.
-            hook_text = str(ai_result.get('hook', '') or '').strip()
-            script_text = str(ai_result.get('script_voice', '') or '').strip()
-            print(
-                f"   [KÊNH {id_tiktok}] 📝 Hook voice: {len(hook_text.split())} từ, "
-                f"{len(hook_text)} ký tự | Script voice: {len(script_text.split())} từ, "
-                f"{len(script_text)} ký tự | Nội dung hook: {hook_text[:180]}",
-                flush=True,
-            )
-            
-            tone = ai_result.get("tone", "Trung tính")
-            music_mood = ai_result.get("music_mood")
-            music_energy = ai_result.get("music_energy", 2)
-            is_sensitive = ai_result.get("is_sensitive", False)
-            channel_voice_id = VOICE_PROFILE_ID
-            channel_voice_speed = get_channel_voice_speed(
-                id_tiktok,
-                story_type=ai_result.get("story_type", ""),
-                tone=tone,
-                is_sensitive=bool(is_sensitive),
-            )
-            try:
-                channel_dir = os.path.join(PROJECT_ROOT, "assets", "channels", id_tiktok)
-                voice_cfg_path = os.path.join(channel_dir, "voice_config.json")
-                if os.path.exists(voice_cfg_path):
-                    with open(voice_cfg_path, "r", encoding="utf-8") as f:
-                        voice_cfg = json.load(f)
-                        
-                        tone_id = voice_cfg.get(tone, "").strip()
-                        neutral_id = voice_cfg.get("Trung tính", "").strip()
-                        
-                        if tone_id:
-                            channel_voice_id = tone_id
-                        elif neutral_id:
-                            channel_voice_id = neutral_id
-            except Exception: pass
-            channel_voice_speed = TARGET_VOICE_SPEED
-            
-            print(f"   [KÊNH {id_tiktok}] 🎵 Tone: {tone} -> Voice ID: {channel_voice_id} | Speed: {channel_voice_speed}")
-
-            voice_hook_path = None
-            voice_script_path = None
-            
-            try:
-                if hook_text:
-                    voice_hook_path = create_voice_full_pipeline(
-                        hook_text, job_dir, "hook_voice.wav", channel_voice_id, speed=channel_voice_speed
+                if not downloaded_imgs:
+                    raise PipelineStageError(
+                        "rendered", "MEDIA_ASSETS_MISSING",
+                        "Không tìm được ảnh phù hợp để dựng video.",
                     )
-                if script_text:
-                    voice_script_path = create_voice_full_pipeline(
-                        script_text, job_dir, "script_voice.wav", channel_voice_id, speed=channel_voice_speed
+
+                downloaded_image_assets = [
+                    asset_by_path[str(image_path)]
+                    for image_path in downloaded_imgs
+                    if str(image_path) in asset_by_path
+                ]
+                _trace_pipeline_step(
+                    id_tiktok,
+                    article_url,
+                    "media_assets",
+                    "completed",
+                    metadata={"images": len(downloaded_imgs), "videos": len(downloaded_videos)},
+                )
+                _trace_pipeline_step(id_tiktok, article_url, "image_rights", "started")
+                image_rights_report = guard_image_assets(downloaded_image_assets)
+                source_metadata.update({"image_rights": image_rights_report.to_dict()})
+                _trace_pipeline_step(
+                    id_tiktok,
+                    article_url,
+                    "image_rights",
+                    "completed" if image_rights_report.passed else "failed",
+                    message="; ".join(image_rights_report.errors),
+                    metadata={"status": image_rights_report.status},
+                )
+                if image_rights_report.warnings:
+                    print(
+                        f"   [KÊNH {id_tiktok}] ⚠️ Image rights review: "
+                        + "; ".join(image_rights_report.warnings)
                     )
-            except Exception as e:
-                raise PipelineStageError(
-                    "voiced", "TTS_FAILED", f"Lỗi sinh voice: {e}",
-                ) from e
-                
-            # Không được âm thầm bỏ qua một đoạn voice đã có trong kịch bản.
-            # Trước đây TTS lỗi/trả file cụt vẫn cho pipeline chạy tiếp nếu
-            # đoạn còn lại tồn tại, khiến video mở đầu bị mất tiếng.
-            if hook_text and not voice_hook_path:
-                raise PipelineStageError(
-                    "voiced", "TTS_FAILED",
-                    "Không tạo được hook_voice; không tiếp tục dựng video bị mất câu mở đầu.",
-                )
-            if script_text and not voice_script_path:
-                raise PipelineStageError(
-                    "voiced", "TTS_FAILED",
-                    "Không tạo được script_voice; không tiếp tục dựng video thiếu lời đọc.",
-                )
+                if not image_rights_report.passed:
+                    raise PipelineStageError(
+                        "selected",
+                        "IMAGE_RIGHTS_FAILED",
+                        "Image rights không đạt: " + "; ".join(image_rights_report.errors),
+                        retryable=False,
+                    )
 
-            # 5. Dựng Video
-            if not downloaded_imgs or (not voice_hook_path and not voice_script_path):
-                raise PipelineStageError(
-                    "voiced", "TTS_FAILED", "Thiếu ảnh hoặc voice để dựng video.",
-                )
-            _trace_pipeline_step(
-                id_tiktok,
-                article_url,
-                "voice",
-                "completed",
-                metadata={
-                    "hook_voice": bool(voice_hook_path),
-                    "script_voice": bool(voice_script_path),
-                    "hook_words": len(hook_text.split()),
-                    "script_words": len(script_text.split()),
-                    "hook_duration": round(probe_audio_duration(voice_hook_path), 3),
-                    "script_duration": round(probe_audio_duration(voice_script_path), 3),
-                },
-            )
-            lifecycle.advance("voiced")
-                
-            print(f"   [KÊNH {id_tiktok}] 🎬 Đang dựng FFmpeg...")
-            _trace_pipeline_step(id_tiktok, article_url, "render", "started")
-            output_video_path = os.path.join(job_dir, f"final_{id_tiktok}_{int(time.time())}.mp4")
-            
-            # Nếu có video gốc từ báo, truyền video đầu tiên vào (nếu có nhiều lấy 1)
-            appended_video_path = downloaded_videos[0] if downloaded_videos else None
-            try:
-                create_article_video(
-                    id_tiktok=id_tiktok,
-                    image_paths=downloaded_imgs,
-                    hook_voice_path=voice_hook_path,
-                    script_voice_path=voice_script_path,
-                    output_path=output_video_path,
-                    hook_text=hook_text,
-                    appended_video_path=appended_video_path,
-                    tone=tone,
-                    script_text=script_text,
-                    music_mood=music_mood,
-                    music_energy=music_energy,
-                    is_sensitive=is_sensitive,
-                    beats=ai_result.get("beats"),
-                    subtitle_style=ai_result.get(
-                        "subtitle_style", "keyword_highlight",
-                    ),
-                )
-            except Exception as error:
-                raise PipelineStageError(
-                    "rendered", "RENDER_FAILED", f"Render FFmpeg lỗi: {error}",
-                ) from error
+                print(f"   [KÊNH {id_tiktok}] 📸 Tổng số ảnh để làm video: {len(downloaded_imgs)}, Số video: {len(downloaded_videos)}")
 
-            if not os.path.exists(output_video_path):
-                raise PipelineStageError(
-                    "rendered", "RENDER_FAILED",
-                    "Render FFmpeg không tạo ra file MP4.",
-                )
-            lifecycle.advance("rendered")
-            _trace_pipeline_step(
-                id_tiktok,
-                article_url,
-                "render",
-                "completed",
-                metadata={"output": output_video_path},
-            )
-
-            subtitle_ass_path = output_video_path.replace(".mp4", "_body.ass")
-            _trace_pipeline_step(id_tiktok, article_url, "video_qa", "started")
-            qa_result = run_video_qa(
-                output_video_path,
-                subtitle_ass_path=(
-                    subtitle_ass_path if os.path.exists(subtitle_ass_path) else ""
-                ),
-                watermark_detected=bool(article_data.get("watermark_detected")),
-            )
-            # Một số video nhúng từ bài báo có đoạn mở đầu đen hoặc PTS lỗi.
-            # Thử bản slideshow không chèn video nhúng trước khi bỏ hẳn bài;
-            # không hạ ngưỡng VideoQA và chỉ áp dụng khi bản có video nhúng bị
-            # đúng lỗi BLACK_FRAME_DETECTED.
-            if (
-                not qa_result.passed
-                and "BLACK_FRAME_DETECTED" in qa_result.blocking_errors
-                and appended_video_path
-            ):
+                # 4. Sinh Voice
+                print(f"   [KÊNH {id_tiktok}] 🗣️ Bắt đầu sinh Voice OmniVoice...")
+                _trace_pipeline_step(id_tiktok, article_url, "voice", "started")
+                hook_text = str(ai_result.get('hook', '') or '').strip()
+                script_text = str(ai_result.get('script_voice', '') or '').strip()
                 print(
-                    f"   [KÊNH {id_tiktok}] ⚠️ Video chèn có khung đen; "
-                    "đang dựng lại bản slideshow không chèn video nguồn...",
+                    f"   [KÊNH {id_tiktok}] 📝 Hook voice: {len(hook_text.split())} từ, "
+                    f"{len(hook_text)} ký tự | Script voice: {len(script_text.split())} từ, "
+                    f"{len(script_text)} ký tự | Nội dung hook: {hook_text[:180]}",
                     flush=True,
                 )
+
+                tone = ai_result.get("tone", "Trung tính")
+                music_mood = ai_result.get("music_mood")
+                music_energy = ai_result.get("music_energy", 2)
+                is_sensitive = ai_result.get("is_sensitive", False)
+                channel_voice_id = VOICE_PROFILE_ID
+                channel_voice_speed = get_channel_voice_speed(
+                    id_tiktok,
+                    story_type=ai_result.get("story_type", ""),
+                    tone=tone,
+                    is_sensitive=bool(is_sensitive),
+                )
+                try:
+                    channel_dir = os.path.join(PROJECT_ROOT, "assets", "channels", id_tiktok)
+                    voice_cfg_path = os.path.join(channel_dir, "voice_config.json")
+                    if os.path.exists(voice_cfg_path):
+                        with open(voice_cfg_path, "r", encoding="utf-8") as f:
+                            voice_cfg = json.load(f)
+
+                            tone_id = voice_cfg.get(tone, "").strip()
+                            neutral_id = voice_cfg.get("Trung tính", "").strip()
+
+                            if tone_id:
+                                channel_voice_id = tone_id
+                            elif neutral_id:
+                                channel_voice_id = neutral_id
+                except Exception: pass
+                channel_voice_speed = TARGET_VOICE_SPEED
+
+                print(f"   [KÊNH {id_tiktok}] 🎵 Tone: {tone} -> Voice ID: {channel_voice_id} | Speed: {channel_voice_speed}")
+
+                voice_hook_path = None
+                voice_script_path = None
+
+                try:
+                    if hook_text:
+                        voice_hook_path = create_voice_full_pipeline(
+                            hook_text, job_dir, "hook_voice.wav", channel_voice_id, speed=channel_voice_speed
+                        )
+                    if script_text:
+                        voice_script_path = create_voice_full_pipeline(
+                            script_text, job_dir, "script_voice.wav", channel_voice_id, speed=channel_voice_speed
+                        )
+                except Exception as e:
+                    raise PipelineStageError(
+                        "voiced", "TTS_FAILED", f"Lỗi sinh voice: {e}",
+                    ) from e
+
+                if hook_text and not voice_hook_path:
+                    raise PipelineStageError(
+                        "voiced", "TTS_FAILED",
+                        "Không tạo được hook_voice; không tiếp tục dựng video bị mất câu mở đầu.",
+                    )
+                if script_text and not voice_script_path:
+                    raise PipelineStageError(
+                        "voiced", "TTS_FAILED",
+                        "Không tạo được script_voice; không tiếp tục dựng video thiếu lời đọc.",
+                    )
+
+                # 5. Dựng Video
+                if not downloaded_imgs or (not voice_hook_path and not voice_script_path):
+                    raise PipelineStageError(
+                        "voiced", "TTS_FAILED", "Thiếu ảnh hoặc voice để dựng video.",
+                    )
+                _trace_pipeline_step(
+                    id_tiktok,
+                    article_url,
+                    "voice",
+                    "completed",
+                    metadata={
+                        "hook_voice": bool(voice_hook_path),
+                        "script_voice": bool(voice_script_path),
+                        "hook_words": len(hook_text.split()),
+                        "script_words": len(script_text.split()),
+                        "hook_duration": round(probe_audio_duration(voice_hook_path), 3),
+                        "script_duration": round(probe_audio_duration(voice_script_path), 3),
+                    },
+                )
+                lifecycle.advance("voiced")
+
+                print(f"   [KÊNH {id_tiktok}] 🎬 Đang dựng FFmpeg...")
+                _trace_pipeline_step(id_tiktok, article_url, "render", "started")
+                output_video_path = os.path.join(job_dir, f"final_{id_tiktok}_{int(time.time())}.mp4")
+
+                appended_video_path = downloaded_videos[0] if downloaded_videos else None
                 try:
                     create_article_video(
                         id_tiktok=id_tiktok,
@@ -1172,7 +1307,7 @@ class ArticlePipelineCore:
                         script_voice_path=voice_script_path,
                         output_path=output_video_path,
                         hook_text=hook_text,
-                        appended_video_path=None,
+                        appended_video_path=appended_video_path,
                         tone=tone,
                         script_text=script_text,
                         music_mood=music_mood,
@@ -1183,63 +1318,117 @@ class ArticlePipelineCore:
                             "subtitle_style", "keyword_highlight",
                         ),
                     )
-                    qa_result = run_video_qa(
-                        output_video_path,
-                        subtitle_ass_path=(
-                            subtitle_ass_path if os.path.exists(subtitle_ass_path) else ""
-                        ),
-                        watermark_detected=bool(article_data.get("watermark_detected")),
+                except Exception as error:
+                    raise PipelineStageError(
+                        "rendered", "RENDER_FAILED", f"Render FFmpeg lỗi: {error}",
+                    ) from error
+
+                if not os.path.exists(output_video_path):
+                    raise PipelineStageError(
+                        "rendered", "RENDER_FAILED",
+                        "Render FFmpeg không tạo ra file MP4.",
                     )
-                except Exception as fallback_error:
+                lifecycle.advance("rendered")
+                _trace_pipeline_step(
+                    id_tiktok,
+                    article_url,
+                    "render",
+                    "completed",
+                    metadata={"output": output_video_path},
+                )
+
+                subtitle_ass_path = output_video_path.replace(".mp4", "_body.ass")
+                _trace_pipeline_step(id_tiktok, article_url, "video_qa", "started")
+                qa_result = run_video_qa(
+                    output_video_path,
+                    subtitle_ass_path=(
+                        subtitle_ass_path if os.path.exists(subtitle_ass_path) else ""
+                    ),
+                    watermark_detected=bool(article_data.get("watermark_detected")),
+                )
+                if (
+                    not qa_result.passed
+                    and "BLACK_FRAME_DETECTED" in qa_result.blocking_errors
+                    and appended_video_path
+                ):
                     print(
-                        f"   [KÊNH {id_tiktok}] ⚠️ Không dựng được bản slideshow dự phòng: "
-                        f"{fallback_error}",
+                        f"   [KÊNH {id_tiktok}] ⚠️ Video chèn có khung đen; "
+                        "đang dựng lại bản slideshow không chèn video nguồn...",
                         flush=True,
                     )
-            if not qa_result.passed:
+                    try:
+                        create_article_video(
+                            id_tiktok=id_tiktok,
+                            image_paths=downloaded_imgs,
+                            hook_voice_path=voice_hook_path,
+                            script_voice_path=voice_script_path,
+                            output_path=output_video_path,
+                            hook_text=hook_text,
+                            appended_video_path=None,
+                            tone=tone,
+                            script_text=script_text,
+                            music_mood=music_mood,
+                            music_energy=music_energy,
+                            is_sensitive=is_sensitive,
+                            beats=ai_result.get("beats"),
+                            subtitle_style=ai_result.get(
+                                "subtitle_style", "keyword_highlight",
+                            ),
+                        )
+                        qa_result = run_video_qa(
+                            output_video_path,
+                            subtitle_ass_path=(
+                                subtitle_ass_path if os.path.exists(subtitle_ass_path) else ""
+                            ),
+                            watermark_detected=bool(article_data.get("watermark_detected")),
+                        )
+                    except Exception as fallback_error:
+                        print(
+                            f"   [KÊNH {id_tiktok}] ⚠️ Không dựng được bản slideshow dự phòng: "
+                            f"{fallback_error}",
+                            flush=True,
+                        )
+                if not qa_result.passed:
+                    _trace_pipeline_step(
+                        id_tiktok,
+                        article_url,
+                        "video_qa",
+                        "failed",
+                        message=", ".join(qa_result.blocking_errors),
+                        error_code=qa_result.error_code or "VIDEO_QA_FAILED",
+                    )
+                    print(
+                        f"   [KÊNH {id_tiktok}] 🔍 QA thực tế: "
+                        f"codec={qa_result.video_codec} pix_fmt={qa_result.pixel_format} "
+                        f"res={qa_result.resolution} fps={qa_result.fps} "
+                        f"audio={qa_result.audio_codec}/{qa_result.audio_sample_rate}/"
+                        f"{qa_result.audio_channels} lufs={qa_result.integrated_lufs}"
+                    )
+                    _append_quality_log(
+                        "article", id_tiktok, quality_score, "failed",
+                        stage="qa_passed", item_id=article_url,
+                        qa=qa_result.to_dict(),
+                        **source_metadata,
+                    )
+                    raise PipelineStageError(
+                        "qa_passed",
+                        qa_result.error_code or "VIDEO_QA_FAILED",
+                        "VideoQA chặn upload: " + ", ".join(qa_result.blocking_errors),
+                    )
+                lifecycle.advance("qa_passed")
                 _trace_pipeline_step(
                     id_tiktok,
                     article_url,
                     "video_qa",
-                    "failed",
-                    message=", ".join(qa_result.blocking_errors),
-                    error_code=qa_result.error_code or "VIDEO_QA_FAILED",
-                )
-                # Ghi lại toàn bộ số liệu QA trước khi ném lỗi; nếu không,
-                # video bị dọn cùng thư mục job và không còn cách nào biết
-                # thông số thật đã sai ở đâu.
-                print(
-                    f"   [KÊNH {id_tiktok}] 🔍 QA thực tế: "
-                    f"codec={qa_result.video_codec} pix_fmt={qa_result.pixel_format} "
-                    f"res={qa_result.resolution} fps={qa_result.fps} "
-                    f"audio={qa_result.audio_codec}/{qa_result.audio_sample_rate}/"
-                    f"{qa_result.audio_channels} lufs={qa_result.integrated_lufs}"
+                    "completed",
+                    metadata=qa_result.to_dict(),
                 )
                 _append_quality_log(
-                    "article", id_tiktok, quality_score, "failed",
+                    "article", id_tiktok, quality_score, "qa_passed",
                     stage="qa_passed", item_id=article_url,
                     qa=qa_result.to_dict(),
                     **source_metadata,
                 )
-                raise PipelineStageError(
-                    "qa_passed",
-                    qa_result.error_code or "VIDEO_QA_FAILED",
-                    "VideoQA chặn upload: " + ", ".join(qa_result.blocking_errors),
-                )
-            lifecycle.advance("qa_passed")
-            _trace_pipeline_step(
-                id_tiktok,
-                article_url,
-                "video_qa",
-                "completed",
-                metadata=qa_result.to_dict(),
-            )
-            _append_quality_log(
-                "article", id_tiktok, quality_score, "qa_passed",
-                stage="qa_passed", item_id=article_url,
-                qa=qa_result.to_dict(),
-                **source_metadata,
-            )
             
             # 6. Upload & Lưu Google Sheet
             _trace_pipeline_step(id_tiktok, article_url, "upload", "started")

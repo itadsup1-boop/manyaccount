@@ -192,7 +192,8 @@ def plan_beat_timeline(
     weights = []
     for item in clean_beats:
         role = _text(item.get("role")).lower() or "development"
-        weights.append(_float(item.get("duration_hint"), ROLE_WEIGHTS.get(role, 3.0)))
+        hint = _float(item.get("duration_hint"), 0.0) or max(0.0, _float(item.get("end_sec"), 0.0) - _float(item.get("start_sec"), 0.0))
+        weights.append(hint if hint > 0 else ROLE_WEIGHTS.get(role, 3.0))
 
     durations: list[float]
     real_hook = min(max(0.0, float(hook_duration or 0.0)), total)

@@ -490,12 +490,13 @@ class FBNewsPipeline:
                 metadata={**video, **dl},
             )
             ai_result = analyze_video_content(
-                dl["path"], 
-                caption, 
+                dl["path"],
+                caption,
                 is_tele_bot=source.get("is_telegram_bot", False),
                 extra_content=operator_instruction,
                 profile_id=target_tiktok_id,
                 edit_mode=edit_mode,
+                hide_chrome=bool(source.get("hide_chrome", False)),
             )
 
             if not ai_result:
@@ -538,6 +539,7 @@ class FBNewsPipeline:
                         profile_id=target_tiktok_id,
                         repair_instruction=instruction,
                         edit_mode=edit_mode,
+                        hide_chrome=bool(source.get("hide_chrome", False)),
                     ),
                 )
             ai_result = prepared_content.content
@@ -1192,6 +1194,10 @@ class FBNewsPipeline:
             hook_text=hook_text,
             script_text=script_text,
         )
+        target_duration = max(
+            0.1,
+            render_duration + (0.2 if audio_dur > 0 else 0.0),
+        )
         hook_text = resolve_intro_overlay_text(hook_text, timeline)
         print(
             f"      🧭 Beat timeline: {len(timeline.segments)} beats | "
@@ -1213,17 +1219,19 @@ class FBNewsPipeline:
             main_audio_idx = None
             
         if has_title_frame:
-            inputs += ["-i", title_frame_path]
+            # Ảnh frame là input tĩnh; loop vô hạn để không làm video kết thúc
+            # sớm khi output có thời lượng cố định theo voice.
+            inputs += ["-loop", "1", "-i", title_frame_path]
             t_frame_idx = input_idx
             input_idx += 1
 
         if has_content_frame:
-            inputs += ["-i", content_frame_path]
+            inputs += ["-loop", "1", "-i", content_frame_path]
             c_frame_idx = input_idx
             input_idx += 1
 
         if has_logo:
-            inputs += ["-i", logo_path]
+            inputs += ["-loop", "1", "-i", logo_path]
             logo_idx = input_idx
             input_idx += 1
 
@@ -1532,7 +1540,7 @@ class FBNewsPipeline:
             base_audio = audio_map if str(audio_map).startswith("[") else f"[{audio_map}]"
             mixed_input = base_audio + "".join(f"[{label}]" for label in sfx_labels)
             filters.append(
-                f"{mixed_input}amix=inputs={1 + len(sfx_labels)}:duration=first:"
+                f"{mixed_input}amix=inputs={1 + len(sfx_labels)}:duration=longest:"
                 f"normalize=0,alimiter=limit=0.84[a_final]"
             )
             audio_map = "[a_final]"
@@ -1542,11 +1550,10 @@ class FBNewsPipeline:
         cmd += ["-filter_complex", ";".join(filters), "-map", video_map]
         cmd += ["-map", f"{audio_map}"]
         
-        if audio_dur > 0:
-            cmd += ["-t", str(audio_dur + 0.2)]
-            
-        # Dùng -shortest để dự phòng
-        cmd += [*final_output_args(), "-shortest", final_path]
+        # Thời lượng đã được xác định từ voice hoặc video nguồn. Không dùng
+        # -shortest vì input ảnh/frame là stream tĩnh có thể kết thúc sớm.
+        cmd += ["-t", f"{target_duration:.3f}"]
+        cmd += [*final_output_args(), final_path]
 
         print(f"         Tạo video CÓ FRAME (1 pass: Voice full + loop video)...")
         try:

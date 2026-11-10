@@ -10,10 +10,28 @@ from playwright.sync_api import sync_playwright
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, PROJECT_ROOT)
 from shared.core.experiment_manager import apply_experiment_metadata
-from shared.core.prompt_builder import build_prompt, resolve_prompt_experiment
+from shared.core.evidence_guard import EVIDENCE_GUARD_ENABLED
+from shared.core.prompt_builder import (
+    build_prompt,
+    format_content_profile,
+    get_content_profile,
+    resolve_prompt_experiment,
+)
 from shared.core.chatgpt_logger import save_chatgpt_log
 
 PROMPT_FILE = os.path.join(PROJECT_ROOT, "config", "prompts", "prompt_article.txt")
+NEWS_VIDEO_STUDIO_PLUGIN_NAME = os.environ.get(
+    "CHATGPT_ARTICLE_PLUGIN_NAME", "News Video Studio"
+).strip()
+NEWS_VIDEO_STUDIO_PROMPT = (
+    "Đọc file đính kèm và chỉ trả Tool Media Article JSON v1. "
+    "Bắt buộc có 3-5 beat B-roll: mỗi beat chỉ dùng duy nhất 1 biến visual_query "
+    "mô tả chi tiết, chân thực, sát đúng nội dung bài báo; "
+    "chỉ dùng DATA GRAPHIC: hoặc MAP GRAPHIC: cho các beat số liệu/bản đồ, không để visual_query rỗng ở mọi beat."
+)
+UPLOAD_READY = "ready"
+UPLOAD_RATE_LIMITED = "rate_limited"
+UPLOAD_FAILED = "failed"
 
 # Article and Facebook both use ChatGPT, but they must not use the same Chrome
 # user-data-dir. A persistent Chromium profile supports only one owner; sharing
@@ -179,11 +197,226 @@ def _replace_prompt_text(page, text: str):
         time.sleep(0.8)
 
     actual = current_length()
-    if actual < max(20, int(expected * 0.8)):
+    min_expected = max(10, int(expected * 0.7)) if expected < 200 else max(20, int(expected * 0.8))
+    if actual < min_expected:
         raise RuntimeError(
             f"Prompt chưa được nhập đầy đủ ({actual}/{expected} ký tự)."
         )
     return actual
+
+
+PLUGIN_MENTION_SELECTORS = (
+    '[role="option"]:has-text("News Video Studio")',
+    '[role="menuitem"]:has-text("News Video Studio")',
+    '[role="listbox"] :has-text("News Video Studio")',
+    'div[data-radix-popper-content-wrapper] :has-text("News Video Studio")',
+    'div[class*="popover"] :has-text("News Video Studio")',
+    'button:has-text("News Video Studio")',
+    'li:has-text("News Video Studio")',
+)
+
+
+def build_article_plugin_package(
+    *,
+    id_tiktok: str,
+    source_url: str,
+    source_title: str,
+    source_content: str,
+    source_name: str = "",
+    published_at: str = "",
+    source_author: str = "",
+    source_category: str = "",
+    source_hash: str = "",
+    intro: str = "",
+    conclusion: str = "",
+    operator_instruction: str = "",
+) -> tuple[str, str]:
+    """Tạo nội dung và lưu file `article_input.txt` chuẩn cho plugin @News Video Studio."""
+    operator_profiles = (operator_instruction,) if operator_instruction else ()
+    channel_profile = get_content_profile(id_tiktok, *operator_profiles)
+    profile_text = format_content_profile(channel_profile).strip()
+
+    body_parts = []
+    if intro and intro not in source_content:
+        body_parts.append(f"Mở đầu: {intro}")
+    if source_content:
+        body_parts.append(source_content)
+    if conclusion and conclusion not in source_content:
+        body_parts.append(f"Kết luận: {conclusion}")
+    clean_article_body = "\n\n".join(part.strip() for part in body_parts if part.strip())
+
+    blocks = [
+        "[HỒ SƠ KÊNH]",
+        f"ID kênh (id_tiktok): {id_tiktok}",
+    ]
+    if profile_text:
+        blocks.append(profile_text)
+    blocks.extend(
+        [
+            "Thời lượng mục tiêu: 52 giây (7-9 beats; hook 10-16 từ + script_voice 140-150 từ).",
+            "Yêu cầu B-roll bắt buộc: phải có ít nhất 3 và tối đa 5 beat B-roll. Mỗi beat chỉ dùng duy nhất 1 biến visual_query mô tả chi tiết, chân thực, sát đúng nội dung sự kiện/bối cảnh bài báo để tìm ảnh thực tế (không tạo biến phụ rườm rà). Chỉ dùng DATA GRAPHIC: hoặc MAP GRAPHIC: cho số liệu/so sánh/bản đồ; không để visual_query rỗng ở mọi beat.",
+            "Đầu ra: chỉ trả duy nhất 1 object JSON hợp lệ theo Tool Media Article JSON v1, không Markdown, không giải thích.",
+            f'Bắt buộc giữ đúng "id_tiktok": "{id_tiktok}" trong JSON.',
+        ]
+    )
+    if operator_instruction:
+        blocks.extend(
+            [
+                "",
+                "[CHỈ ĐẠO BIÊN TẬP]",
+                operator_instruction,
+                "Chỉ áp dụng cho góc triển khai, giọng điệu và trọng tâm; tuyệt đối không thêm dữ kiện ngoài bài báo.",
+            ]
+        )
+
+    blocks.extend(
+        [
+            "",
+            "[NGUỒN]",
+            f"URL: {source_url or '[chưa xác định]'}",
+            f"Toà soạn: {source_name or '[chưa xác định]'}",
+            f"Tác giả: {source_author or '[chưa xác định]'}",
+            f"Chuyên mục: {source_category or '[chưa xác định]'}",
+            f"Ngày xuất bản: {published_at or '[chưa xác định]'}",
+            f"Mã băm nội dung: {source_hash or '[chưa xác định]'}",
+            f"Tiêu đề: {source_title or '[chưa xác định]'}",
+            "",
+            "[BÀI BÁO]",
+            clean_article_body or f"URL nguồn: {source_url}",
+            "",
+        ]
+    )
+    package_content = "\n".join(blocks)
+
+    clean_id = _safe_profile_id(id_tiktok) or "default"
+    package_dir = os.path.join(PROJECT_ROOT, "temp", "article_inputs", clean_id)
+    os.makedirs(package_dir, exist_ok=True)
+    package_path = os.path.join(package_dir, "article_input.txt")
+    with open(package_path, "w", encoding="utf-8") as handle:
+        handle.write(package_content)
+    return package_path, package_content
+
+
+def wait_for_article_file_upload(
+    page, file_path: str, timeout_seconds: int = 40
+) -> str:
+    """Chờ tới khi ChatGPT hiển thị xác nhận đã đính kèm file `article_input.txt`."""
+    filename = os.path.basename(file_path or "").strip().lower()
+    deadline = time.time() + max(8, int(timeout_seconds))
+    upload_error_markers = (
+        "upload failed",
+        "failed to upload",
+        "couldn't upload",
+        "không thể tải lên",
+        "tải lên thất bại",
+        "file quá lớn",
+    )
+
+    while time.time() < deadline:
+        if dismiss_rate_limit_dialog(page):
+            return UPLOAD_RATE_LIMITED
+
+        try:
+            body_text = page.locator("body").inner_text(timeout=2000).lower()
+        except Exception:
+            body_text = ""
+        if any(marker in body_text for marker in upload_error_markers):
+            return UPLOAD_FAILED
+
+        try:
+            attachment_state = page.evaluate(
+                """(name) => {
+                    const nodes = Array.from(document.querySelectorAll(
+                        '[data-testid], [aria-label], [title], button, [role="button"], div, span'
+                    ));
+                    const text = (node) => [
+                        node.getAttribute?.('data-testid') || '',
+                        node.getAttribute?.('aria-label') || '',
+                        node.getAttribute?.('title') || '',
+                        node.textContent || '',
+                    ].join(' ').toLowerCase();
+                    const named = Boolean(name) && nodes.some((node) => text(node).includes(name));
+                    const attachment = nodes.some((node) => {
+                        const value = text(node);
+                        return /remove.*(file|attachment)|xóa.*tệp|attachment.*file|file.*(attached|uploaded)/.test(value);
+                    });
+                    const uploading = /uploading|đang tải lên/.test(
+                        (document.body?.innerText || '').toLowerCase()
+                    );
+                    return { named, attachment, uploading };
+                }""",
+                filename,
+            )
+        except Exception:
+            attachment_state = {}
+
+        if (
+            (attachment_state.get("named") or attachment_state.get("attachment"))
+            and not attachment_state.get("uploading")
+        ):
+            print(f"      ✅ ChatGPT đã xác nhận file đính kèm ({filename}).")
+            return UPLOAD_READY
+        time.sleep(1.0)
+
+    print(
+        f"      ⚠️ ChatGPT chưa xác nhận file đính kèm ({filename}) sau {timeout_seconds}s."
+    )
+    return UPLOAD_FAILED
+
+
+def _invoke_news_video_studio_plugin(
+    page,
+    instruction_text: str,
+    plugin_name: str = NEWS_VIDEO_STUDIO_PLUGIN_NAME,
+) -> int:
+    """Kích hoạt `@News Video Studio` trong ô chat và điền câu lệnh yêu cầu JSON v1."""
+    textarea = _focus_prompt_box(page)
+    import platform
+
+    modifier = "Meta" if platform.system() == "Darwin" else "Control"
+    page.keyboard.press(f"{modifier}+A")
+    page.keyboard.press("Backspace")
+    time.sleep(0.2)
+
+    mention_selected = False
+    if plugin_name:
+        try:
+            page.keyboard.type(f"@{plugin_name}", delay=25)
+            time.sleep(1.0)
+            for selector in PLUGIN_MENTION_SELECTORS:
+                try:
+                    option = page.locator(selector).first
+                    if option.count() > 0 and option.is_visible(timeout=400):
+                        option.click(timeout=3000)
+                        mention_selected = True
+                        time.sleep(0.4)
+                        print(f"      🔌 Đã chọn plugin @{plugin_name} từ menu ChatGPT.")
+                        break
+                except Exception:
+                    continue
+        except Exception:
+            mention_selected = False
+
+    if mention_selected:
+        try:
+            page.keyboard.insert_text(instruction_text)
+        except Exception:
+            _replace_prompt_text(page, f"@{plugin_name}\n{instruction_text}")
+        time.sleep(0.5)
+        try:
+            current_val = textarea.evaluate(
+                "el => el.value ?? el.innerText ?? el.textContent ?? ''"
+            )
+            if len(str(current_val or "").strip()) >= 10:
+                return len(str(current_val or ""))
+        except Exception:
+            pass
+
+    combined_prompt = (
+        f"@{plugin_name}\n{instruction_text}" if plugin_name else instruction_text
+    )
+    return _replace_prompt_text(page, combined_prompt)
+
 
 DIALOG_DISMISS_LABELS = ("Got it", "Đã hiểu", "OK", "Okay", "Close", "Đóng")
 RATE_LIMIT_MARKERS = ("too many requests", "quá nhiều yêu cầu", "making requests too quickly")
@@ -245,6 +478,72 @@ def is_rate_limited(dialog_text: str) -> bool:
 def dismiss_rate_limit_dialog(page) -> bool:
     """Close the blocking dialog and report whether it is a rate limit."""
     return is_rate_limited(dismiss_blocking_dialog(page))
+
+
+WORK_MODE_SELECTORS = (
+    'button[class*="home-mode-toggle"][class*="col-start-2"]',
+    'button[class*="home-mode-toggle"]:has-text("Công việc")',
+    'button[class*="home-mode-toggle"]:has-text("Work")',
+    'button[class*="mode-toggle"]:has-text("Công việc")',
+    'button[class*="mode-toggle"]:has-text("Work")',
+    'button[aria-pressed]:has-text("Công việc")',
+    'button[aria-pressed]:has-text("Work")',
+    'button:has(span:text-is("Công việc"))',
+    'button:has(span:text-is("Work"))',
+)
+
+
+def ensure_work_mode_selected(page, timeout_seconds: float = 10.0) -> bool:
+    """Đảm bảo nút chế độ 'Công việc' / 'Work' (home-mode-toggle) được chọn khi mở ChatGPT."""
+    deadline = time.time() + max(1.0, float(timeout_seconds))
+    while True:
+        for selector in WORK_MODE_SELECTORS:
+            try:
+                locator = page.locator(selector)
+                if locator.count() == 0:
+                    continue
+                button = locator.first
+                if not button.is_visible(timeout=500):
+                    continue
+                aria_pressed = str(button.get_attribute("aria-pressed") or "").strip().lower()
+                if aria_pressed == "true":
+                    print("      💼 Chế độ 'Công việc' (Work) trên ChatGPT đã được bật sẵn.")
+                    return True
+
+                clicked = False
+                for click_attempt in range(3):
+                    try:
+                        if click_attempt == 0:
+                            button.click(timeout=5000)
+                        elif click_attempt == 1:
+                            button.click(timeout=5000, force=True)
+                        else:
+                            handle = button.element_handle(timeout=2000)
+                            if handle:
+                                page.evaluate("(el) => el.click()", handle)
+                        clicked = True
+                    except Exception:
+                        continue
+                    time.sleep(1.0)
+                    new_pressed = str(button.get_attribute("aria-pressed") or "").strip().lower()
+                    if new_pressed == "true":
+                        break
+
+                if clicked:
+                    time.sleep(1.5)
+                    final_pressed = str(button.get_attribute("aria-pressed") or "").strip().lower()
+                    print(
+                        f"      💼 Đã chọn chế độ 'Công việc' (Work) trên ChatGPT "
+                        f"(aria-pressed={final_pressed})."
+                    )
+                    return True
+            except Exception:
+                continue
+
+        if time.time() >= deadline:
+            return False
+        time.sleep(0.5)
+
 
 
 def remember_active_chat_url(page, fallback_url: str, timeout_seconds: int = 0) -> str:
@@ -691,6 +990,7 @@ def analyze_article_with_chatgpt(
     article_title: str = "",
     article_content: str = "",
     extra_content: str = "",
+    hide_chrome: bool = False,
 ) -> dict | None:
     """Analyze one article through the ChatGPT browser automator.
 
@@ -792,15 +1092,19 @@ def analyze_article_with_chatgpt(
             "đúng bài từ URL; nếu không, đặt topic_fit=false và should_make_video=false."
         )
 
+    evidence_instruction = (
+        "Evidence nâng cao là bắt buộc: tạo claim_register cho mọi claim trong hook, title, script, fact_sheet và on_screen_text. "
+        "Mỗi claim_id phải có ít nhất một evidence tương ứng; claim có số phải ghi numeric_values và source_text phải chứa đúng số đó.\n"
+        if EVIDENCE_GUARD_ENABLED
+        else "claim_register và evidence để [] vì EvidenceGuard đang tắt.\n"
+    )
     task_input = (
         f"{source_block}\n"
         f"{source_instruction}\n"
-        "Evidence nâng cao là bắt buộc: tạo claim_register cho mọi claim trong hook, title, script, fact_sheet và on_screen_text. "
-        "Mỗi claim_id phải có ít nhất một evidence tương ứng; claim có số phải ghi numeric_values và source_text phải chứa đúng số đó. "
+        f"{evidence_instruction}"
         "Trước khi viết hook/script, phải lập fact_sheet gồm who, what, when, "
         "where, cause, impact, confirmed_facts và unknowns. Chỉ dùng "
         "confirmed_facts cho khẳng định; unknowns phải được giữ ở dạng chưa xác nhận.\n"
-        "Mỗi evidence phải trích từ nội dung nguồn ở trên. "
         f"Bắt buộc thêm \"id_tiktok\": \"{id_tiktok}\" vào JSON."
     )
     operator_instruction = str(extra_content or "").strip()
@@ -829,7 +1133,32 @@ def analyze_article_with_chatgpt(
         experiment_assignment=experiment_assignment,
     )
 
-    print(f"      🤖 Mở ChatGPT (Automator) cho kênh {id_tiktok}...")
+    article_input_path, article_package_text = build_article_plugin_package(
+        id_tiktok=id_tiktok,
+        source_url=source_url,
+        source_title=source_title,
+        source_content=source_content,
+        source_name=source_name,
+        published_at=published_at,
+        source_author=source_author,
+        source_category=source_category,
+        source_hash=source_hash,
+        intro=str(sections.get("intro") or "").strip(),
+        conclusion=str(sections.get("conclusion") or "").strip(),
+        operator_instruction=operator_instruction,
+    )
+    plugin_instruction = NEWS_VIDEO_STUDIO_PROMPT
+    if str(repair_instruction or "").strip():
+        plugin_instruction = (
+            f"{NEWS_VIDEO_STUDIO_PROMPT}\n\n"
+            f"YÊU CẦU SỬA DUY NHẤT\n{str(repair_instruction).strip()}"
+        )
+    inline_plugin_instruction = (
+        f"{plugin_instruction}\n\n{article_package_text}"
+    )
+
+    chrome_mode = "ẩn" if hide_chrome else "hiện"
+    print(f"      🤖 Mở ChatGPT (Automator, Chrome {chrome_mode}) cho kênh {id_tiktok}...")
     if not _clear_stale_singleton_lock(profile_dir):
         print(
             f"      ❌ Profile ChatGPT của {id_tiktok} đang được Chrome khác sử dụng; "
@@ -841,7 +1170,7 @@ def analyze_article_with_chatgpt(
     with sync_playwright() as p:
         context = p.chromium.launch_persistent_context(
             user_data_dir=profile_dir,
-            headless=False,
+            headless=bool(hide_chrome),
             args=[
                 "--no-sandbox",
                 "--no-first-run",
@@ -891,28 +1220,38 @@ def analyze_article_with_chatgpt(
                     time.sleep(RATE_LIMIT_RETRY_WAIT_SECONDS)
                     continue
 
+                ensure_work_mode_selected(page)
+
                 try:
                     page.wait_for_selector(
                         "#prompt-textarea, [contenteditable='true']", timeout=45000
                     )
                 except Exception:
-                    if is_cloudflare_challenge(page):
-                        print("      ❌ Cloudflare chặn! Cần login lại ChatGPT.")
-                        context.close()
-                        return None
-                    rate_limited = dismiss_rate_limit_dialog(page)
-                    if rate_limited:
-                        print(
-                            "      ⏳ Không thấy ô chat vì 'Too many requests'; "
-                            "đã bấm Got it, sẽ tải lại đúng chat."
+                    if ensure_work_mode_selected(page, timeout_seconds=3.0):
+                        try:
+                            page.wait_for_selector(
+                                "#prompt-textarea, [contenteditable='true']", timeout=15000
+                            )
+                        except Exception:
+                            pass
+                    if page.locator("#prompt-textarea, [contenteditable='true']").count() == 0:
+                        if is_cloudflare_challenge(page):
+                            print("      ❌ Cloudflare chặn! Cần login lại ChatGPT.")
+                            context.close()
+                            return None
+                        rate_limited = dismiss_rate_limit_dialog(page)
+                        if rate_limited:
+                            print(
+                                "      ⏳ Không thấy ô chat vì 'Too many requests'; "
+                                "đã bấm Got it, sẽ tải lại đúng chat."
+                            )
+                        else:
+                            print("      🔄 Chưa thấy ô chat; sẽ tải lại đúng chat.")
+                        time.sleep(
+                            RATE_LIMIT_RETRY_WAIT_SECONDS
+                            if rate_limited else RECOVERY_RELOAD_WAIT_SECONDS
                         )
-                    else:
-                        print("      🔄 Chưa thấy ô chat; sẽ tải lại đúng chat.")
-                    time.sleep(
-                        RATE_LIMIT_RETRY_WAIT_SECONDS
-                        if rate_limited else RECOVERY_RELOAD_WAIT_SECONDS
-                    )
-                    continue
+                        continue
 
                 # Sau khi tải lại, ưu tiên lấy kết quả đã hoàn tất trong chính
                 # cuộc chat trước đó thay vì gửi trùng prompt.
@@ -927,12 +1266,52 @@ def analyze_article_with_chatgpt(
                         break
 
                 previous_assistant_count = _assistant_message_count(page)
+                file_attached = False
+                if source_content and os.path.isfile(article_input_path):
+                    try:
+                        print(
+                            f"      📎 Đính kèm file {os.path.basename(article_input_path)} "
+                            f"cho @{NEWS_VIDEO_STUDIO_PLUGIN_NAME}..."
+                        )
+                        file_input = page.locator("input[type='file']:not([accept*='image'])")
+                        if file_input.count() == 0:
+                            file_input = page.locator("input[type='file']")
+                        if file_input.count() > 0:
+                            file_input.last.set_input_files(article_input_path)
+                            upload_status = wait_for_article_file_upload(
+                                page, article_input_path, timeout_seconds=12
+                            )
+                            chat_url = remember_active_chat_url(page, chat_url)
+                            if upload_status == UPLOAD_RATE_LIMITED:
+                                print(
+                                    "      ⏳ ChatGPT báo 'Too many requests' khi đính kèm file; "
+                                    "đã bấm Got it, sẽ tải lại đúng chat."
+                                )
+                                time.sleep(RATE_LIMIT_RETRY_WAIT_SECONDS)
+                                continue
+                            file_attached = upload_status == UPLOAD_READY
+                    except Exception as upload_error:
+                        print(
+                            f"      ⚠️ Không đính kèm được file article_input.txt ({upload_error}); "
+                            "chuyển sang gửi kèm các khối nội dung trực tiếp."
+                        )
+                        file_attached = False
+
+                active_instruction = (
+                    plugin_instruction if file_attached else inline_plugin_instruction
+                )
                 try:
-                    print("      ✍️ Nhập prompt và nội dung bài báo (gõ phím ảo)...")
-                    inserted_chars = _replace_prompt_text(page, full_prompt)
                     print(
-                        f"      ✅ Đã nhập đủ prompt "
-                        f"({inserted_chars}/{len(full_prompt)} ký tự)."
+                        f"      ✍️ Gọi @{NEWS_VIDEO_STUDIO_PLUGIN_NAME} và nhập lệnh..."
+                    )
+                    inserted_chars = _invoke_news_video_studio_plugin(
+                        page,
+                        active_instruction,
+                        plugin_name=NEWS_VIDEO_STUDIO_PLUGIN_NAME,
+                    )
+                    print(
+                        f"      ✅ Đã nhập lệnh @{NEWS_VIDEO_STUDIO_PLUGIN_NAME} "
+                        f"({inserted_chars} ký tự, đính kèm file={file_attached})."
                     )
                 except Exception as prompt_error:
                     chat_url = remember_active_chat_url(page, chat_url)
@@ -1301,7 +1680,12 @@ def analyze_article_with_chatgpt(
             if is_truncated or json_text is None:
                 print("      🔄 JSON chưa hoàn chỉnh, chờ thêm 15 giây để ChatGPT render xong...")
                 time.sleep(15)
-                retry_text = _read_assistant_text()
+                retry_text = _read_latest_assistant_text(
+                    page,
+                    previous_assistant_count,
+                    fallback_to_body=True,
+                    exclude_json=previous_json_text,
+                )
                 if retry_text:
                     raw_text = retry_text
                     json_text_retry, is_truncated_retry = _extract_json_from_text(raw_text)

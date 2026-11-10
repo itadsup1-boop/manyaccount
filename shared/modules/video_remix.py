@@ -61,7 +61,8 @@ FFPROBE_BINARY = resolve_ffprobe_binary()
 TIKTOK_KARAOKE_SUBTITLES_ENABLED = False
 
 for d in [TARGET_VIDEO_FOLDER, TEMP_REMIX_DIR, FRAME_DIR, LOGO_DIR, FONT_DIR]:
-    os.makedirs(d, exist_ok=True)
+    try: os.makedirs(d, exist_ok=True)
+    except OSError: pass
 
 # ==============================================================================
 # 2. CÁC HÀM HỖ TRỢ (UTILS)
@@ -1103,9 +1104,10 @@ def create_video_from_source_video(
             if subtitle_style == "normal":
                 keywords = []
             subtitle_path = f"subtitle_{unique_session_id}.ass"
-            subtitle_path = generate_word_ass(
-                p_aud_main_name,
+            subtitle_path = generate_text_ass(
+                script_text,
                 subtitle_path,
+                duration=body_duration,
                 time_offset=intro_duration,
                 words_per_line=subtitle_preset["max_words"],
                 font_size=subtitle_preset["font_size"],
@@ -1122,10 +1124,9 @@ def create_video_from_source_video(
                 ),
             )
             if not subtitle_path:
-                subtitle_path = generate_text_ass(
-                    script_text,
+                subtitle_path = generate_word_ass(
+                    p_aud_main_name,
                     f"subtitle_{unique_session_id}.ass",
-                    duration=body_duration,
                     time_offset=intro_duration,
                     words_per_line=subtitle_preset["max_words"],
                     font_size=subtitle_preset["font_size"],

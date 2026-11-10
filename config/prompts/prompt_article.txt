@@ -54,14 +54,15 @@ Yêu cầu kịch bản (Script Voice - Thân bài & Kết thúc):
 - Nếu thiếu dữ kiện để viết 140 từ, đặt should_make_video=false; tuyệt đối không bôi chữ tả cảnh.
 
 Yêu cầu an toàn dữ kiện:
-- claim_register và evidence để [] vì EvidenceGuard đang tắt.
+- claim_register và evidence để [].
+- source_text: chép nguyên văn 3-6 câu từ bài nguồn chứa TOÀN BỘ con số/khoản tiền/thời gian dùng trong video. Tool đối chiếu số liệu trong kịch bản với source_text; thiếu hoặc lệch số sẽ bị đưa vào hàng chờ duyệt.
 - Chỉ dùng dữ kiện trong fact_sheet và bài nguồn; không bịa tên người, nguyên nhân, con số.
 
 Yêu cầu beats:
 - Có 7-9 beats khớp với script_voice.
 - Beat đầu role=hook (voice_over chính là selected_hook); beat cuối role=payoff hoặc close.
 - role: hook, context, evidence, development, turn, payoff, close.
-- visual_query: Cụm tìm ảnh THẬT có tên người/đơn vị/mẫu xe/địa danh. Không dùng ảnh stock chung chung ("người buồn", "cảnh thành phố").
+- visual_query: Brief tìm B-roll Pexels theo bối cảnh phổ quát, viết tiếng Anh, có chủ thể + hành động + bối cảnh (VD: "people walking on city street at night rain"). Không nhét tên người/đơn vị/mẫu xe cụ thể vào query — Pexels không có ảnh hiện trường, và cấm dùng stock đóng giả sự kiện cụ thể. Dữ kiện cụ thể đặt vào on_screen_text/must_show; số liệu dùng tiền tố "DATA GRAPHIC:", địa danh/phạm vi dùng "MAP GRAPHIC:" để tool dựng đồ hoạ.
 - on_screen_text: 3-7 từ, ưu tiên tên riêng/con số, có thể trống.
 - motion: static, slow_push_in, slow_pull_out, pan_left, pan_right.
 - transition: cut (ưu tiên), fade.
@@ -136,6 +137,7 @@ Trả về đúng JSON:
   "skip_reason": "",
   "claim_register": [],
   "evidence": [],
+  "source_text": "",
   "beats": [
     {
       "beat_number": 1,

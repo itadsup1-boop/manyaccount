@@ -1,0 +1,22 @@
+{
+  "interface": {
+    "displayName": "News Video Studio",
+    "shortDescription": "Bài báo thành JSON Tool Media",
+    "longDescription": "Đọc file bài báo và trả JSON v1 tương thích Tool Media.",
+    "developerName": "Long Bảo",
+    "category": "Productivity",
+    "capabilities": [],
+    "defaultPrompt": [
+      "Đọc file bài báo đính kèm và trả JSON Tool Media v1.",
+      "Tạo JSON dựng video dọc 52 giây tương thích Tool Media.",
+      "Biên tập nội dung nguồn thành kịch bản, beats và visual query cho Tool Media."
+    ],
+    "brandColor": "#D61F26"
+  },
+  "name": "news-video-studio",
+  "version": "0.4.2",
+  "description": "Chuyển bài báo hoặc file bài báo thành JSON v1 tương thích trực tiếp Tool Media.",
+  "author": {"name": "Long Bảo", "email": "nguyenbaolong16869@gmail.com"},
+  "keywords": ["news", "video", "vietnamese", "json", "tool-media"],
+  "skills": "./skills"
+}

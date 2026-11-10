@@ -374,6 +374,7 @@ def run_worker_process(account_id):
                     source_type="tiktok",
                     experiment_content_key=vid_url,
                     whisper_transcript=whisper_transcript,
+                    hide_chrome=bool(cfg.get("hide_chrome", False)),
                 )
 
                 if not ai_result:
@@ -434,6 +435,7 @@ def run_worker_process(account_id):
                         source_type="tiktok",
                         experiment_content_key=vid_url,
                         whisper_transcript=whisper_transcript,
+                        hide_chrome=bool(cfg.get("hide_chrome", False)),
                     ),
                 )
                 ai_result = prepared_content.content

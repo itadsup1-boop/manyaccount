@@ -31,13 +31,14 @@ export default function TikTokAccountsTab({ controller }: Props) {
         <div className="tiktok-card__header"><div><h3>Danh sách tài khoản TikTok</h3><p>{controller.accounts.length} tài khoản đã cấu hình</p></div></div>
         <div className="tiktok-table-wrap">
           <table className="tiktok-table">
-            <thead><tr><th>Tài khoản</th><th>Profile Chrome</th><th>Max Limit</th><th>Trạng thái</th><th>Hành động</th></tr></thead>
+            <thead><tr><th>Tài khoản</th><th>Profile Chrome</th><th>Max Limit</th><th>Ẩn Chrome</th><th>Trạng thái</th><th>Hành động</th></tr></thead>
             <tbody>
               {controller.accounts.map((account) => (
                 <tr key={account.tiktok_id}>
                   <td><div className="account-cell"><span className="account-avatar">{initials(account.tiktok_id)}</span><div><strong>{account.tiktok_id}</strong><small>{account.email || 'Chưa có email'}</small></div></div></td>
                   <td><code>{account.chrome_profile || '-'}</code></td>
                   <td><input className="table-number-input" type="number" min="1" defaultValue={account.video_limit_per_run || 3} onBlur={(event) => controller.handleUpdateLimit(account.tiktok_id, Number.parseInt(event.target.value) || 3)} aria-label={`Giới hạn video ${account.tiktok_id}`} /></td>
+                  <td><label className="tiktok-switch" title="Chrome chạy ngầm ẩn khi tạo kịch bản ChatGPT/Gemini"><input type="checkbox" checked={Boolean(account.hide_chrome)} onChange={() => controller.handleToggleHideChrome(account.tiktok_id, account.hide_chrome)} /><span aria-hidden="true" /><b>{account.hide_chrome ? 'Ẩn' : 'Hiện'}</b></label></td>
                   <td><label className="tiktok-switch"><input type="checkbox" checked={Boolean(account.active)} onChange={() => controller.handleToggleActive(account.tiktok_id, account.active)} /><span aria-hidden="true" /><b>{account.active ? 'Bật' : 'Tắt'}</b></label></td>
                   <td><div className="table-actions">
                     <button type="button" onClick={() => controller.handleOpenChrome(account.chrome_profile)} aria-label={`Mở Chrome ${account.tiktok_id}`} title="Mở Chrome TikTok"><MonitorPlay size={16} /></button>
@@ -46,7 +47,7 @@ export default function TikTokAccountsTab({ controller }: Props) {
                   </div></td>
                 </tr>
               ))}
-              {!controller.accounts.length && <tr><td colSpan={5} className="table-empty">Chưa có tài khoản TikTok.</td></tr>}
+              {!controller.accounts.length && <tr><td colSpan={6} className="table-empty">Chưa có tài khoản TikTok.</td></tr>}
             </tbody>
           </table>
         </div>

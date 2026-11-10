@@ -1,6 +1,7 @@
 import { useState, useEffect, useRef } from 'react';
 import { Play, Square, Plus, RefreshCw, Key, Upload, Trash2, Save, Search, ExternalLink, ShieldAlert } from 'lucide-react';
 import VisualTextEditor from '../components/VisualTextEditor';
+import ImportJsonPanel from '../components/ImportJsonPanel';
 import { useAuth } from '../context/AuthContext';
 
 const defaultContentProfile: Record<string, string> = {
@@ -256,6 +257,14 @@ export default function ToolArticle() {
     }).then(() => fetchSources());
   };
 
+  const handleToggleSourceHideChrome = (id: number, currentStatus: boolean) => {
+    fetch(`/api/article/sources/${id}`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ hide_chrome: !currentStatus })
+    }).then(() => fetchSources());
+  };
+
   useEffect(() => {
     if (activeTab === 'history') {
       fetchProcessedLinks();
@@ -317,6 +326,7 @@ export default function ToolArticle() {
       
       <div className="tab-headers">
         <button className={`tab-header ${activeTab === 'pipeline' ? 'active' : ''}`} onClick={() => setActiveTab('pipeline')}>📰 Pipeline</button>
+        <button className={`tab-header ${activeTab === 'import' ? 'active' : ''}`} onClick={() => setActiveTab('import')}>📥 Import JSON</button>
         <button className={`tab-header ${activeTab === 'chrome' ? 'active' : ''}`} onClick={() => setActiveTab('chrome')}>🌐 Trình duyệt</button>
         <button className={`tab-header ${activeTab === 'history' ? 'active' : ''}`} onClick={() => setActiveTab('history')}>🔎 Bài đã làm</button>
         <button className={`tab-header ${activeTab === 'visual' ? 'active' : ''}`} onClick={() => setActiveTab('visual')}>🎨 Căn chỉnh Text</button>
@@ -370,6 +380,10 @@ export default function ToolArticle() {
                             <input type="checkbox" checked={source.is_active} onChange={() => handleToggleSourceActive(source.id, source.is_active)} />
                             <span>📄 {source.category_url}</span>
                           </label>
+                          <label style={{ display: 'flex', alignItems: 'center', gap: '0.35rem', fontSize: '0.8rem', color: 'var(--text-secondary)', cursor: 'pointer' }} title="Chrome chạy ngầm ẩn khi tạo kịch bản ChatGPT/Gemini">
+                            <input type="checkbox" checked={!!source.hide_chrome} onChange={() => handleToggleSourceHideChrome(source.id, source.hide_chrome)} />
+                            <span>Ẩn Chrome</span>
+                          </label>
                           <button className="btn" style={{ background: 'transparent', color: 'var(--danger)', padding: '0.25rem' }} onClick={() => handleDeleteSource(source.id)}>
                             <Trash2 size={16} />
                           </button>
@@ -407,6 +421,9 @@ export default function ToolArticle() {
           </div>
         )}
 
+
+        {/* ═══ TAB: IMPORT JSON ═══ */}
+        {activeTab === 'import' && <ImportJsonPanel channels={uniqueChannels} />}
 
         {/* ═══ TAB: BÀI ĐÃ LÀM ═══ */}
         {activeTab === 'history' && (

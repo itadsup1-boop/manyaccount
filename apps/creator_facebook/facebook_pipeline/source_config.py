@@ -45,6 +45,7 @@ _ALLOWED_WRITE_FIELDS = {
     "delogo",
     "platform",
     "is_active",
+    "hide_chrome",
     "extra_content",
 }
 
@@ -57,6 +58,7 @@ _PAGE_WRITE_FIELDS = {
     "delogo",
     "platform",
     "is_active",
+    "hide_chrome",
     "extra_content",
 }
 
@@ -71,6 +73,7 @@ _GROUP_WRITE_FIELDS = {
     "delogo",
     "platform",
     "is_active",
+    "hide_chrome",
     "extra_content",
 }
 
@@ -248,6 +251,7 @@ def normalize_page_source_record(source: Mapping[str, Any]) -> dict[str, Any]:
     result["source_type"] = SOURCE_TYPE_PAGE
     result["edit_mode"] = EDIT_MODE_FULL_AI
     result["max_videos_per_scan"] = DEFAULT_PAGE_MAX_VIDEOS_PER_SCAN
+    result["hide_chrome"] = bool(result.get("hide_chrome", False))
     return result
 
 
@@ -265,6 +269,7 @@ def normalize_group_source_record(source: Mapping[str, Any]) -> dict[str, Any]:
     result["max_videos_per_scan"] = normalize_max_videos(
         result.get("max_videos_per_scan")
     )
+    result["hide_chrome"] = bool(result.get("hide_chrome", False))
     return result
 
 
@@ -293,6 +298,14 @@ def _sanitize_common_fields(
         if not 0 <= max_age <= 24 * 30:
             raise ValueError("Max giờ phải từ 0 đến 720; 0 nghĩa là không giới hạn.")
         data["max_video_age_hours"] = max_age
+    if "hide_chrome" in data:
+        raw_hide_chrome = data["hide_chrome"]
+        if isinstance(raw_hide_chrome, str):
+            data["hide_chrome"] = raw_hide_chrome.strip().lower() in {
+                "1", "true", "yes", "on"
+            }
+        else:
+            data["hide_chrome"] = bool(raw_hide_chrome)
     return data
 
 
@@ -316,6 +329,7 @@ def sanitize_page_source_payload(
         data.setdefault("is_active", True)
         data.setdefault("scan_interval_min", 30)
         data.setdefault("max_video_age_hours", 48)
+        data.setdefault("hide_chrome", False)
     return data
 
 
@@ -347,6 +361,7 @@ def sanitize_group_source_payload(
         data.setdefault("is_active", True)
         data.setdefault("scan_interval_min", 30)
         data.setdefault("max_video_age_hours", 48)
+        data.setdefault("hide_chrome", False)
     return data
 
 

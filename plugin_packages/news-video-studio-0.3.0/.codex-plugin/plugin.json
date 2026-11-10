@@ -1,0 +1,22 @@
+{
+  "interface": {
+    "displayName": "News Video Studio",
+    "shortDescription": "Bài báo thành JSON video",
+    "longDescription": "Nhận bài báo tiếng Việt hoặc file đính kèm để tạo duy nhất News Video Production JSON v2 có timeline và brief stock thật cho HyperFrames.",
+    "developerName": "Long Bảo",
+    "category": "Productivity",
+    "capabilities": [],
+    "defaultPrompt": [
+      "Đính kèm file bài báo và tạo News Video Production JSON v2.",
+      "Tạo JSON video dọc 52 giây từ nội dung bài báo này.",
+      "Kiểm tra dữ kiện và tạo JSON sản xuất video có brief stock thật từ nội dung nguồn."
+    ],
+    "brandColor": "#D61F26"
+  },
+  "name": "news-video-studio",
+  "version": "0.3.0",
+  "description": "Chuyển bài báo tiếng Việt hoặc file bài báo thành News Video Production JSON v2 cho video dọc.",
+  "author": {"name": "Long Bảo", "email": "nguyenbaolong16869@gmail.com"},
+  "keywords": ["news", "video", "vietnamese", "json", "production", "hyperframes"],
+  "skills": "./skills"
+}

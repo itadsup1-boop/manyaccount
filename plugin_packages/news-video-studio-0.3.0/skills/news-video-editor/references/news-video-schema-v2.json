@@ -1,0 +1,31 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "News Video Production JSON v2",
+  "type": "object",
+  "required": ["schema_version", "input_status", "target", "render_spec", "rights_policy", "source", "fact_sheet", "assets", "stock_requests", "title_tiktok", "hook_variants", "selected_hook", "hook", "script_voice", "full_voice_over", "should_make_video", "tone", "music_mood", "music_energy", "is_sensitive", "beats", "retention_risks", "risk_flags"],
+  "properties": {
+    "schema_version": {"const": 2},
+    "input_status": {"enum": ["ready", "missing_article_text", "insufficient_source"]},
+    "target": {"type": "object", "required": ["duration_sec", "aspect_ratio", "language"], "properties": {"duration_sec": {"type": "number", "minimum": 45, "maximum": 70}, "aspect_ratio": {"const": "9:16"}, "language": {"const": "vi-VN"}}},
+    "render_spec": {"type": "object", "required": ["width", "height", "fps", "safe_area"], "properties": {"width": {"const": 1080}, "height": {"const": 1920}, "fps": {"const": 30}, "safe_area": {"type": "object", "required": ["top", "right", "bottom", "left"], "properties": {"top": {"const": 180}, "right": {"const": 72}, "bottom": {"const": 360}, "left": {"const": 72}}}}},
+    "rights_policy": {"type": "object", "required": ["mode", "publisher_assets_allowed", "logos_allowed", "watermark_removal_allowed", "ai_generated_assets_allowed"], "properties": {"mode": {"const": "facts_and_licensed_real_stock_only"}, "publisher_assets_allowed": {"const": false}, "logos_allowed": {"const": false}, "watermark_removal_allowed": {"const": false}, "ai_generated_assets_allowed": {"const": false}}},
+    "source": {"type": "object", "required": ["url", "publisher", "title", "published_at"], "properties": {"url": {"type": "string", "pattern": "^https?://[^\\s\\[\\]\\(\\)]+$"}, "publisher": {"type": "string"}, "title": {"type": "string"}, "published_at": {"type": "string"}}},
+    "fact_sheet": {"type": "object"},
+    "assets": {"type": "array", "description": "Chỉ các graphic original hoặc local asset đã được Tool Media cấp license sau này; không chèn URL của ảnh bài báo."},
+    "stock_requests": {"type": "array", "items": {"type": "object", "required": ["request_id", "beat_number", "asset_kind", "orientation", "search_query_en", "editorial_use", "must_avoid", "fallback"], "properties": {"request_id": {"type": "string"}, "beat_number": {"type": "integer", "minimum": 1}, "asset_kind": {"enum": ["photo", "video"]}, "orientation": {"const": "vertical_preferred"}, "search_query_en": {"type": "string", "minLength": 12}, "editorial_use": {"type": "string"}, "must_avoid": {"type": "array", "items": {"type": "string"}}, "fallback": {"type": "string"}}}},
+    "title_tiktok": {"type": "string"},
+    "hook_variants": {"type": "array", "minItems": 3, "maxItems": 3},
+    "selected_hook": {"type": "string"},
+    "hook": {"type": "string"},
+    "script_voice": {"type": "string"},
+    "full_voice_over": {"type": "string"},
+    "should_make_video": {"type": "boolean"},
+    "tone": {"type": "string"},
+    "music_mood": {"type": "string"},
+    "music_energy": {"type": "integer", "minimum": 1, "maximum": 3},
+    "is_sensitive": {"type": "boolean"},
+    "beats": {"type": "array", "minItems": 7, "maxItems": 9, "items": {"type": "object", "required": ["beat_number", "role", "start_sec", "end_sec", "voice_over", "source_fact_ids", "asset_ids", "visual_query", "visual_fallback", "on_screen_text", "motion", "transition", "sfx", "must_show"], "properties": {"beat_number": {"type": "integer"}, "role": {"type": "string"}, "start_sec": {"type": "number"}, "end_sec": {"type": "number"}, "voice_over": {"type": "string"}, "source_fact_ids": {"type": "array"}, "asset_ids": {"type": "array"}, "visual_query": {"type": "string", "minLength": 8}, "visual_fallback": {"type": "string", "minLength": 8}, "on_screen_text": {"type": "string"}, "motion": {"type": "string"}, "transition": {"type": "string"}, "sfx": {"type": "string"}, "must_show": {"type": "array"}}}},
+    "retention_risks": {"type": "array"},
+    "risk_flags": {"type": "array"}
+  }
+}

@@ -394,6 +394,72 @@ def dismiss_rate_limit_dialog(page) -> bool:
     return is_rate_limited_text(_blocking_dialog_text(page))
 
 
+WORK_MODE_SELECTORS = (
+    'button[class*="home-mode-toggle"][class*="col-start-2"]',
+    'button[class*="home-mode-toggle"]:has-text("Công việc")',
+    'button[class*="home-mode-toggle"]:has-text("Work")',
+    'button[class*="mode-toggle"]:has-text("Công việc")',
+    'button[class*="mode-toggle"]:has-text("Work")',
+    'button[aria-pressed]:has-text("Công việc")',
+    'button[aria-pressed]:has-text("Work")',
+    'button:has(span:text-is("Công việc"))',
+    'button:has(span:text-is("Work"))',
+)
+
+
+def ensure_work_mode_selected(page, timeout_seconds: float = 10.0) -> bool:
+    """Đảm bảo nút chế độ 'Công việc' / 'Work' (home-mode-toggle) được chọn khi mở ChatGPT."""
+    deadline = time.time() + max(1.0, float(timeout_seconds))
+    while True:
+        for selector in WORK_MODE_SELECTORS:
+            try:
+                locator = page.locator(selector)
+                if locator.count() == 0:
+                    continue
+                button = locator.first
+                if not button.is_visible(timeout=500):
+                    continue
+                aria_pressed = str(button.get_attribute("aria-pressed") or "").strip().lower()
+                if aria_pressed == "true":
+                    print("      💼 Chế độ 'Công việc' (Work) trên ChatGPT đã được bật sẵn.")
+                    return True
+
+                clicked = False
+                for click_attempt in range(3):
+                    try:
+                        if click_attempt == 0:
+                            button.click(timeout=5000)
+                        elif click_attempt == 1:
+                            button.click(timeout=5000, force=True)
+                        else:
+                            handle = button.element_handle(timeout=2000)
+                            if handle:
+                                page.evaluate("(el) => el.click()", handle)
+                        clicked = True
+                    except Exception:
+                        continue
+                    time.sleep(1.0)
+                    new_pressed = str(button.get_attribute("aria-pressed") or "").strip().lower()
+                    if new_pressed == "true":
+                        break
+
+                if clicked:
+                    time.sleep(1.5)
+                    final_pressed = str(button.get_attribute("aria-pressed") or "").strip().lower()
+                    print(
+                        f"      💼 Đã chọn chế độ 'Công việc' (Work) trên ChatGPT "
+                        f"(aria-pressed={final_pressed})."
+                    )
+                    return True
+            except Exception:
+                continue
+
+        if time.time() >= deadline:
+            return False
+        time.sleep(0.5)
+
+
+
 def remember_active_chat_url(page, fallback_url: str, timeout_seconds: int = 0) -> str:
     """Keep the exact conversation URL after ChatGPT creates the chat.
 
@@ -1154,6 +1220,7 @@ def analyze_video_with_chatgpt(
     experiment_content_key: str = "",
     edit_mode: str = "",
     whisper_transcript: str = "",
+    hide_chrome: bool = False,
 ) -> dict | None:
     """
     Tự động:
@@ -1253,7 +1320,8 @@ def analyze_video_with_chatgpt(
         )
 
     profile_label = get_chatgpt_profile_label(clean_id, is_tele_bot=is_tele_bot)
-    print(f"      🤖 Mở ChatGPT (Profile: {profile_label})...")
+    chrome_mode = "ẩn" if hide_chrome else "hiện"
+    print(f"      🤖 Mở ChatGPT (Profile: {profile_label} | Chrome: {chrome_mode})...")
 
     # Lấy lock riêng cho profile này – chặn worker thứ 2 mở cùng profile
     _profile_lock = _get_profile_lock(profile_dir)
@@ -1276,7 +1344,7 @@ def analyze_video_with_chatgpt(
         playwright = sync_playwright().start()
         launch_options = {
             "user_data_dir": profile_dir,
-            "headless": False,
+            "headless": bool(hide_chrome),
             "args": [
                 "--no-sandbox",
                 "--test-type",
@@ -1342,26 +1410,34 @@ def analyze_video_with_chatgpt(
                     time.sleep(RATE_LIMIT_RETRY_WAIT_SECONDS)
                     continue
 
+                ensure_work_mode_selected(page)
+
                 # Chờ ô nhập xuất hiện
                 try:
                     page.wait_for_selector("#prompt-textarea, [contenteditable='true']", timeout=45000)
                 except Exception:
-                    if is_cloudflare_challenge(page):
-                        print("      ❌ Cloudflare chặn! Cần login lại.")
-                        context.close()
-                        return None
-                    rate_limited = dismiss_rate_limit_dialog(page)
-                    if rate_limited:
-                        print(f"      ⏳ ChatGPT báo 'Too many requests' (lần {attempt}/{MAX_RATE_LIMIT_RETRIES}), "
-                              f"đã bấm Got it; nghỉ {RATE_LIMIT_RETRY_WAIT_SECONDS}s rồi tải lại đúng chat...")
-                    else:
-                        print(f"      🔄 Lần {attempt}/{MAX_RATE_LIMIT_RETRIES}: Chưa thấy ô chat, "
-                              f"tải lại đúng chat sau {RECOVERY_RELOAD_WAIT_SECONDS}s...")
-                    time.sleep(
-                        RATE_LIMIT_RETRY_WAIT_SECONDS
-                        if rate_limited else RECOVERY_RELOAD_WAIT_SECONDS
-                    )
-                    continue
+                    if ensure_work_mode_selected(page, timeout_seconds=3.0):
+                        try:
+                            page.wait_for_selector("#prompt-textarea, [contenteditable='true']", timeout=15000)
+                        except Exception:
+                            pass
+                    if page.locator("#prompt-textarea, [contenteditable='true']").count() == 0:
+                        if is_cloudflare_challenge(page):
+                            print("      ❌ Cloudflare chặn! Cần login lại.")
+                            context.close()
+                            return None
+                        rate_limited = dismiss_rate_limit_dialog(page)
+                        if rate_limited:
+                            print(f"      ⏳ ChatGPT báo 'Too many requests' (lần {attempt}/{MAX_RATE_LIMIT_RETRIES}), "
+                                  f"đã bấm Got it; nghỉ {RATE_LIMIT_RETRY_WAIT_SECONDS}s rồi tải lại đúng chat...")
+                        else:
+                            print(f"      🔄 Lần {attempt}/{MAX_RATE_LIMIT_RETRIES}: Chưa thấy ô chat, "
+                                  f"tải lại đúng chat sau {RECOVERY_RELOAD_WAIT_SECONDS}s...")
+                        time.sleep(
+                            RATE_LIMIT_RETRY_WAIT_SECONDS
+                            if rate_limited else RECOVERY_RELOAD_WAIT_SECONDS
+                        )
+                        continue
 
                 # Khi tải lại đúng chat sau một lần chờ, cuộn xuống đáy trước.
                 # Nếu ChatGPT đã hoàn tất JSON trong lúc reload thì lấy luôn,

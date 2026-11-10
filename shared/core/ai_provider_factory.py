@@ -69,6 +69,7 @@ def analyze_video_content(
     experiment_content_key: str = "",
     edit_mode: str = "",
     whisper_transcript: str = "",
+    hide_chrome: bool = False,
     enable_auto_fallback: bool = True,
 ) -> dict[str, Any] | None:
     """
@@ -91,6 +92,7 @@ def analyze_video_content(
             experiment_content_key=experiment_content_key,
             edit_mode=edit_mode,
             whisper_transcript=whisper_transcript,
+            hide_chrome=hide_chrome,
         )
         if not result:
             print("   ⚠️ Gemini không trả về kịch bản hợp lệ. Giữ nguyên lựa chọn Gemini (không mở ChatGPT)...")
@@ -107,6 +109,7 @@ def analyze_video_content(
             experiment_content_key=experiment_content_key,
             edit_mode=edit_mode,
             whisper_transcript=whisper_transcript,
+            hide_chrome=hide_chrome,
         )
         if not result and enable_auto_fallback:
             print("   ⚠️ ChatGPT gặp lỗi hoặc bận, tự động chuyển sang Gemini (Web/API) dự phòng...")
@@ -120,6 +123,7 @@ def analyze_video_content(
                 experiment_content_key=experiment_content_key,
                 edit_mode=edit_mode,
                 whisper_transcript=whisper_transcript,
+                hide_chrome=hide_chrome,
             )
 
     return result
@@ -134,6 +138,8 @@ def analyze_article_content(
     provider: str | None = None,
     enable_auto_fallback: bool = True,
     extra_content: str = "",
+    hide_chrome: bool = False,
+    article_data: dict[str, Any] | None = None,
 ) -> dict[str, Any] | None:
     """
     Hàm giao diện chung sinh kịch bản cho bài viết báo chí qua AI Provider được lựa chọn.
@@ -155,22 +161,29 @@ def analyze_article_content(
             repair_instruction=repair_instruction,
             source_type="article",
             experiment_content_key=article_url,
+            hide_chrome=hide_chrome,
         )
         if not result:
             print("   ⚠️ Gemini không trả về kịch bản cho bài viết. Giữ nguyên lựa chọn Gemini (không mở ChatGPT)...")
         return result
     else:
         if analyze_article_with_chatgpt:
+            merged_article_data = dict(article_data) if isinstance(article_data, dict) else {}
+            if article_title and not merged_article_data.get("title"):
+                merged_article_data["title"] = article_title
+            if article_content and not (
+                merged_article_data.get("clean_content") or merged_article_data.get("content")
+            ):
+                merged_article_data["clean_content"] = article_content
+            if article_url and not merged_article_data.get("source_url"):
+                merged_article_data["source_url"] = article_url
             result = analyze_article_with_chatgpt(
                 article_url=article_url,
                 id_tiktok=id_tiktok,
                 extra_content=extra_content,
                 repair_instruction=repair_instruction,
-                article_data={
-                    "title": article_title,
-                    "clean_content": article_content,
-                    "source_url": article_url,
-                },
+                hide_chrome=hide_chrome,
+                article_data=merged_article_data,
             )
         else:
             result = None
@@ -185,5 +198,6 @@ def analyze_article_content(
                 repair_instruction=repair_instruction,
                 source_type="article",
                 experiment_content_key=article_url,
+                hide_chrome=hide_chrome,
             )
         return result

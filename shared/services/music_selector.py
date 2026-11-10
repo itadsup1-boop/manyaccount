@@ -432,7 +432,10 @@ def build_ducked_mix_filter(
         f"volume={bed_gain}dB[{prefix}_bed];"
         f"[{prefix}_bed][{prefix}_side]sidechaincompress="
         f"threshold=0.08:ratio=4:attack=15:release=300[{prefix}_ducked];"
+        # Giữ toàn bộ voice khi nhánh BGM/sidechain có timestamp ngắn hơn.
+        # duration=first từng làm output audio bị cắt còn ~0.3s, khiến
+        # VideoQA đo loudness là -70 LUFS dù voice nguồn vẫn đầy đủ.
         f"[{prefix}_voice][{prefix}_ducked]amix="
-        f"inputs=2:duration=first:dropout_transition=0:normalize=0,"
+        f"inputs=2:duration=longest:dropout_transition=0:normalize=0,"
         f"loudnorm=I=-14:LRA=9:TP=-1.5[{out}]"
     )

@@ -235,6 +235,14 @@ export function useTikTokController() {
     }).then(() => fetchAccounts());
   };
 
+  const handleToggleHideChrome = (id: string, currentStatus: boolean) => {
+    fetch(`/api/tiktok/accounts/${id}`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ hide_chrome: !currentStatus })
+    }).then(() => fetchAccounts());
+  };
+
   const handleUpdateLimit = (id: string, limit: number) => {
     fetch(`/api/tiktok/accounts/${id}`, {
       method: 'PUT',
@@ -397,6 +405,7 @@ export function useTikTokController() {
     handleAddAccount,
     handleDeleteAccount,
     handleToggleActive,
+    handleToggleHideChrome,
     handleUpdateLimit,
     handleSelectProfileAccount,
     handleProfileDraftChange,

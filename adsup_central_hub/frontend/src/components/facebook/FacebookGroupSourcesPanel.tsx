@@ -15,6 +15,7 @@ type GroupSource = {
   max_video_age_hours?: number;
   max_videos_per_scan?: number;
   delogo?: string;
+  hide_chrome?: boolean;
 };
 
 type GroupSourceForm = {
@@ -25,6 +26,7 @@ type GroupSourceForm = {
   max_video_age_hours: number;
   max_videos_per_scan: number;
   delogo: string;
+  hide_chrome: boolean;
 };
 
 type Props = {
@@ -42,7 +44,8 @@ function emptyForm(): GroupSourceForm {
     edit_mode: FACEBOOK_GROUP_EDIT_MODE_HOOK,
     max_video_age_hours: 48,
     max_videos_per_scan: 5,
-    delogo: ''
+    delogo: '',
+    hide_chrome: false
   };
 }
 
@@ -93,7 +96,8 @@ export default function FacebookGroupSourcesPanel({ sources, auth, onRefresh, on
       edit_mode: String(source.edit_mode || FACEBOOK_GROUP_EDIT_MODE_HOOK),
       max_video_age_hours: source.max_video_age_hours ?? 48,
       max_videos_per_scan: source.max_videos_per_scan ?? 5,
-      delogo: String(source.delogo || '')
+      delogo: String(source.delogo || ''),
+      hide_chrome: !!source.hide_chrome
     });
   };
 
@@ -157,7 +161,17 @@ export default function FacebookGroupSourcesPanel({ sources, auth, onRefresh, on
             <label className="form-label">Tọa độ Delogo:</label>
             <input className="form-input" placeholder="x=683:y=231:w=280:h=85" value={form.delogo} onChange={event => setForm({ ...form, delogo: event.target.value })} />
           </div>
+          <div className="form-group">
+            <label className="form-label">Ẩn Chrome:</label>
+            <label style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', cursor: 'pointer', marginTop: '0.5rem' }}>
+              <input type="checkbox" checked={form.hide_chrome} onChange={event => setForm({ ...form, hide_chrome: event.target.checked })} />
+              <span>Chạy ngầm không hiển thị cửa sổ</span>
+            </label>
+          </div>
         </div>
+        <p style={{ color: 'var(--text-secondary)', marginTop: '0.5rem', fontSize: '0.8rem' }}>
+          Khi bật Ẩn Chrome, Chrome vẫn mở ChatGPT tạo kịch bản như bình thường nhưng chạy ẩn. Kênh cần đăng nhập ChatGPT trước rồi mới bật được.
+        </p>
 
         <div style={{ display: 'flex', gap: '0.75rem', marginTop: '1.5rem' }}>
           <button className="btn btn-primary" style={{ flex: 1, justifyContent: 'center' }} onClick={submit}>
@@ -184,6 +198,7 @@ export default function FacebookGroupSourcesPanel({ sources, auth, onRefresh, on
               <th style={{ padding: '0.5rem' }}>URL</th>
               <th style={{ padding: '0.5rem' }}>Số bài</th>
               <th style={{ padding: '0.5rem' }}>Max giờ</th>
+              <th style={{ padding: '0.5rem' }}>Ẩn Chrome</th>
               <th style={{ padding: '0.5rem' }}>Hành động</th>
             </tr></thead>
             <tbody>
@@ -195,13 +210,14 @@ export default function FacebookGroupSourcesPanel({ sources, auth, onRefresh, on
                   <td style={{ padding: '0.5rem', color: 'var(--info)' }}>{source.source_url}</td>
                   <td style={{ padding: '0.5rem' }}>{source.max_videos_per_scan ?? 5}</td>
                   <td style={{ padding: '0.5rem' }}>{source.max_video_age_hours ?? 48}</td>
+                  <td style={{ padding: '0.5rem' }}>{source.hide_chrome ? 'Có' : 'Không'}</td>
                   <td style={{ padding: '0.5rem', whiteSpace: 'nowrap' }}>
                     <button className="btn" style={{ background: 'transparent', color: 'var(--info)', padding: '0.25rem' }} onClick={() => edit(source)}><Pencil size={16} /></button>
                     <button className="btn" style={{ background: 'transparent', color: 'var(--danger)', padding: '0.25rem' }} onClick={() => remove(source.id)}><Trash2 size={16} /></button>
                   </td>
                 </tr>
               ))}
-              {sources.length === 0 && <tr><td colSpan={7} style={{ padding: '1rem', textAlign: 'center', color: 'var(--text-secondary)' }}>Chưa có nguồn Group.</td></tr>}
+              {sources.length === 0 && <tr><td colSpan={8} style={{ padding: '1rem', textAlign: 'center', color: 'var(--text-secondary)' }}>Chưa có nguồn Group.</td></tr>}
             </tbody>
           </table>
         </div>

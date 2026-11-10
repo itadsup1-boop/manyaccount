@@ -455,6 +455,7 @@ def analyze_video_with_gemini_web(
     experiment_content_key: str = "",
     edit_mode: str = "",
     whisper_transcript: str = "",
+    hide_chrome: bool = False,
 ) -> dict | None:
     """Tự động hóa Playwright trên gemini.google.com"""
     clean_id = sanitize_profile_id(profile_id)
@@ -550,11 +551,12 @@ def analyze_video_with_gemini_web(
         remove_profile_locks(profile_dir)
         mark_profile_exited_cleanly(profile_dir)
 
-        print(f"      🤖 Đang mở Gemini Web (Profile: {os.path.basename(profile_dir)})...")
+        chrome_mode = "ẩn" if hide_chrome else "hiện"
+        print(f"      🤖 Đang mở Gemini Web (Profile: {os.path.basename(profile_dir)} | Chrome: {chrome_mode})...")
         with sync_playwright() as p:
             context = p.chromium.launch_persistent_context(
                 user_data_dir=profile_dir,
-                headless=False,
+                headless=bool(hide_chrome),
                 args=[
                     "--no-sandbox",
                     "--disable-setuid-sandbox",
@@ -757,6 +759,7 @@ def analyze_video_with_gemini(
     experiment_content_key: str = "",
     edit_mode: str = "",
     whisper_transcript: str = "",
+    hide_chrome: bool = False,
 ) -> dict | None:
     """Hàm wrapper hỗ trợ thử Gemini Web trước, nếu thất bại thử Gemini API dự phòng."""
     print("   🤖 Kích hoạt AI Provider: GEMINI...")
@@ -770,6 +773,7 @@ def analyze_video_with_gemini(
         experiment_content_key=experiment_content_key,
         edit_mode=edit_mode,
         whisper_transcript=whisper_transcript,
+        hide_chrome=hide_chrome,
     )
     if res:
         return res

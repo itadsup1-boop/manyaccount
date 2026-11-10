@@ -1,7 +1,7 @@
 from fastapi import FastAPI, HTTPException, Query, Request, Form, File, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse, Response
+from fastapi.responses import FileResponse, Response, JSONResponse
 import os
 import json
 import time
@@ -25,6 +25,8 @@ from shared.core.performance_dashboard import (
 )
 from shared.core.quality_log import DEFAULT_QUALITY_LOG_PATH
 from shared.services.performance_store import DEFAULT_PERFORMANCE_DB
+from shared.core.locked_script import build_storyboard, validate_locked_script
+from adsup_central_hub.backend import production_jobs
 from adsup_central_hub.backend.facebook_auth import FacebookAuthManager
 from adsup_central_hub.backend.facebook_group_sources import (
     normalize_group_api_source,
@@ -395,6 +397,358 @@ def get_article_processed_links(limit: int = 300, search: str = ""):
     except Exception as e:
         return {"error": str(e)}
 
+@app.post("/api/article/import-production-json")
+async def import_production_json(
+    request: Request,
+    dry_run: bool = False,
+    channel_id: str = "",
+):
+    """Nhận JSON kịch bản khoá (Article JSON v1), validate và lưu job.
+
+    Body là chính object JSON. Sai schema trả 422 kèm danh sách lỗi, không
+    ghi gì xuống đĩa. ``dry_run=true`` chỉ validate + trả storyboard.
+    """
+    try:
+        payload = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Body phải là JSON hợp lệ.")
+    if not isinstance(payload, dict):
+        raise HTTPException(
+            status_code=400, detail="Body phải là một JSON object, không phải mảng/chuỗi."
+        )
+
+    clean_channel = str(channel_id or "").replace("@", "").strip()
+    if not clean_channel:
+        clean_channel = str(
+            payload.get("channel_id") or payload.get("id_tiktok") or ""
+        ).replace("@", "").strip()
+
+    profile = None
+    if clean_channel:
+        try:
+            profile = get_synced_content_profile(clean_channel)
+        except Exception:
+            profile = None
+
+    report = validate_locked_script(payload, profile=profile, channel_id=clean_channel)
+    storyboard = build_storyboard(payload, report=report)
+    from shared.core.evidence_gate import evaluate_evidence
+
+    evidence_gate = evaluate_evidence(
+        storyboard,
+        source_text=str(payload.get("source_text") or payload.get("source_excerpt") or ""),
+        source_url=str(payload.get("source_url") or ""),
+        profile=profile,
+    )
+    body = {
+        "ok": report.passed,
+        "validation": report.to_dict(),
+        "evidence_gate": evidence_gate.to_dict(),
+        "storyboard": storyboard,
+        "job_id": None,
+        "created": False,
+    }
+    if not report.passed:
+        return JSONResponse(status_code=422, content=body)
+    if dry_run:
+        return body
+
+    try:
+        job_id, created = production_jobs.save_job(
+            payload,
+            channel_id=clean_channel,
+            validation=report.to_dict(),
+            storyboard=storyboard,
+            status="imported" if evidence_gate.passed else "needs_review",
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Không lưu được job: {exc}")
+    return {**body, "job_id": job_id, "created": created}
+
+
+@app.get("/api/article/production-jobs")
+def list_production_jobs(limit: int = 50):
+    return {"items": production_jobs.list_jobs(limit=limit)}
+
+
+@app.get("/api/article/production-jobs/{job_id}")
+def get_production_job(job_id: str):
+    meta = production_jobs.load_job(job_id)
+    if meta is None:
+        raise HTTPException(status_code=404, detail="Không tìm thấy job.")
+    return {
+        "job": meta,
+        "validation": production_jobs.load_job_artifact(job_id, "validation") or {},
+        "storyboard": production_jobs.load_job_artifact(job_id, "storyboard") or {},
+    }
+
+
+@app.get("/api/article/production-jobs/{job_id}/storyboard")
+def get_production_job_storyboard(job_id: str):
+    storyboard = production_jobs.load_job_artifact(job_id, "storyboard")
+    if storyboard is None:
+        raise HTTPException(status_code=404, detail="Không tìm thấy job.")
+    return storyboard
+
+
+@app.get("/api/article/production-jobs/{job_id}/source.json")
+def get_production_job_source(job_id: str):
+    source = production_jobs.load_job_artifact(job_id, "source")
+    if source is None:
+        raise HTTPException(status_code=404, detail="Không tìm thấy job.")
+    return source
+
+
+@app.post("/api/article/production-jobs/{job_id}/media-plan")
+def create_production_job_media_plan(job_id: str):
+    """Tìm tư liệu Pexels cho từng beat và ghi media plan + manifest vào job."""
+    from apps.creator_article.media_planner import plan_media_for_job
+
+    meta = production_jobs.load_job(job_id)
+    if meta is None:
+        raise HTTPException(status_code=404, detail="Không tìm thấy job.")
+    if meta.get("passed") is False:
+        raise HTTPException(
+            status_code=409,
+            detail="Job bị chặn bởi validation — phải sửa JSON và import lại trước khi tìm tư liệu.",
+        )
+    try:
+        load_dotenv(ENV_FILE, override=True)
+        result = plan_media_for_job(job_id)
+    except ValueError as exc:
+        if str(exc) == "JOB_NOT_FOUND":
+            raise HTTPException(status_code=404, detail="Không tìm thấy job.")
+        raise HTTPException(status_code=422, detail=f"Storyboard không hợp lệ: {exc}")
+    except RuntimeError as exc:
+        if str(exc) in (
+            "SERPAPI_API_KEY_MISSING",
+            "UNSPLASH_ACCESS_KEY_MISSING",
+            "PEXELS_API_KEY_MISSING",
+            "PIXABAY_API_KEY_MISSING",
+        ):
+            raise HTTPException(
+                status_code=503,
+                detail=(
+                    "Chưa cấu hình nguồn tư liệu (SERPAPI_API_KEY, UNSPLASH_ACCESS_KEY, "
+                    "PIXABAY_API_KEY, PEXELS_API_KEY hoặc STOCK_PROVIDER=wikimedia trong .env) — không thể tìm tư liệu."
+                ),
+            )
+        raise HTTPException(status_code=502, detail=f"Lỗi tìm tư liệu: {exc}")
+
+    plan_status = str(result["plan"].get("status") or "")
+    job_status = {
+        "ready": "assets_ready",
+        "partial": "assets_partial",
+        "graphics_only": "graphics_only",
+    }.get(plan_status)
+    if job_status:
+        production_jobs.set_job_status(job_id, job_status)
+    return result
+
+
+@app.get("/api/article/production-jobs/{job_id}/media-plan")
+def get_production_job_media_plan(job_id: str):
+    plan = production_jobs.load_job_artifact(job_id, "media_plan")
+    if plan is None:
+        raise HTTPException(status_code=404, detail="Job chưa có media plan.")
+    return plan
+
+
+@app.get("/api/article/production-jobs/{job_id}/assets-manifest")
+def get_production_job_assets_manifest(job_id: str):
+    manifest = production_jobs.load_job_artifact(job_id, "assets_manifest")
+    if manifest is None:
+        raise HTTPException(status_code=404, detail="Job chưa có asset manifest.")
+    return {"items": manifest}
+
+
+def _block_graphics_only_render(job_id: str, *, allow_graphics_only: bool) -> None:
+    """Ngăn xuất nhầm video toàn card khi người dùng đang yêu cầu tư liệu thật."""
+
+    plan = production_jobs.load_job_artifact(job_id, "media_plan") or {}
+    if plan.get("status") == "graphics_only" and not allow_graphics_only:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Media plan hiện không có B-roll/ảnh thật. Sửa visual_query để có ít nhất "
+                "3 cảnh B-roll, kiểm tra PEXELS_API_KEY rồi bấm 'Tìm tư liệu' lại; hệ thống "
+                "đã chặn xuất video toàn chữ."
+            ),
+        )
+
+
+@app.post("/api/article/production-jobs/{job_id}/render-preview")
+def render_production_job_preview(job_id: str, allow_graphics_only: bool = False):
+    """Render preview KHÔNG voice từ media plan hiện có (renderer mới, Giai đoạn 3)."""
+    from apps.creator_article.video_renderer import render_preview
+
+    meta = production_jobs.load_job(job_id)
+    if meta is None:
+        raise HTTPException(status_code=404, detail="Không tìm thấy job.")
+    if meta.get("passed") is False:
+        raise HTTPException(
+            status_code=409,
+            detail="Job bị chặn bởi validation — phải sửa JSON và import lại trước khi render.",
+        )
+    _block_graphics_only_render(job_id, allow_graphics_only=allow_graphics_only)
+    try:
+        result = render_preview(job_id)
+    except ValueError as exc:
+        if str(exc).startswith("PROVENANCE_MISSING"):
+            raise HTTPException(
+                status_code=409,
+                detail="Asset không có provenance trong manifest — bấm 'Tìm tư liệu' lại trước khi render.",
+            )
+        messages = {
+            "JOB_NOT_FOUND": ("Không tìm thấy job.", 404),
+            "STORYBOARD_MISSING": ("Job chưa có storyboard.", 422),
+            "MEDIA_PLAN_MISSING": ("Job chưa có media plan — bấm 'Tìm tư liệu' trước khi render.", 422),
+            "RENDER_PLAN_EMPTY": ("Không có segment nào để render.", 422),
+        }
+        detail, code = messages.get(str(exc), (f"Không render được: {exc}", 422))
+        raise HTTPException(status_code=code, detail=detail)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+    report = result["report"]
+    production_jobs.set_job_status(job_id, "preview_ready")
+    return {
+        "ok": True,
+        "output": report["output"],
+        "mode": report["mode"],
+        "segment_count": report["segment_count"],
+        "total_planned_seconds": report["total_planned_seconds"],
+        "probe": report["probe"],
+        "warnings": report["warnings"],
+        "preview_url": f"/api/article/production-jobs/{job_id}/preview.mp4",
+    }
+
+
+@app.get("/api/article/production-jobs/{job_id}/preview.mp4")
+def get_production_job_preview_video(job_id: str):
+    from fastapi.responses import FileResponse
+
+    path = production_jobs.job_file_path(job_id, "preview.mp4")
+    if path is None:
+        raise HTTPException(status_code=404, detail="Job chưa có preview.mp4 — hãy render thử trước.")
+    return FileResponse(path, media_type="video/mp4", filename=f"preview_{job_id}.mp4")
+
+
+@app.post("/api/article/production-jobs/{job_id}/render-final")
+def render_production_job_final(job_id: str, allow_graphics_only: bool = False):
+    """Dựng final.mp4 hoàn chỉnh: TTS + phụ đề + BGM/SFX (Giai đoạn 4).
+
+    Lưu ý: gọi TTS voice.adsup.vn rồi encode lại toàn bộ video nên có thể mất
+    vài phút — frontend phải hiển thị trạng thái đang chạy và không gửi lại.
+    """
+    from apps.creator_article.final_video import render_final_video
+
+    meta = production_jobs.load_job(job_id)
+    if meta is None:
+        raise HTTPException(status_code=404, detail="Không tìm thấy job.")
+    if meta.get("passed") is False:
+        raise HTTPException(
+            status_code=409,
+            detail="Job bị chặn bởi validation — phải sửa JSON và import lại trước khi dựng.",
+        )
+    _block_graphics_only_render(job_id, allow_graphics_only=allow_graphics_only)
+    if meta.get("status") == "needs_review" and not meta.get("operator_approved"):
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Job đang chờ duyệt: số liệu/tin rủi ro chưa có evidence hợp lệ. "
+                "Bấm 'Duyệt' trên job (sau khi tự kiểm tra nguồn) để cho phép dựng."
+            ),
+        )
+    try:
+        result = render_final_video(job_id)
+    except ValueError as exc:
+        message = str(exc)
+        if message == "JOB_NOT_FOUND":
+            raise HTTPException(status_code=404, detail="Không tìm thấy job.")
+        if message == "STORYBOARD_MISSING":
+            raise HTTPException(status_code=422, detail="Job chưa có storyboard.")
+        if message == "MEDIA_PLAN_MISSING":
+            raise HTTPException(
+                status_code=422,
+                detail="Job chưa có media plan — bấm 'Tìm tư liệu' trước khi dựng video.",
+            )
+        if message.startswith("PROVENANCE_MISSING"):
+            raise HTTPException(
+                status_code=409,
+                detail="Asset không có provenance trong manifest — bấm 'Tìm tư liệu' lại trước khi dựng video.",
+            )
+        if message.startswith("QA_FAILED"):
+            production_jobs.set_job_status(job_id, "qa_failed")
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    "Video không đạt quality gate: "
+                    + message.split(": ", 1)[-1]
+                    + ". Chi tiết trong final_report.json (mục video_qa) của job."
+                ),
+            )
+        if message.startswith("TTS_FAILED"):
+            raise HTTPException(
+                status_code=502,
+                detail=(
+                    "Không tạo được voice từ voice.adsup.vn — video bị chặn thay vì xuất thiếu "
+                    "câu mở đầu/kết. Kiểm tra VOICEBOX_API_KEY rồi thử lại. "
+                    + message.split(": ", 1)[-1]
+                ),
+            )
+        raise HTTPException(status_code=422, detail=f"Không dựng được: {message}")
+    except RuntimeError as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+    report = result["report"]
+    production_jobs.set_job_status(job_id, "final_ready")
+    return {
+        "ok": True,
+        "output": report["output"],
+        "mode": report["mode"],
+        "segment_count": report["segment_count"],
+        "voice": report["voice"],
+        "bgm": report["bgm"],
+        "subtitle": report["subtitle"],
+        "sfx_count": report["sfx_count"],
+        "probe": report["probe"],
+        "video_qa": report.get("video_qa"),
+        "warnings": report["warnings"],
+        "final_url": f"/api/article/production-jobs/{job_id}/final.mp4",
+    }
+
+
+@app.get("/api/article/production-jobs/{job_id}/final.mp4")
+def get_production_job_final_video(job_id: str):
+    from fastapi.responses import FileResponse
+
+    path = production_jobs.job_file_path(job_id, "final.mp4")
+    if path is None:
+        raise HTTPException(status_code=404, detail="Job chưa có final.mp4 — hãy bấm 'Dựng video' trước.")
+    return FileResponse(path, media_type="video/mp4", filename=f"final_{job_id}.mp4")
+
+
+@app.post("/api/article/production-jobs/{job_id}/approve")
+def approve_production_job(job_id: str):
+    """Operator duyệt job đang needs_review (evidence đã tự kiểm tra bằng tay)."""
+    from datetime import datetime, timezone
+
+    meta = production_jobs.load_job(job_id)
+    if meta is None:
+        raise HTTPException(status_code=404, detail="Không tìm thấy job.")
+    media_plan = production_jobs.load_job_artifact(job_id, "media_plan") or {}
+    plan_status = str(media_plan.get("status") or "")
+    status_map = {"ready": "assets_ready", "partial": "assets_partial", "graphics_only": "graphics_only"}
+    restored = status_map.get(plan_status, "imported")
+    meta = production_jobs.set_job_status(job_id, restored) or meta
+    meta["operator_approved"] = True
+    meta["approved_at"] = datetime.now(timezone.utc).isoformat()
+    directory = production_jobs._safe_job_dir(job_id)
+    production_jobs._atomic_write_json(os.path.join(directory, "job.json"), meta)
+    return {"ok": True, "status": meta.get("status"), "operator_approved": True}
+
+
 @app.get("/api/article/config/{channel_id}")
 def get_channel_config(channel_id: str):
     import json
@@ -594,7 +948,7 @@ async def add_facebook_source(request: Request):
         return {"error": str(e)}
 
 @app.put("/api/facebook/sources/{source_id}")
-async def update_facebook_source(source_id: int, request: Request):
+async def update_facebook_source(source_id: str, request: Request):
     if not supabase_client: return {"error": "Supabase not initialized"}
     try:
         data = prepare_api_source_payload(await request.json(), partial=True)
@@ -606,7 +960,7 @@ async def update_facebook_source(source_id: int, request: Request):
         return {"error": str(e)}
 
 @app.delete("/api/facebook/sources/{source_id}")
-def delete_facebook_source(source_id: int):
+def delete_facebook_source(source_id: str):
     if not supabase_client: return {"error": "Supabase not initialized"}
     try:
         res = supabase_client.table("facebook_sources").delete().eq("id", source_id).execute()
@@ -630,7 +984,7 @@ async def add_facebook_group_source(request: Request):
 
 
 @app.put("/api/facebook/group-sources/{source_id}")
-async def update_facebook_group_source(source_id: int, request: Request):
+async def update_facebook_group_source(source_id: str, request: Request):
     if not supabase_client:
         return {"error": "Supabase not initialized"}
     try:
@@ -651,7 +1005,7 @@ async def update_facebook_group_source(source_id: int, request: Request):
 
 
 @app.delete("/api/facebook/group-sources/{source_id}")
-def delete_facebook_group_source(source_id: int):
+def delete_facebook_group_source(source_id: str):
     if not supabase_client:
         return {"error": "Supabase not initialized"}
     try:
