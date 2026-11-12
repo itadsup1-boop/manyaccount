@@ -142,7 +142,7 @@ def insert_video_record(
             "facebook_video_id": video.get("video_id"),
             "original_url": video["url"],
             "caption": video.get("caption", "")[:500],
-            "status": "uploaded",
+            "status": "completed",
             "file_hash": download.get("hash"),
             "file_size_bytes": download.get("size"),
             "downloaded_path": download.get("path"),
@@ -181,7 +181,7 @@ def claim_video_record(
                 "facebook_video_id": video_id,
                 "original_url": video.get("url", ""),
                 "caption": video.get("caption", "")[:500],
-                "status": "processing",
+                "status": "completed",
             }
         ).execute()
     except Exception as error:
@@ -209,7 +209,7 @@ def finalize_video_record(
         client.table(video_table_for(source))
         .update(
             {
-                "status": "uploaded",
+                "status": "completed",
                 "file_hash": download.get("hash"),
                 "file_size_bytes": download.get("size"),
                 "downloaded_path": download.get("path"),

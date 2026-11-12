@@ -253,7 +253,11 @@ class TeleBotConfigApp(ctk.CTk):
                 self.log(f"❌ Lỗi: ID Kênh '{c_id}' đã tồn tại! Hãy dùng tab Sửa.")
                 return
 
+            # Giữ các key không có trên form (force_full_frame, upload_group,
+            # tool_tk_channel) thay vì ghi đè mất cấu hình đã lưu.
+            base_channel = dict(self.channels.get(c_id) or {})
             self.channels[c_id] = {
+                **base_channel,
                 "name": c_name,
                 "title_frame_path": widgets["title_frame_var"].get().strip(),
                 "content_frame_path": widgets["content_frame_var"].get().strip(),

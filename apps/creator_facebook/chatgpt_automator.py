@@ -74,8 +74,11 @@ from shared.core.experiment_manager import apply_experiment_metadata
 from shared.core.prompt_builder import build_prompt, resolve_prompt_experiment
 from shared.core.chatgpt_logger import save_chatgpt_log
 from apps.creator_facebook.facebook_pipeline.hook_mode import build_hook_prompt
+from apps.creator_facebook.facebook_pipeline.title_mode import build_title_only_prompt
 from apps.creator_facebook.facebook_pipeline.source_config import (
     EDIT_MODE_HOOK_THEN_ORIGINAL,
+    EDIT_MODE_TITLE_ONLY,
+    EDIT_MODE_TITLE_SCRIPT,
 )
 
 APP_DIR = PROJECT_ROOT
@@ -1299,6 +1302,15 @@ def analyze_video_with_chatgpt(
             extra_content=extra_content,
             repair_instruction=repair_instruction,
         )
+    elif edit_mode == EDIT_MODE_TITLE_ONLY:
+        # Mode chỉ viết lại tiêu đề: prompt ngắn, JSON nhỏ, không sinh script.
+        experiment_assignment = None
+        full_prompt = build_title_only_prompt(
+            caption=caption,
+            channel_id=clean_id,
+            extra_content=extra_content,
+            repair_instruction=repair_instruction,
+        )
     else:
         experiment_assignment = resolve_prompt_experiment(
             clean_id,
@@ -1309,6 +1321,23 @@ def analyze_video_with_chatgpt(
             ),
             task_input=task_input,
         )
+        # Mode 4: nguồn ngắn không được làm cớ bỏ script — thân video sẽ
+        # được lặp phần cuối để đủ voice, nên kịch bản chỉ cần ngắn gọn.
+        title_script_override = ""
+        if edit_mode == EDIT_MODE_TITLE_SCRIPT:
+            title_script_override = (
+                "MODE SỬA TIÊU ĐỀ + KỊCH BẢN — BẮT BUỘC CÓ KỊCH BẢN:\n"
+                "- Viết script_voice đầy đủ, TUYỆT ĐỐI KHÔNG để trống và KHÔNG "
+                "được từ chối với lý do 'nguồn ngắn', 'không đủ căn cứ cho bản "
+                "tin 50-55 giây' hoặc tương tự. Quy tắc thời lượng 50-55 giây "
+                "KHÔNG áp dụng cho mode này.\n"
+                "- Độ dài kịch bản linh hoạt theo độ dày thông tin của nguồn: "
+                "khoảng 60-120 từ. Thân video sẽ được lặp lại phần cuối để đủ "
+                "tiếng nên không cần lo kịch bản dài hơn video.\n"
+                "- Chỉ kể đúng những gì video/caption cho thấy; vật liệu ít thì "
+                "viết gọn nhưng vẫn đủ Mở đầu - Thân bài - Kết thúc.\n"
+                "- should_make_video bắt buộc là true vì người dùng đã duyệt video."
+            )
         full_prompt = build_prompt(
             prompt_text,
             clean_id,
@@ -1317,16 +1346,23 @@ def analyze_video_with_chatgpt(
             repair_instruction=repair_instruction,
             operator_profiles=(extra_content,) if extra_content else (),
             experiment_assignment=experiment_assignment,
+            edit_mode_override=title_script_override,
         )
 
     profile_label = get_chatgpt_profile_label(clean_id, is_tele_bot=is_tele_bot)
     chrome_mode = "ẩn" if hide_chrome else "hiện"
     print(f"      🤖 Mở ChatGPT (Profile: {profile_label} | Chrome: {chrome_mode})...")
 
-    # Lấy lock riêng cho profile này – chặn worker thứ 2 mở cùng profile
+    # Lấy lock riêng cho profile này – chặn worker thứ 2 mở cùng profile.
+    # Job Telegram là tương tác (người dùng đang chờ) nên chờ lock lâu hơn
+    # nguồn chạy nền, tránh hỏng video chỉ vì phiên ChatGPT khác chưa xong.
+    lock_timeout = 600 if is_tele_bot else 300
     _profile_lock = _get_profile_lock(profile_dir)
-    if not _profile_lock.acquire(blocking=True, timeout=300):
-        print("      ❌ Không thể lấy profile lock sau 5 phút – bỏ qua video này.")
+    if not _profile_lock.acquire(blocking=True, timeout=lock_timeout):
+        print(
+            f"      ❌ Không thể lấy profile lock sau {lock_timeout // 60} phút "
+            f"– bỏ qua video này."
+        )
         return None
 
     playwright = None

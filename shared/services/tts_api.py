@@ -138,6 +138,8 @@ def create_voice_full_pipeline(
     }
 
     print(f"🚀 Đang gửi yêu cầu sinh giọng từ xa tới {url} với voice_id={profile_id}...", flush=True)
+    last_status = None
+    last_error = ""
     for attempt in range(1, 4):
         try:
             # Reuse the same key for every retry so the server does not render
@@ -151,6 +153,8 @@ def create_voice_full_pipeline(
             )
             if response.status_code != 200:
                 print(f"⚠️ Thử lần {attempt}/3 thất bại ({response.status_code}): {response.text[:200]}", flush=True)
+                last_status = response.status_code
+                last_error = response.text[:200]
                 response.close()
                 if response.status_code in {401, 402, 409, 422}:
                     break
@@ -178,6 +182,8 @@ def create_voice_full_pipeline(
                             f"(duration={duration:.2f}s); sẽ gọi lại.",
                             flush=True,
                         )
+                        last_status = response.status_code
+                        last_error = f"TTS trả audio bị cụt (duration={duration:.2f}s, tối thiểu {minimum_duration:.2f}s)"
                         try:
                             os.remove(part_path)
                         except OSError:
@@ -189,11 +195,18 @@ def create_voice_full_pipeline(
                             f"({duration:.2f}s)",
                             flush=True,
                         )
+                        try:
+                            from shared.services.tele_reporter import notify_tts_recovered
+                            notify_tts_recovered()
+                        except Exception:
+                            pass
                         return save_path
                 finally:
                     response.close()
         except Exception as e:
             print(f"⚠️ Thử lần {attempt}/3 lỗi kết nối: {e}", flush=True)
+            last_status = None
+            last_error = str(e)
             try:
                 if os.path.exists(part_path):
                     os.remove(part_path)
@@ -203,6 +216,11 @@ def create_voice_full_pipeline(
             time.sleep(2 * attempt)
 
     print(f"❌ Cả 3 lần gọi API TTS tới {url} đều thất bại.", flush=True)
+    try:
+        from shared.services.tele_reporter import notify_tts_failure
+        notify_tts_failure(last_error or "Không gọi được API TTS sau 3 lần thử", last_status)
+    except Exception:
+        pass
     return None
 
 

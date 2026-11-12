@@ -52,6 +52,14 @@ class ArticleCrawler:
         "comment", "social", "share", "newsletter", "subscribe", "cookie",
         "popup", "modal", "login", "pagination", "tag-list",
     )
+    # Ảnh trang trí/không liên quan thường nhận diện được ngay từ URL.
+    _JUNK_IMAGE_URL_PATTERNS = (
+        "logo", "icon", "avatar", "/thumb", "banner", "/ads", "ads/",
+        "quangcao", "quang-cao", "adserver", "sponsor", "newsletter",
+        "placeholder", "no-image", "noimage", "loading.", "doubleclick",
+        "googlesyndication",
+    )
+    _THUMB_DIMENSIONS_RE = re.compile(r"(\d{2,4})x(\d{2,4})")
 
     def __init__(self):
         # Tránh bị web báo chặn chặn Bot
@@ -78,6 +86,44 @@ class ArticleCrawler:
             if container:
                 return container
         return soup
+
+    @classmethod
+    def _in_noise_block(cls, img) -> bool:
+        """True nếu ảnh nằm trong khối có dấu hiệu sidebar/ads/bài liên quan."""
+        depth = 0
+        for ancestor in img.parents:
+            name = getattr(ancestor, "name", None)
+            if not name or name in ("html", "body", "[document]"):
+                break
+            if depth >= 6:
+                break
+            depth += 1
+            if cls._is_noise_element(ancestor):
+                return True
+        return False
+
+    @classmethod
+    def _is_tiny_thumbnail_url(cls, lower_src: str) -> bool:
+        """Thumbnail thường kèm kích thước trong URL (vd _120x90.jpg, 74x50.png)."""
+        for match in cls._THUMB_DIMENSIONS_RE.finditer(lower_src):
+            width = int(match.group(1))
+            height = int(match.group(2))
+            if 1 <= width <= 320 and 1 <= height <= 320:
+                return True
+        return False
+
+    @classmethod
+    def _near_body_text(cls, img, minimum_length: int = 60) -> bool:
+        """Ảnh đáng tin khi khối chứa nó (trong vòng 3 cấp) có đoạn văn dài."""
+        block = img.find_parent(["figure", "td", "div", "section", "article"])
+        for _ in range(3):
+            if block is None:
+                return False
+            for p in block.find_all("p", limit=12):
+                if len(p.get_text(" ", strip=True)) >= minimum_length:
+                    return True
+            block = block.find_parent(["figure", "td", "div", "section", "article"])
+        return False
 
     @staticmethod
     def _fetch_rendered_html(url, timeout_ms=20000):
@@ -246,15 +292,29 @@ class ArticleCrawler:
             if not img_urls:
                 # Tìm khu vực chứa nội dung chính của bài viết để tránh lấy nhầm ảnh sidebar, quảng cáo
                 article_container = self._article_container(soup)
-                                    
+                whole_page_fallback = article_container is soup
+
                 # Bắt cả src, data-src và data-original (vì nhiều trang báo dùng lazy load, đặc biệt 24h dùng data-original)
                 for img in article_container.find_all("img"):
                     src = img.get("data-original") or img.get("data-src") or img.get("src")
-                    if src and src.startswith("http"):
-                        # Loại bỏ các ảnh logo, icon, avatar (dựa vào từ khóa thường thấy)
-                        if any(x in src.lower() for x in ['logo', 'icon', 'avatar', '/thumb/']):
-                            continue
-                        img_urls.append(src)
+                    if not src or not src.startswith("http"):
+                        continue
+                    lower_src = src.lower()
+                    # Loại bỏ ảnh logo/icon/banner quảng cáo và thumbnail có
+                    # kích thước bé in ngay trong URL (vd _120x90.jpg, 74x50.png)
+                    if any(x in lower_src for x in self._JUNK_IMAGE_URL_PATTERNS):
+                        continue
+                    if self._is_tiny_thumbnail_url(lower_src):
+                        continue
+                    # Bỏ qua ảnh nằm trong khối sidebar/ads/bài liên quan
+                    if self._in_noise_block(img):
+                        continue
+                    if whole_page_fallback and not self._near_body_text(img):
+                        # Không định vị được khung bài viết: chỉ nhận ảnh đứng
+                        # cạnh đoạn văn dài, tránh banner/thumb "tin nổi bật"
+                        # xuất hiện y nguyên ở mọi trang của site.
+                        continue
+                    img_urls.append(src)
             
             # Xóa trùng lặp và chỉ lấy tối đa 5-7 ảnh đầu tiên của bài báo
             img_urls = list(dict.fromkeys(img_urls))[:7]

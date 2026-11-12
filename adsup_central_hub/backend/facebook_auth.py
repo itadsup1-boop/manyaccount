@@ -31,8 +31,10 @@ class FacebookAuthManager:
         entrypoint = (
             self.project_root / "apps" / "creator_facebook" / "fb_crawler.py"
         )
+        # "browse" giữ cửa sổ mở tới khi người dùng tự đóng; "login" cũ sẽ tự
+        # đóng ngay khi cookie c_user còn hạn — cửa sổ chớp lên rồi tắt.
         self.process = subprocess.Popen(
-            [sys.executable, str(entrypoint), "login"],
+            [sys.executable, str(entrypoint), "browse"],
             cwd=str(self.project_root),
             env=os.environ.copy(),
             stdout=subprocess.DEVNULL,

@@ -803,6 +803,24 @@ def run_worker_process(account_id):
                 if update_final_result(sheet_url, row_data['row'], drv_link):
                     ctx.logger.info("   ✅ HOÀN TẤT!")
 
+                    # Gửi tool_tk đăng NGAY qua direct-upload (không warmup).
+                    # Lỗi webhook không ảnh hưởng worker: tool_tk còn đường
+                    # dự phòng quét Sheet chu kỳ 10 phút.
+                    try:
+                        try:
+                            from services.tool_tk_webhook import notify_new_video
+                        except ImportError:
+                            from shared.services.tool_tk_webhook import notify_new_video
+                        if notify_new_video(
+                            channel_id=account_id,
+                            row_index=row_data['row'],
+                            title=row_data["title_text"],
+                            drive_link=drv_link,
+                        ):
+                            ctx.logger.info("   📮 Đã gửi tool_tk đăng ngay.")
+                    except Exception as tooltk_err:
+                        ctx.logger.warning(f"⚠️ ToolTK webhook bỏ qua: {tooltk_err}")
+
                     ctx.remove_pending_result(vid_url, row_data["row"])
                     if preserved_path and os.path.exists(preserved_path):
                         os.remove(preserved_path)

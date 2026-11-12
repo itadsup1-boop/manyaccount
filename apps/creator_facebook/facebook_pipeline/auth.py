@@ -148,3 +148,65 @@ def login_facebook_interactive(timeout_seconds: int = 600) -> dict[str, Any]:
     except Timeout as exc:
         raise RuntimeError("Một crawler hoặc cửa sổ đăng nhập Facebook khác đang chạy.") from exc
     raise RuntimeError("Chưa phát hiện đăng nhập Facebook hoặc đã hết thời gian chờ.")
+
+
+def open_facebook_browse() -> dict[str, Any]:
+    """Mở cửa sổ Facebook giữ mở tới khi người dùng tự đóng.
+
+    Khác ``login_facebook_interactive`` (đóng ngay khi bắt được cookie c_user —
+    khiến cửa sổ chớp lên rồi tắt nếu phiên còn hạn), cửa sổ này dùng để xem/
+    thao tác Facebook: giữ phiên hiện có, và nếu người dùng đăng nhập trong cửa
+    sổ thì phiên được lưu cho crawler. Chỉ giữ lock phiên trong lúc ghi cookie
+    để không chặn crawler pipeline chạy song song.
+    """
+
+    from playwright.sync_api import sync_playwright
+
+    COOKIE_DIR.mkdir(parents=True, exist_ok=True)
+    save_lock = FileLock(str(SESSION_LOCK_PATH))
+
+    def _has_session_cookie(context: Any) -> bool:
+        try:
+            cookies = context.cookies("https://www.facebook.com/")
+        except Exception:
+            return False
+        return any(cookie.get("name") == "c_user" for cookie in cookies)
+
+    def _save_session(context: Any) -> None:
+        try:
+            with save_lock.acquire(timeout=5):
+                save_browser_storage(context)
+            print(f"✅ Đã lưu phiên Facebook: {STORAGE_STATE_PATH}")
+        except Timeout:
+            print("   ⚠️ Lock phiên đang bận — bỏ lượt lưu cookie này.")
+        except Exception as exc:
+            print(f"   ⚠️ Lưu phiên Facebook lỗi: {exc}")
+
+    print("🌐 Mở trình duyệt Facebook (giữ mở đến khi bạn tự đóng cửa sổ)...")
+    with sync_playwright() as playwright:
+        browser = playwright.chromium.launch(**chromium_launch_options(headless=False))
+        context = browser.new_context(**browser_context_options())
+        page = context.new_page()
+        page.goto("https://www.facebook.com/", wait_until="domcontentloaded")
+        saved_logged = False
+        while True:
+            try:
+                pages = context.pages
+            except Exception:
+                break
+            if not pages or all(item.is_closed() for item in pages):
+                break
+            logged_in = _has_session_cookie(context)
+            if logged_in and not saved_logged:
+                _save_session(context)
+                saved_logged = True
+            elif not logged_in:
+                saved_logged = False
+            time.sleep(2)
+        if _has_session_cookie(context):
+            _save_session(context)
+        try:
+            browser.close()
+        except Exception:
+            pass
+    return facebook_login_status()

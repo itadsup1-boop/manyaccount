@@ -181,7 +181,7 @@ export default function ToolFacebook() {
       })
       .then(() => {
         setFacebookAuth((current: any) => ({ ...current, login_running: true }));
-        alert('Đã mở cửa sổ Facebook trên máy chạy Hub. Hãy đăng nhập trong cửa sổ đó.');
+        alert('Đã mở cửa sổ Facebook trên máy chạy Hub. Cửa sổ giữ mở đến khi bạn tự đóng; nếu chưa đăng nhập hãy đăng nhập trong đó, phiên sẽ được lưu tự động.');
       })
       .catch(error => alert(`Không mở được Facebook: ${error}`));
   };

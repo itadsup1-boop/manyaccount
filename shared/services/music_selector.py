@@ -413,9 +413,11 @@ def build_ducked_mix_filter(
     # sidechaincompress dừng sớm (~mất 3 giây cuối, voice ngắn còn ~0.1s) nếu
     # một trong hai đầu vào của nó từng đi qua loudnorm/dynaudnorm: bộ chuẩn
     # hoá động phát frame không đều khiến cặp main/sidechain mất đồng bộ.
-    # Vì vậy tách bản voice THÔ cho sidechain, loudnorm chỉ đứng sau khi đã
-    # tách; bed chỉnh mức bằng gain tĩnh đo trước (bed_gain_db) thay vì
-    # loudnorm trong graph.
+    # Ngày 2026-10-16 xác nhận thêm: loudnorm trên nhánh voice CHÍNH (trước
+    # amix) trong cùng graph cũng đủ khiến sidechaincompress EOF ở ~0.4s dù
+    # sidechain nhận voice thô — audio intro chỉ còn tiếng 0.3-0.4s đầu.
+    # Vì vậy voice giữ nguyên mức (TTS server đã chuẩn hoá), chỉ áp gain tĩnh
+    # qua volume; loudnorm duy nhất đứng sau amix.
     bed_gain = (
         f"{selection.bed_gain_db:.2f}"
         if selection.bed_gain_db is not None
@@ -424,7 +426,7 @@ def build_ducked_mix_filter(
     return (
         f"[{voice}]aformat=sample_rates=48000:channel_layouts=stereo,"
         f"asplit=2[{prefix}_voicemix][{prefix}_side];"
-        f"[{prefix}_voicemix]loudnorm=I=-16:LRA=7:TP=-2[{prefix}_voice];"
+        f"[{prefix}_voicemix]volume=0dB[{prefix}_voice];"
         f"[{bgm}]aformat=sample_rates=48000:channel_layouts=stereo,"
         f"atrim=start={cue:.3f}:duration={duration:.3f},asetpts=PTS-STARTPTS,"
         f"afade=t=in:st=0:d={min(0.2, duration / 4):.3f},"

@@ -1,5 +1,6 @@
 import os
 import json
+import time
 import requests
 from datetime import datetime
 from shared.services.supabase_api import SupabaseAPI
@@ -10,6 +11,79 @@ FAILURE_STATS_FILE = os.path.join(
     PROJECT_ROOT, "assets", "temp_downloads", "pipeline_failures.json"
 )
 MACHINE_FILE = os.path.join(PROJECT_ROOT, "config", "local_machine.json")
+TTS_ALERT_STATE_FILE = os.path.join(
+    PROJECT_ROOT, "assets", "temp_downloads", "tts_alert_state.json"
+)
+TTS_ALERT_COOLDOWN_SECONDS = 30 * 60
+
+
+def send_bot_message(text):
+    """Gửi tin qua bot báo cáo (@matrix_baocao_bot) tới các chat ID cấu hình."""
+    try:
+        settings = SupabaseAPI.get_system_config("app_settings") or {}
+    except Exception:
+        return False
+    token = settings.get("tele_token")
+    chat_id = settings.get("tele_chatid")
+    if not token or not chat_id:
+        return False
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    sent = False
+    for cid in [c.strip() for c in str(chat_id).split(',') if c.strip()]:
+        try:
+            res = requests.post(url, json={"chat_id": cid, "text": text, "parse_mode": "HTML"}, timeout=15)
+            if res.status_code == 200:
+                sent = True
+        except Exception:
+            pass
+    return sent
+
+
+def notify_tts_failure(detail, status_code=None):
+    """Đẩy cảnh báo TTS chết qua bot báo cáo; tối đa 1 tin / 30 phút cho cùng mã lỗi."""
+    state = {}
+    if os.path.exists(TTS_ALERT_STATE_FILE):
+        try:
+            with open(TTS_ALERT_STATE_FILE, "r", encoding="utf-8") as f:
+                state = json.load(f)
+        except (OSError, json.JSONDecodeError):
+            state = {}
+    now = time.time()
+    try:
+        last_sent = float(state.get("last_alert_ts") or 0)
+    except (TypeError, ValueError):
+        last_sent = 0
+    if now - last_sent < TTS_ALERT_COOLDOWN_SECONDS and state.get("last_status") == status_code:
+        return False
+    msg = (
+        "🔴 <b>LỖI TTS (voice.adsup.vn)</b>\n"
+        f"Mã lỗi: {status_code or 'không xác định'}\n"
+        f"Chi tiết: {str(detail or '')[:300]}\n\n"
+        "Pipeline sẽ tạm dừng các video cần voice tới khi server sống lại."
+    )
+    if send_bot_message(msg):
+        try:
+            os.makedirs(os.path.dirname(TTS_ALERT_STATE_FILE), exist_ok=True)
+            with open(TTS_ALERT_STATE_FILE, "w", encoding="utf-8") as f:
+                json.dump({"last_alert_ts": now, "last_status": status_code or "unknown"}, f)
+        except OSError:
+            pass
+        return True
+    return False
+
+
+def notify_tts_recovered():
+    """Báo TTS đã hoạt động trở lại nếu trước đó từng gửi cảnh báo."""
+    if not os.path.exists(TTS_ALERT_STATE_FILE):
+        return
+    send_bot_message(
+        "🟢 <b>TTS (voice.adsup.vn) đã hoạt động trở lại</b> — pipeline có thể chạy bình thường."
+    )
+    try:
+        os.remove(TTS_ALERT_STATE_FILE)
+    except OSError:
+        pass
+
 
 class TeleReporter:
     @staticmethod

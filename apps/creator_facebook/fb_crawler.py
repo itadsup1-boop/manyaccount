@@ -7,7 +7,7 @@ không tiếp tục phình to.
 
 from __future__ import annotations
 
-from facebook_pipeline.auth import login_facebook_interactive
+from facebook_pipeline.auth import login_facebook_interactive, open_facebook_browse
 from facebook_pipeline.crawler import crawl_facebook_videos
 from facebook_pipeline.source_config import build_crawl_url, extract_video_id
 
@@ -30,8 +30,10 @@ if __name__ == "__main__":
 
     if len(sys.argv) > 1 and sys.argv[1] == "login":
         print(json.dumps(login_facebook_interactive(), ensure_ascii=False, indent=2))
+    elif len(sys.argv) > 1 and sys.argv[1] == "browse":
+        print(json.dumps(open_facebook_browse(), ensure_ascii=False, indent=2))
     elif len(sys.argv) > 1:
         results = crawl_facebook_videos(sys.argv[1])
         print(f"\n📊 Tổng: {len(results)} video")
     else:
-        print("Dùng: python3 fb_crawler.py login | <URL Facebook>")
+        print("Dùng: python3 fb_crawler.py login | browse | <URL Facebook>")

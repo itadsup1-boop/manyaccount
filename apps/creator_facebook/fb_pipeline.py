@@ -78,6 +78,7 @@ from shared.modules.subtitle_renderer import (
 from fb_crawler import crawl_facebook_videos
 from fb_downloader import download_video
 from facebook_pipeline.hook_mode import prepare_hook_content
+from facebook_pipeline.title_mode import prepare_title_only_content
 from facebook_pipeline.group_review import stage_group_review
 from facebook_pipeline.source_repository import (
     claim_video_record,
@@ -91,10 +92,17 @@ from facebook_pipeline.source_repository import (
 )
 from facebook_pipeline.source_config import (
     EDIT_MODE_HOOK_THEN_ORIGINAL,
+    EDIT_MODE_KEEP_ALL,
+    EDIT_MODE_TITLE_ONLY,
+    EDIT_MODE_TITLE_SCRIPT,
     SOURCE_TYPE_GROUP,
 )
 
 FFMPEG_BINARY = resolve_ffmpeg_binary()
+from shared.modules.video_remix import (
+    conform_video_passthrough,
+    create_video_title_script_mode,
+)
 from shared.core.ai_provider_factory import analyze_video_content, get_configured_ai_provider
 from fb_sheet_api import save_fb_to_sheet, update_fb_finished_time, update_fb_drive_link, update_fb_status, update_fb_status_m
 
@@ -225,6 +233,22 @@ def resolve_title_layout_box(text_cfg: dict) -> tuple[int, int]:
     except (TypeError, ValueError):
         text_x = 65
     return max_width, text_x
+
+
+def _download_asset_safe(folder: str, filename: str) -> str | None:
+    """Tải asset (frame/font/logo) từ Supabase Storage về assets/ nếu chưa có."""
+    if not filename or filename == "-- Trống --":
+        return None
+    if os.path.isabs(filename):
+        return filename if os.path.exists(filename) else None
+    local_dir = os.path.join(PROJECT_ROOT, "assets", folder)
+    os.makedirs(local_dir, exist_ok=True)
+    local_path = os.path.join(local_dir, filename)
+    if not os.path.exists(local_path):
+        print(f"      📥 Đang tải {filename} từ Supabase Storage...")
+        from shared.services.supabase_api import SupabaseAPI
+        SupabaseAPI.download_asset("assets", folder, local_dir, filename)
+    return local_path if os.path.exists(local_path) else None
 
 
 def _get_duration(file_path: str) -> float:
@@ -446,6 +470,13 @@ class FBNewsPipeline:
             caption = video.get("caption", "").strip()
             edit_mode = source.get("edit_mode", "")
             hook_then_original = edit_mode == EDIT_MODE_HOOK_THEN_ORIGINAL
+            keep_all = edit_mode == EDIT_MODE_KEEP_ALL
+            title_only = edit_mode == EDIT_MODE_TITLE_ONLY
+            title_script = edit_mode == EDIT_MODE_TITLE_SCRIPT
+            # Pass-through: giữ nguyên bytes video gốc, không AI/TTS/dựng lại.
+            # Mode 3 (chỉ tiêu đề) KHÔNG pass-through: intro mới (voice tiêu đề
+            # + frame kênh) ghép trước thân video gốc giữ nguyên tiếng.
+            pass_through = keep_all
 
             # ── [1/6] Download video ──
             print(f"      📥 [1/6] Download...")
@@ -479,8 +510,6 @@ class FBNewsPipeline:
                 print(f"      📝 Tìm thấy Caption xịn: \"{caption[:60]}...\"")
 
             # ── [2/6] AI Provider phân tích ──
-            active_provider = get_configured_ai_provider().upper()
-            print(f"      🤖 [2/6] {active_provider} phân tích video...")
             target_tiktok_id = _get_source_target_channel(source)
             operator_instruction = source.get("extra_content", "")
             evidence_pack = build_social_evidence_pack(
@@ -489,15 +518,32 @@ class FBNewsPipeline:
                 caption=caption,
                 metadata={**video, **dl},
             )
-            ai_result = analyze_video_content(
-                dl["path"],
-                caption,
-                is_tele_bot=source.get("is_telegram_bot", False),
-                extra_content=operator_instruction,
-                profile_id=target_tiktok_id,
-                edit_mode=edit_mode,
-                hide_chrome=bool(source.get("hide_chrome", False)),
-            )
+            if keep_all:
+                print("      🧷 [2/6] Mode GIỮ NGUYÊN TOÀN BỘ — bỏ qua AI phân tích.")
+                ai_result = {
+                    "title_tiktok": caption[:100],
+                    "hook": "",
+                    "script_voice": "",
+                    "main_idea": caption[:150],
+                    "have_frame": False,
+                    "detected_competitor_frame_end_sec": None,
+                    "should_make_video": True,
+                    "scenes": [],
+                    "tone": "Trung tính",
+                    "quality_score": 7,
+                }
+            else:
+                active_provider = get_configured_ai_provider().upper()
+                print(f"      🤖 [2/6] {active_provider} phân tích video...")
+                ai_result = analyze_video_content(
+                    dl["path"],
+                    caption,
+                    is_tele_bot=source.get("is_telegram_bot", False),
+                    extra_content=operator_instruction,
+                    profile_id=target_tiktok_id,
+                    edit_mode=edit_mode,
+                    hide_chrome=bool(source.get("hide_chrome", False)),
+                )
 
             if not ai_result:
                 print(f"      ℹ️ AI không khả dụng — dùng caption gốc")
@@ -519,6 +565,13 @@ class FBNewsPipeline:
             )
             if hook_then_original:
                 prepared_content = prepare_hook_content(
+                    ai_result,
+                    caption=caption,
+                    channel_id=target_tiktok_id,
+                    source_url=video["url"],
+                )
+            elif title_only:
+                prepared_content = prepare_title_only_content(
                     ai_result,
                     caption=caption,
                     channel_id=target_tiktok_id,
@@ -552,19 +605,19 @@ class FBNewsPipeline:
                 should_make_video = True
 
             topic_fit = ai_result.get("topic_fit", True)
-            if not source.get("is_telegram_bot") and (str(topic_fit).lower() == "false" or not topic_fit):
+            if not pass_through and not source.get("is_telegram_bot") and (str(topic_fit).lower() == "false" or not topic_fit):
                 topic_fit_reason = ai_result.get("topic_fit_reason") or ai_result.get("skip_reason", "")
                 print(f"      ⏭️ Video không đúng định vị kênh → skip. {topic_fit_reason}")
                 _append_quality_log("facebook", source.get("source_name", ""), int(ai_result.get("quality_score", 0)), "skip", topic_fit_reason)
                 return "skip"
 
             # Ép kiểu an toàn (nếu ChatGPT trả về chuỗi "false" hoặc boolean False)
-            if str(should_make_video).lower() == "false" or not should_make_video:
+            if not pass_through and (str(should_make_video).lower() == "false" or not should_make_video):
                 skip_reason = ai_result.get("skip_reason", "")
                 print(f"      ⏭️ AI đánh giá: KHÔNG NÊN làm video này. {f'Lý do: {skip_reason}' if skip_reason else ''}")
                 return "skip"
 
-            if not prepared_content.report.passed:
+            if not pass_through and not prepared_content.report.passed:
                 validation_reason = summarize_validation(prepared_content.report)
                 print(
                     f"      ⏭️ ContentValidator không đạt → skip. "
@@ -590,7 +643,9 @@ class FBNewsPipeline:
                 source_text=evidence_pack.source_text,
                 profile=editorial_profile,
             )
-            if not EVIDENCE_GUARD_ENABLED:
+            # Mode 3 chỉ viết tiêu đề (không script/beats) nên 2 guard thiết kế
+            # cho bản tin đầy đủ sẽ chặn oan (VISUAL_BEATS_MISSING) → bỏ qua.
+            if not EVIDENCE_GUARD_ENABLED or pass_through or title_only:
                 print("      ⏭️ EvidenceGuard đã tắt; tiếp tục xử lý video.")
             elif not evidence_report.passed:
                 evidence_reason = summarize_evidence(evidence_report)
@@ -611,7 +666,7 @@ class FBNewsPipeline:
                 source_type="facebook",
                 source_text=evidence_pack.source_text,
             )
-            if not visual_report.passed:
+            if not pass_through and not title_only and not visual_report.passed:
                 visual_reason = summarize_visual_grounding(visual_report)
                 print(f"      ⏭️ VisualGrounding không đạt → skip. {visual_reason}")
                 _append_quality_log(
@@ -636,7 +691,7 @@ class FBNewsPipeline:
                 frame_mode=bool(ai_result.get("have_frame")),
                 threshold=int(os.environ.get("SOCIAL_QUALITY_THRESHOLD", "70")),
             )
-            if not social_report.passed and not source.get("is_telegram_bot"):
+            if not social_report.passed and not pass_through and not source.get("is_telegram_bot"):
                 social_reason = summarize_social_quality(social_report)
                 print(f"      Social Quality Gate: {social_reason}")
                 _append_quality_log(
@@ -693,9 +748,20 @@ class FBNewsPipeline:
             # tiêu đề thay vì âm thầm dựng intro im lặng.
             if not hook and title:
                 hook = title
-            have_frame = (
-                False if hook_then_original else ai_result.get("have_frame", False)
-            )
+            # Kênh bật force_full_frame (channels_config.json) luôn phủ frame
+            # thương hiệu xuyên suốt, bất kể AI phán video nguồn là "quay thật"
+            # hay phát hiện mốc frame đối thủ.
+            channel_force_frame = bool(source.get("force_full_frame"))
+            if channel_force_frame and not (
+                pass_through or hook_then_original or title_script or title_only
+            ):
+                have_frame = True
+                print("      🖼️ Kênh bật force_full_frame → ép render CÓ FRAME xuyên suốt")
+            else:
+                have_frame = (
+                    False if (hook_then_original or title_script or title_only)
+                    else ai_result.get("have_frame", False)
+                )
             tone = ai_result.get("tone", "Trung tính").strip()
             music_mood = ai_result.get("music_mood")
             music_energy = ai_result.get("music_energy", 2)
@@ -758,7 +824,7 @@ class FBNewsPipeline:
             hook_voice_path = None
             script_voice_path = None
 
-            if hook:
+            if hook and not pass_through:
                 try:
                     hook_voice_path = create_voice_full_pipeline(
                         text=hook, save_dir=work_dir,
@@ -777,9 +843,9 @@ class FBNewsPipeline:
                 except Exception as e:
                     print(f"      ⚠️ Hook voice lỗi: {e}")
 
-            # Nếu CÓ FRAME → tạo voice script (không gộp hook vì hook đã có voice riêng)
-            # Nếu KHÔNG FRAME → không cần script_voice, chỉ dùng voice hook và audio gốc
-            if have_frame and script_voice:
+            # Nếu CÓ FRAME (hoặc mode title+script) → tạo voice script
+            # Nếu pass-through → không tạo voice nào
+            if not pass_through and (have_frame or title_script) and script_voice:
                 print(f"      🗣️ Tạo voice script (cột C): \"{script_voice[:50]}...\"")
                 try:
                     script_voice_path = create_voice_full_pipeline(
@@ -802,67 +868,161 @@ class FBNewsPipeline:
             # không tạo được. Trước đây nhánh KHÔNG FRAME vẫn đi tiếp với
             # anullsrc, nên người xem nghe được vài chữ hoặc hoàn toàn im ở
             # câu mở đầu.
-            if hook and not hook_voice_path:
+            if hook and not hook_voice_path and not pass_through:
                 raise PipelineStageError(
                     "voiced", "TTS_FAILED",
                     "Không tạo được hook voice; dừng trước khi dựng intro bị mất tiếng.",
                 )
-            if have_frame and script_voice and not script_voice_path:
+            if (have_frame or title_script) and script_voice and not script_voice_path:
                 raise PipelineStageError(
                     "voiced", "TTS_FAILED",
                     "Không tạo được script voice cho video có frame.",
                 )
-            if have_frame and not hook_voice_path and not script_voice_path:
+            if (have_frame or title_script) and not hook_voice_path and not script_voice_path:
                 raise PipelineStageError(
                     "voiced", "TTS_FAILED",
                     "Chế độ có frame nhưng không tạo được voice.",
                 )
-            if hook_then_original and not hook_voice_path:
+            if (hook_then_original or title_only) and not hook_voice_path:
                 raise PipelineStageError(
                     "voiced",
                     "TTS_FAILED",
-                    "Chế độ Hook + tiếng gốc bắt buộc phải tạo được voice hook.",
+                    "Chế độ intro voice tiêu đề bắt buộc phải tạo được voice hook.",
                 )
             lifecycle.advance("voiced")
 
             # ── [4/6] Dựng video ──
-            mode_name = "CÓ FRAME" if have_frame else "KHÔNG FRAME"
-            print(f"      🎬 [4/6] Dựng video (mode: {mode_name})...")
-
-            if have_frame:
-                render_result = self._edit_video_with_frame(
+            if pass_through:
+                print("      🧷 [4/6] Mode GIỮ NGUYÊN: chuẩn hóa video gốc về spec upload...")
+                conform_output = os.path.join(work_dir, f"passthrough_{job_id}.mp4")
+                render_result = conform_video_passthrough(
+                    dl["path"], conform_output, work_dir=work_dir,
+                )
+            elif title_script:
+                print("      🎬 [4/6] Dựng video (mode: TIÊU ĐỀ + KỊCH BẢN)...")
+                # Intro = voice tiêu đề; thân = voice script. AI thỉnh thoảng
+                # trả script rỗng — khi đó lùi về thân dùng voice tiêu đề
+                # làm tiếng chính (bỏ intro) thay vì fail cả video.
+                if script_voice_path:
+                    body_voice_file = script_voice_path
+                    body_narration = script_voice.strip()
+                    intro_voice_for_render = hook_voice_path or ""
+                elif hook_voice_path:
+                    body_voice_file = hook_voice_path
+                    body_narration = hook.strip() or title.strip()
+                    intro_voice_for_render = ""
+                    print("      ⚠️ AI không sinh kịch bản — dùng voice tiêu đề cho toàn video, bỏ intro.")
+                else:
+                    body_voice_file = ""
+                    body_narration = ""
+                    intro_voice_for_render = ""
+                body_voice_duration = 0.0
+                if body_voice_file:
+                    body_voice_duration = probe_audio_duration(body_voice_file) or 0.0
+                subtitle_ass_path = os.path.join(work_dir, f"subtitle_{job_id}.ass")
+                if body_narration:
+                    generate_text_ass(
+                        body_narration,
+                        subtitle_ass_path,
+                        max(body_voice_duration, 1.0),
+                    )
+                else:
+                    subtitle_ass_path = ""
+                # Intro giống mode thường: frame kênh + chữ tiêu đề + voice.
+                is_tele_src = source.get("is_telegram_bot", False)
+                raw_title_frame = source.get("title_frame_path")
+                intro_frame_path = (
+                    _download_asset_safe("frame", raw_title_frame)
+                    if is_tele_src
+                    else (raw_title_frame or FRAME_PATH)
+                )
+                intro_font_path = _download_asset_safe(
+                    "font", source.get("font_path")
+                ) if is_tele_src else source.get("font_path")
+                if not intro_font_path or not os.path.exists(intro_font_path):
+                    intro_font_path = os.path.join(
+                        PROJECT_ROOT, "assets", "font", "RobotoCondensed-Bold.ttf"
+                    )
+                text_cfg = resolve_text_settings(source, target_tiktok_id)
+                try:
+                    intro_y1 = float(text_cfg.get("text_y1", 0) or 0)
+                except (TypeError, ValueError):
+                    intro_y1 = 0.0
+                intro_text_config = {
+                    "text": title,
+                    "font_path": intro_font_path,
+                    "font_size": text_cfg.get("text_size", 65),
+                    "x": text_cfg.get("text_x", 65),
+                    "y": int(1920 * intro_y1) if intro_y1 > 0 else 1230,
+                    "color": (
+                        str(text_cfg.get("text_color") or "white").strip() or "white"
+                    ),
+                    "manual_position": (
+                        str(text_cfg.get("text_position_mode", "manual")).lower()
+                        == "manual"
+                    ),
+                }
+                title_script_output = os.path.join(work_dir, f"final_{job_id}.mp4")
+                render_result = create_video_title_script_mode(
                     source_video=dl["path"],
-                    hook_voice_path=hook_voice_path,
-                    script_voice_path=script_voice_path,
-                    title=title, hook_text=hook,
-                    work_dir=work_dir, job_id=job_id,
-                    source=source, tone=tone,
-                    music_mood=music_mood, music_energy=music_energy,
-                    is_sensitive=is_sensitive, channel_id=target_tiktok_id,
-                    beats=ai_result.get("beats"), script_text=script_voice,
-                    subtitle_style=ai_result.get(
-                        "subtitle_style", "keyword_highlight",
-                    ),
-                    frame_end_sec=ai_result.get(
-                        "detected_competitor_frame_end_sec"
-                    ),
+                    voice_paths=[body_voice_file] if body_voice_file else [],
+                    output_path=title_script_output,
+                    subtitle_ass_path=subtitle_ass_path,
+                    work_dir=work_dir,
+                    intro_voice_path=intro_voice_for_render,
+                    intro_frame_path=intro_frame_path or "",
+                    intro_text_config=intro_text_config,
+                    body_frame_path=intro_frame_path or "",
                 )
             else:
-                render_result = self._edit_video_no_frame(
-                    source_video=dl["path"],
-                    hook_voice_path=hook_voice_path,
-                    hook_text=hook or title,
-                    title_text=title,
-                    work_dir=work_dir, job_id=job_id,
-                    source=source, tone=tone,
-                    music_mood=music_mood, music_energy=music_energy,
-                    is_sensitive=is_sensitive, channel_id=target_tiktok_id,
-                    beats=ai_result.get("beats"),
-                    preserve_full_source_audio=hook_then_original,
-                    # Nguồn không có frame chỉ hiển thị hook trên intro;
-                    # phần body là video nguồn, không lặp frame/text.
-                    title_on_body=False,
-                )
+                mode_name = "CÓ FRAME" if have_frame else "KHÔNG FRAME"
+                print(f"      🎬 [4/6] Dựng video (mode: {mode_name})...")
+
+                if have_frame:
+                    render_result = self._edit_video_with_frame(
+                        source_video=dl["path"],
+                        hook_voice_path=hook_voice_path,
+                        script_voice_path=script_voice_path,
+                        title=title, hook_text=hook,
+                        work_dir=work_dir, job_id=job_id,
+                        source=source, tone=tone,
+                        music_mood=music_mood, music_energy=music_energy,
+                        is_sensitive=is_sensitive, channel_id=target_tiktok_id,
+                        beats=ai_result.get("beats"), script_text=script_voice,
+                        subtitle_style=ai_result.get(
+                            "subtitle_style", "keyword_highlight",
+                        ),
+                        frame_end_sec=(
+                            None if channel_force_frame
+                            else ai_result.get(
+                                "detected_competitor_frame_end_sec"
+                            )
+                        ),
+                    )
+                else:
+                    render_result = self._edit_video_no_frame(
+                        source_video=dl["path"],
+                        hook_voice_path=hook_voice_path,
+                        hook_text=hook or title,
+                        title_text=title,
+                        work_dir=work_dir, job_id=job_id,
+                        source=source, tone=tone,
+                        music_mood=music_mood, music_energy=music_energy,
+                        is_sensitive=is_sensitive, channel_id=target_tiktok_id,
+                        beats=ai_result.get("beats"),
+                        preserve_full_source_audio=(
+                            hook_then_original or title_only
+                        ),
+                        # Nguồn không có frame chỉ hiển thị hook trên intro;
+                        # phần body là video nguồn, không lặp frame/text.
+                        title_on_body=False,
+                        body_frame_path=(
+                            _download_asset_safe(
+                                "frame", source.get("content_frame_path")
+                            )
+                            if channel_force_frame and title_only else ""
+                        ),
+                    )
 
             final_path = (
                 render_result.get("final_path")
@@ -986,6 +1146,21 @@ class FBNewsPipeline:
                     print(f"      ✅ Đã ghi Sheet Tổng dòng {sheet_row}")
                     # Đối với sheet tổng chạy từ telebot, cột M phải là đăng ngay lập tức
                     update_fb_status_m(sheet_row, "đăng ngay lập tức", sheet_name="tổng")
+                    # Gửi tool_tk đăng NGAY qua direct-upload API (không warmup;
+                    # nick bận thì tool_tk tự trả về làn ưu tiên). Lỗi webhook
+                    # không ảnh hưởng pipeline: tool_tk vẫn nhận video qua
+                    # đường quét Sheet dự phòng.
+                    try:
+                        from shared.services.tool_tk_webhook import notify_new_video
+                        if notify_new_video(
+                            channel_id=source.get("id_tiktok", ""),
+                            row_index=sheet_row,
+                            title=ai_result.get("title_tiktok", ""),
+                            drive_link=drive_link,
+                        ):
+                            print(f"      📮 Đã gửi tool_tk đăng ngay (kênh {source.get('id_tiktok', '')}).")
+                    except Exception as tooltk_err:
+                        print(f"      ⚠️ ToolTK webhook bỏ qua: {tooltk_err}")
             else:
                 sheet_result = save_fb_to_sheet(
                     ai_result=ai_result,
@@ -1002,6 +1177,19 @@ class FBNewsPipeline:
                     update_fb_drive_link(sheet_row, drive_link)
                     update_fb_finished_time(sheet_row, datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
                     print(f"      ✅ Đã đẩy link Drive vào Google Sheet dòng {sheet_row}")
+                    # Gửi tool_tk đăng NGAY qua direct-upload API. Lỗi webhook không ảnh hưởng:
+                    # tool_tk còn đường quét Sheet dự phòng chu kỳ 10 phút.
+                    try:
+                        from shared.services.tool_tk_webhook import notify_new_video
+                        if notify_new_video(
+                            channel_id=source.get("id_tiktok", ""),
+                            row_index=sheet_row,
+                            title=ai_result.get("title_tiktok", ""),
+                            drive_link=drive_link,
+                        ):
+                            print(f"      📮 Đã gửi tool_tk đăng ngay (kênh {source.get('id_tiktok', '')}).")
+                    except Exception as tooltk_err:
+                        print(f"      ⚠️ ToolTK webhook bỏ qua: {tooltk_err}")
 
             # 2. Hoàn tất claim đã đặt trước khi xử lý. Không insert mới ở
             # đây vì Drive có thể đã upload trước khi database trả lỗi.
@@ -1130,18 +1318,7 @@ class FBNewsPipeline:
         render_error = ""
 
         def download_asset_safe(folder, filename):
-            if not filename or filename == "-- Trống --":
-                return None
-            if os.path.isabs(filename):
-                return filename if os.path.exists(filename) else None
-            local_dir = os.path.join(PROJECT_ROOT, "assets", folder)
-            os.makedirs(local_dir, exist_ok=True)
-            local_path = os.path.join(local_dir, filename)
-            if not os.path.exists(local_path):
-                print(f"      📥 Đang tải {filename} từ Supabase Storage...")
-                from shared.services.supabase_api import SupabaseAPI
-                SupabaseAPI.download_asset("assets", folder, local_dir, filename)
-            return local_path if os.path.exists(local_path) else None
+            return _download_asset_safe(folder, filename)
 
         hook_duration = 5.0
         if hook_voice_path and os.path.exists(hook_voice_path):
@@ -1751,7 +1928,7 @@ class FBNewsPipeline:
                               preserve_full_source_audio=False,
                               title_on_body=True, title_text="",
                               body_start_sec=0.0, intro_overlay_text="",
-                              disable_music=False):
+                              disable_music=False, body_frame_path=""):
         # 3 PASS: Intro (frame + hook/text) -> Body (video gốc từ mốc đã chọn) -> Concat
         final_path = os.path.join(work_dir, f"final_{job_id}.mp4")
         temp_intro = os.path.join(work_dir, f"intro_{job_id}.mp4")
@@ -1759,18 +1936,7 @@ class FBNewsPipeline:
         render_errors = []
 
         def download_asset_safe(folder, filename):
-            if not filename or filename == "-- Trống --":
-                return None
-            if os.path.isabs(filename):
-                return filename if os.path.exists(filename) else None
-            local_dir = os.path.join(PROJECT_ROOT, "assets", folder)
-            os.makedirs(local_dir, exist_ok=True)
-            local_path = os.path.join(local_dir, filename)
-            if not os.path.exists(local_path):
-                print(f"      📥 Đang tải {filename} từ Supabase Storage...")
-                from shared.services.supabase_api import SupabaseAPI
-                SupabaseAPI.download_asset("assets", folder, local_dir, filename)
-            return local_path if os.path.exists(local_path) else None
+            return _download_asset_safe(folder, filename)
 
         hook_duration = 5.0
         has_hook_voice = hook_voice_path and os.path.exists(hook_voice_path)
@@ -2030,6 +2196,10 @@ class FBNewsPipeline:
         body_bgm_idx = 1 + int(not has_audio) + int(bool(has_logo))
         if music and not has_audio:
             body_inputs += ["-stream_loop", "-1", "-i", music.path]
+        has_body_frame = bool(body_frame_path and os.path.exists(body_frame_path))
+        if has_body_frame:
+            body_inputs += ["-i", body_frame_path]
+        body_frame_idx = body_bgm_idx + int(bool(music and not has_audio))
 
         body_filters = []
         if is_horiz:
@@ -2044,7 +2214,11 @@ class FBNewsPipeline:
             body_filters.extend(_build_logo_blur_chain("[bg_pre]", _logo_regions))
         curr_body = "[bg]"
         in_idx = 2 if not has_audio else 1
-        
+
+        if has_body_frame:
+            body_filters.append(f"[{body_frame_idx}:v]scale=1080:1920[frame_b];{curr_body}[frame_b]overlay=0:0[v_bfr]")
+            curr_body = "[v_bfr]"
+
         if has_logo:
             body_filters.append(f"[{in_idx}:v]scale=1080:1920[logo];{curr_body}[logo]overlay=0:0[v_l]")
             curr_body = "[v_l]"

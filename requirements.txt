@@ -18,6 +18,10 @@ curl_cffi==0.14.0
 customtkinter==5.2.2
 darkdetect==0.8.0
 decorator==4.4.2
+# demucs cần torch: cài bản CPU bằng
+#   pip install torch torchaudio --index-url https://download.pytorch.org/whl/cpu
+# trước khi cài demucs để tránh kéo theo CUDA (~2GB).
+demucs==4.1.0
 deprecation==2.1.0
 duckduckgo_search==8.1.1
 fastapi>=0.115,<1

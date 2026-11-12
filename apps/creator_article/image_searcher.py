@@ -15,35 +15,34 @@ except ImportError:  # Pillow is a project dependency; keep a soft fallback anyw
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_HISTORY_PATH = PROJECT_ROOT / "data" / "image_history.json"
 
-MIN_DIMENSION = 480          # reject thumbnails too small for a 1080x1920 render.
+MIN_DIMENSION = 720          # reject thumbnails too small for a 1080x1920 render.
 MAX_ASPECT_RATIO = 2.4       # reject banner/divider-shaped images (likely ads/decoration).
 FLAT_STDDEV_THRESHOLD = 8.0  # near-solid color / placeholder ("image not found") images.
 DUPLICATE_HAMMING_DISTANCE = 6  # ahash bits that may differ and still count as "same image".
 HISTORY_RECENT_LIMIT = 60
 
 
-def _rank_score(result: dict) -> float:
-    """Score a DuckDuckGo image result before downloading anything.
+def _metadata_ok(result: dict) -> bool:
+    """Metadata-level rejection before downloading anything.
 
-    Higher is better. Known-good resolution/aspect ratio beats unknown
-    metadata, which in turn beats known-bad (tiny or banner-shaped) results.
+    DuckDuckGo returns results in relevance order; we only drop candidates
+    whose declared size/shape cannot possibly render sharp. Re-sorting by
+    resolution would destroy that relevance order, so it is deliberately
+    not done here.
     """
     width = result.get("width") or 0
     height = result.get("height") or 0
     try:
         width, height = int(width), int(height)
     except (TypeError, ValueError):
-        width, height = 0, 0
+        return True  # unknown metadata: worth trying, verification decides later.
 
     if not width or not height:
-        return 1_500_000.0  # neutral: metadata missing, still worth trying.
-
-    area = min(width * height, 4_000_000)
-    long_side, short_side = max(width, height), max(1, min(width, height))
-    ratio = long_side / short_side
-    ratio_penalty = 0.0 if ratio <= MAX_ASPECT_RATIO else (ratio - MAX_ASPECT_RATIO) * 200_000
-    size_penalty = 0.0 if min(width, height) >= MIN_DIMENSION else 2_000_000.0
-    return area - ratio_penalty - size_penalty
+        return True
+    if min(width, height) < MIN_DIMENSION:
+        return False
+    ratio = max(width, height) / max(1, min(width, height))
+    return ratio <= MAX_ASPECT_RATIO
 
 
 def _average_hash(image: "Image.Image") -> int:
@@ -116,6 +115,53 @@ class ImageSearcher:
         except Exception:
             return None
 
+    def filter_quality_images(
+        self,
+        paths: list,
+        channel_id: str | None = None,
+        history_path: str | os.PathLike | None = None,
+    ) -> list:
+        """
+        Lọc ảnh đã tải sẵn (ảnh gốc bài báo): bỏ ảnh quá nhỏ, méo, placeholder
+        hoặc trùng ảnh đã dùng gần đây cho kênh. Ảnh đạt chuẩn được ghi vào
+        lịch sử chống trùng để ảnh search sau không chọn lại chúng.
+        """
+        if not paths:
+            return []
+
+        history_file = Path(history_path) if history_path else DEFAULT_HISTORY_PATH
+        history = _read_history(history_file)
+        history_key = str(channel_id or "default").strip() or "default"
+        recent_hashes = [
+            int(value, 16) for value in history.get(history_key, [])
+            if isinstance(value, str)
+        ]
+
+        kept = []
+        removed = 0
+        for path in paths:
+            verified = self._verify_image(path, recent_hashes) if os.path.exists(path) else None
+            if verified is None:
+                removed += 1
+                continue
+            image_hash = verified.get("phash")
+            if image_hash:
+                recent_hashes.append(int(image_hash, 16))
+                history.setdefault(history_key, [])
+                history[history_key] = (
+                    history[history_key] + [image_hash]
+                )[-HISTORY_RECENT_LIMIT:]
+            kept.append(path)
+
+        if removed:
+            print(
+                f"   🧹 Lọc ảnh gốc bài báo: bỏ {removed} ảnh mờ/placeholder/trùng, "
+                f"giữ {len(kept)} ảnh đạt chuẩn."
+            )
+        if kept:
+            _write_history(history_file, history)
+        return kept
+
     def download_missing_images(
         self,
         prompts: list,
@@ -158,15 +204,17 @@ class ImageSearcher:
                     # Ngủ ngẫu nhiên một chút trước khi search để tránh bị chém IP
                     time.sleep(random.uniform(1.5, 3.5))
 
-                    # Tìm ảnh với từ khóa, ưu tiên ảnh to (Large) để làm video cho nét
+                    # Tìm ảnh với từ khóa. Giữ nguyên thứ tự liên quan của
+                    # DuckDuckGo, chỉ lọc bỏ kết quả metadata cho thấy quá
+                    # nhỏ/dẹt; ảnh đầu tiên tải được + đạt chuẩn sẽ thắng.
                     results = list(ddgs.images(
                         keywords=prompt,
                         region="wt-wt",
                         safesearch="moderate",
                         size="Large",
-                        max_results=8  # lấy dư để có đủ ứng viên sau khi xếp hạng/loại
+                        max_results=12  # lấy dư để có đủ ứng viên sau khi lọc
                     ))
-                    results.sort(key=_rank_score, reverse=True)
+                    results = [res for res in results if _metadata_ok(res)]
 
                     for res in results:
                         img_url = res.get("image")

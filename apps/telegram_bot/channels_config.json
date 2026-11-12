@@ -9,7 +9,9 @@
         "text_y1": "0.702",
         "text_size": "64",
         "text_color": "white",
-        "text_x": "210"
+        "text_x": "210",
+        "upload_group": "car",
+        "tool_tk_channel": "gbn.car"
     },
     "showbiz124h": {
         "name": "showbiz 24h",
@@ -21,7 +23,9 @@
         "text_y1": "0.694",
         "text_size": "56",
         "text_color": "white",
-        "text_x": "153"
+        "text_x": "153",
+        "upload_group": "showbiz24h",
+        "tool_tk_channel": "100091876592610"
     },
     "Adsupnews": {
         "name": "Adsup New",
@@ -32,7 +36,9 @@
         "sheet_type": "facebook",
         "text_y1": "0.65",
         "text_size": "50",
-        "text_color": "white"
+        "text_color": "white",
+        "upload_group": "adsupnew",
+        "tool_tk_channel": "adsup.news_"
     },
     "tintucthammy24h": {
         "name": "thẩm mỹ 24h",
@@ -43,7 +49,9 @@
         "sheet_type": "tong",
         "text_y1": "0.7",
         "text_size": "50",
-        "text_color": "white"
+        "text_color": "white",
+        "upload_group": "thammy24h",
+        "tool_tk_channel": "100068786900830"
     },
     "taichinh24444h": {
         "name": "taichinh24444h",
@@ -54,7 +62,9 @@
         "sheet_type": "tong",
         "text_y1": "0.75",
         "text_size": "40",
-        "text_color": "white"
+        "text_color": "white",
+        "upload_group": "taichinh24h",
+        "tool_tk_channel": "100091615694752"
     },
     "adsup_sport": {
         "name": "adsup_sport",
@@ -66,6 +76,9 @@
         "text_y1": "0.734",
         "text_size": "51",
         "text_color": "white",
-        "text_x": "180"
+        "text_x": "180",
+        "upload_group": "adsupsport",
+        "tool_tk_channel": "stoklasatadeusz@outlook.com.vn",
+        "force_full_frame": true
     }
 }

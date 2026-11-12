@@ -12,6 +12,9 @@ SOURCE_TYPE_PAGE = "page"
 SOURCE_TYPE_GROUP = "group"
 EDIT_MODE_FULL_AI = "full_ai_voiceover"
 EDIT_MODE_HOOK_THEN_ORIGINAL = "hook_then_original"
+EDIT_MODE_KEEP_ALL = "keep_all"
+EDIT_MODE_TITLE_ONLY = "edit_title_only"
+EDIT_MODE_TITLE_SCRIPT = "edit_title_script"
 
 DEFAULT_PAGE_MAX_VIDEOS_PER_SCAN = 10
 DEFAULT_GROUP_MAX_VIDEOS_PER_SCAN = 5
@@ -25,6 +28,14 @@ SOURCE_TYPE_LABELS = {
 EDIT_MODE_LABELS = {
     EDIT_MODE_FULL_AI: "Full AI Script",
     EDIT_MODE_HOOK_THEN_ORIGINAL: "Đọc Hook + Giữ tiếng gốc",
+}
+
+# Nhãn 4 chế độ biên tập dùng cho Telegram Bot (override từng video).
+TELEGRAM_MODE_LABELS = {
+    EDIT_MODE_KEEP_ALL: "1️⃣ Giữ nguyên toàn bộ",
+    EDIT_MODE_FULL_AI: "2️⃣ Biên tập toàn bộ",
+    EDIT_MODE_TITLE_ONLY: "3️⃣ Chỉ sửa tiêu đề",
+    EDIT_MODE_TITLE_SCRIPT: "4️⃣ Sửa tiêu đề + kịch bản",
 }
 
 _EDIT_MODE_ALIASES = {

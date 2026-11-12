@@ -1116,6 +1116,19 @@ class ArticlePipelineCore:
                     )
                 downloaded_videos = article_data.get("videos", [])
 
+                # Ảnh gốc bài báo cũng phải đạt chuẩn (đủ lớn, không placeholder,
+                # không trùng ảnh đã dùng cho kênh) — ảnh bị loại sẽ được săn ảnh bù.
+                if downloaded_imgs:
+                    filtered_imgs = self.img_searcher.filter_quality_images(
+                        downloaded_imgs, channel_id=id_tiktok,
+                    )
+                    if len(filtered_imgs) < len(downloaded_imgs):
+                        print(
+                            f"   [KÊNH {id_tiktok}] 🧹 Lọc ảnh bài báo: "
+                            f"{len(downloaded_imgs)} → {len(filtered_imgs)} ảnh đạt chuẩn."
+                        )
+                    downloaded_imgs = filtered_imgs
+
                 if not downloaded_imgs:
                     print(f"   [KÊNH {id_tiktok}] ⚠️ Bài báo không có ảnh gốc, sẽ tìm toàn bộ ảnh từ DuckDuckGo...")
 
@@ -1137,7 +1150,9 @@ class ArticlePipelineCore:
                                 search_prompts.append(vq)
                     needed = TARGET_IMAGES - len(downloaded_imgs)
                     if search_prompts:
-                        search_prompts = search_prompts[:needed]
+                        # Ảnh gốc bài thường phủ phần đầu video; ảnh search đặt vào
+                        # timeline sau nên lấy prompt của các scene CUỐI cho khớp.
+                        search_prompts = search_prompts[-needed:]
                         print(f"   [KÊNH {id_tiktok}] 🔎 Thiếu ảnh, đang tìm thêm {needed} ảnh từ DuckDuckGo...")
                         extra_imgs = self.img_searcher.download_missing_images(
                             search_prompts, job_dir, channel_id=id_tiktok,

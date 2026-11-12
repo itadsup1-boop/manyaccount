@@ -545,6 +545,7 @@ def build_prompt(
     experiment_assignment: Mapping[str, Any] | None = None,
     experiment_content_key: str = "",
     include_output_schema: bool = True,
+    edit_mode_override: str = "",
 ) -> str:
     """Ghép prompt theo cùng một thứ tự ưu tiên cho mọi pipeline."""
     sections = [
@@ -615,6 +616,12 @@ def build_prompt(
         sections.append(f"ĐẦU VÀO TÁC VỤ\n{task_input.strip()}")
     if repair_instruction.strip():
         sections.append(f"YÊU CẦU SỬA DUY NHẤT\n{repair_instruction.strip()}")
+    if edit_mode_override.strip():
+        # Ghi đè quy tắc chung (ví dụ thời lượng 50-55s) cho chế độ biên tập
+        # đặc biệt; đặt ngay trước hợp đồng JSON để độ ưu tiên cao.
+        sections.append(
+            f"CHẾ ĐỘ BIÊN TẬP ĐẶC BIỆT — ƯU TIÊN CAO NHẤT\n{edit_mode_override.strip()}"
+        )
     if include_output_schema:
         sections.append(
             "HỢP ĐỒNG OUTPUT BẮT BUỘC\n"

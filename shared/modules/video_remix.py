@@ -14,6 +14,7 @@ from shared.core.beat_timeline import plan_beat_timeline, resolve_intro_overlay_
 from shared.services.audio_director import plan_audio_cues
 from shared.core.video_encoding import (
     final_output_args,
+    intermediate_output_args,
     resolve_color_grade,
 )
 from shared.core.ffmpeg_utils import resolve_ffmpeg_binary, resolve_ffprobe_binary
@@ -1293,3 +1294,636 @@ def create_video_from_source_video(
 
 if __name__ == "__main__":
     pass
+
+
+# ==============================================================================
+#  CHẾ ĐỘ 4: SỬA TIÊU ĐỀ + KỊCH BẢN
+#  Giữ nguyên hình ảnh/video gốc; tách vocal để giữ bed nhạc nền gốc;
+#  ghép voice AI mới đọc kịch bản mới lên trên; đốt phụ đề mới.
+# ==============================================================================
+def probe_audio_channel_count(file_path: str) -> int:
+    """Trả về số kênh audio đầu tiên tìm thấy (0 nếu không có audio)."""
+    try:
+        probe = ffmpeg.probe(file_path, cmd=FFPROBE_BINARY)
+        for stream in probe.get("streams", []):
+            if stream.get("codec_type") == "audio":
+                return int(stream.get("channels") or 0)
+    except Exception:
+        pass
+    return 0
+
+
+def _escape_ass_filter_path(path: str) -> str:
+    """Escape đường dẫn ASS cho filter graph của ffmpeg."""
+    return str(path).replace("\\", "\\\\").replace(":", "\\:").replace("'", "\\'")
+
+
+def _loop_tail_extend(source_video: str, work_dir: str, target_duration: float) -> str:
+    """
+    Kéo dài video nguồn tới target_duration bằng cách lặp phần thân cuối
+    (mặc định lấy tối đa 60% cuối của bản gốc). Trả về file trung gian
+    đã mở rộng, hoặc "" nếu thất bại để caller dùng bản gốc.
+    """
+    try:
+        video_duration = get_media_duration(source_video)
+        tail_len = min(video_duration * 0.6, max(3.0, target_duration - video_duration))
+        tail_start = max(0.0, video_duration - tail_len)
+        n_frames = max(1, int(tail_len * 30))
+        n_samples = max(1, int(tail_len * 48000))
+        extended_path = os.path.join(work_dir, "source_extended.mp4")
+        filter_complex = (
+            "[0:v]split=2[vmain][vsrc];"
+            f"[vsrc]trim=start={tail_start:.3f}:end={video_duration:.3f},"
+            f"setpts=PTS-STARTPTS,fps=30,loop=loop=-1:size={n_frames}:start=0[vloop];"
+            f"[vmain]trim=end={video_duration:.3f},setpts=PTS-STARTPTS,fps=30[vm];"
+            "[vm][vloop]concat=n=2:v=1:a=0[vout];"
+            "[0:a]aformat=sample_rates=48000:channel_layouts=stereo,asplit=2[amain_s][asrc];"
+            f"[amain_s]atrim=end={video_duration:.3f},asetpts=PTS-STARTPTS[am];"
+            f"[asrc]atrim=start={tail_start:.3f}:end={video_duration:.3f},"
+            f"asetpts=PTS-STARTPTS,aloop=loop=-1:size={n_samples}:start=0[aloop];"
+            "[am][aloop]concat=n=2:v=0:a=1[aout]"
+        )
+        cmd = [
+            FFMPEG_BINARY, "-y", "-i", source_video,
+            "-filter_complex", filter_complex,
+            "-map", "[vout]", "-map", "[aout]",
+            *intermediate_output_args(),
+            "-t", f"{target_duration:.3f}",
+            extended_path,
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode != 0 or not os.path.exists(extended_path):
+            _record_render_failure(
+                extended_path, cmd, result.stderr, work_dir,
+                error_type="LoopTailExtendError",
+            )
+            return ""
+        print(f"   🔁 Voice dài hơn video gốc — lặp phần thân cuối tới {target_duration:.1f}s.")
+        return extended_path
+    except Exception as extend_error:
+        print(f"   ⚠️ Không kéo dài được video nguồn ({extend_error}); dùng bản gốc.")
+        return ""
+
+
+def separate_instrumental_demucs(source_video: str, work_dir: str) -> str:
+    """
+    Tách nhạc nền (instrumental) khỏi vocal bằng Demucs hai stem.
+    Trả về đường dẫn no_vocals.wav, hoặc "" nếu chưa cài/lỗi/timeout —
+    khi đó caller lùi về tách vocal FFmpeg (L−R) hoặc duck.
+    """
+    if os.environ.get("DEMUCS_SEPARATION_ENABLED", "1").strip().lower() in {
+        "0", "false", "no",
+    }:
+        return ""
+    demucs_out = os.path.join(work_dir, "demucs_out")
+    os.makedirs(demucs_out, exist_ok=True)
+    bed_input_wav = os.path.join(work_dir, "demucs_input.wav")
+    extract_cmd = [
+        FFMPEG_BINARY, "-y", "-i", source_video,
+        "-vn", "-ac", "2", "-ar", "44100", bed_input_wav,
+    ]
+    extract_result = subprocess.run(extract_cmd, capture_output=True, text=True)
+    if extract_result.returncode != 0 or not os.path.exists(bed_input_wav):
+        print("   ⚠️ Không xuất được audio nguồn cho Demucs; dùng fallback FFmpeg.")
+        return ""
+
+    demucs_cmd = [
+        sys.executable, "-m", "demucs.separate",
+        "--two-stems", "vocals",
+        "-n", "htdemucs",
+        "-o", demucs_out,
+        bed_input_wav,
+    ]
+    timeout_sec = int(os.environ.get("DEMUCS_TIMEOUT_SEC", "900"))
+    try:
+        result = subprocess.run(
+            demucs_cmd, capture_output=True, text=True, timeout=timeout_sec,
+        )
+    except subprocess.TimeoutExpired:
+        print(f"   ⚠️ Demucs vượt {timeout_sec}s — dùng fallback FFmpeg.")
+        return ""
+    except FileNotFoundError:
+        print("   ⚠️ Không gọi được Python cho Demucs — dùng fallback FFmpeg.")
+        return ""
+    if result.returncode != 0:
+        print(f"   ⚠️ Demucs lỗi: {(result.stderr or '')[-300:]}")
+        return ""
+    track_stem = os.path.splitext(os.path.basename(bed_input_wav))[0]
+    instrumental = os.path.join(
+        demucs_out, "htdemucs", track_stem, "no_vocals.wav",
+    )
+    if os.path.exists(instrumental):
+        print("   🎼 Bed nhạc gốc: tách vocal bằng Demucs (htdemucs).")
+        return instrumental
+    print("   ⚠️ Demucs không tạo file no_vocals.wav — dùng fallback FFmpeg.")
+    return ""
+
+
+def _escape_drawtext_text(text: str) -> str:
+    """Escape text cho drawtext filter (giữ tương thích filtergraph)."""
+    return (
+        str(text or "")
+        .replace("'", "")
+        .replace(":", "\\:")
+        .replace("%", "\\%")
+        .strip()
+        .upper()
+    )
+
+
+def render_intro_card(
+    source_video: str,
+    intro_voice_path: str,
+    intro_frame_path: str,
+    output_path: str,
+    text_config: dict | None = None,
+    work_dir: str = "",
+) -> str:
+    """
+    Dựng intro kiểu mode thường: video gốc làm nền (loop, blur nếu ngang),
+    frame title của kênh overlay, chữ tiêu đề, audio = voice đọc tiêu đề.
+    Trả về output_path hoặc "" nếu bỏ qua/thất bại để caller render không intro.
+    """
+    intro_duration = get_media_duration(intro_voice_path)
+    if intro_duration <= 0:
+        return ""
+    cfg = dict(text_config or {})
+    os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+    cmd = [
+        FFMPEG_BINARY, "-y", "-stream_loop", "-1", "-i", source_video,
+        "-i", intro_voice_path,
+    ]
+    has_frame = bool(intro_frame_path and os.path.exists(intro_frame_path))
+    if has_frame:
+        cmd += ["-i", intro_frame_path]
+
+    spec = _probe_media_spec(source_video)
+    is_horizontal = (
+        spec["width"] > 0 and spec["height"] > 0
+        and spec["width"] / spec["height"] > 1.20
+    )
+    filters = []
+    if is_horizontal:
+        filters += [
+            "[0:v]scale=1080:1920:force_original_aspect_ratio=increase,"
+            "crop=1080:1920,boxblur=10:2[bg_blur]",
+            "[0:v]scale=1080:1920:force_original_aspect_ratio=decrease[fg]",
+            "[bg_blur][fg]overlay=(W-w)/2:(H-h)/2[bg0]",
+        ]
+    else:
+        filters.append(
+            "[0:v]scale=1080:1920:force_original_aspect_ratio=decrease,"
+            "pad=1080:1920:(ow-iw)/2:(oh-ih)/2[bg0]"
+        )
+    curr = "[bg0]"
+    if has_frame:
+        filters.append("[2:v]scale=1080:1920[frame];[bg0][frame]overlay=0:0[v_f]")
+        curr = "[v_f]"
+
+    title_text = str(cfg.get("text") or "").strip()
+    font_path = str(cfg.get("font_path") or "")
+    if title_text and font_path and os.path.exists(font_path):
+        safe_font = font_path.replace("\\", "/").replace(":", "\\:")
+        try:
+            layout = plan_text_layout(
+                title_text.upper(),
+                font_size=int(cfg.get("font_size", 65) or 65),
+                preferred_x=int(cfg.get("x", 65) or 65),
+                preferred_y=int(cfg.get("y", 1230) or 1230),
+                max_width=950,
+                clamp_to_safe_zone=not bool(cfg.get("manual_position", False)),
+                allow_extra_lines=True,
+            )
+        except Exception as layout_error:
+            print(f"   ⚠️ Layout chữ intro lỗi ({layout_error}) — intro không chữ.")
+            layout = None
+        if layout:
+            for i, line in enumerate(layout.lines):
+                y_pos = layout.y + i * layout.line_spacing
+                filters.append(
+                    f"{curr}drawtext=fontfile='{safe_font}':"
+                    f"text='{_escape_drawtext_text(line)}':"
+                    f"fontsize={layout.font_size}:fontcolor={cfg.get('color', 'white')}:"
+                    "bordercolor=black:borderw=3:shadowcolor=black:"
+                    f"shadowx=3:shadowy=3:x={layout.x}:y={y_pos}[vt{i}]"
+                )
+                curr = f"[vt{i}]"
+
+    filters.append(f"{curr}null[vout]")
+    filters.append("[1:a]aformat=sample_rates=48000:channel_layouts=stereo[aout]")
+    cmd += [
+        "-filter_complex", ";".join(filters),
+        "-map", "[vout]",
+        "-map", "[aout]",
+        *final_output_args(),
+        "-t", f"{intro_duration:.3f}",
+        output_path,
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0 or not os.path.exists(output_path):
+        tmp_dir = work_dir or os.path.dirname(output_path) or "."
+        report = _record_render_failure(
+            output_path, cmd, result.stderr, tmp_dir,
+            error_type="IntroCardError",
+        )
+        print(f"   ⚠️ Render intro card lỗi ({report}) — bỏ intro, giữ thân thuần.")
+        return ""
+    print(f"   🎬 Intro card tiêu đề: {intro_duration:.1f}s")
+    return output_path
+
+
+def create_video_title_script_mode(
+    source_video: str,
+    voice_paths: list,
+    output_path: str,
+    subtitle_ass_path: str = "",
+    work_dir: str = "",
+    voice_volume_db: float = 0.0,
+    bed_gain_db: float = -8.0,
+    intro_voice_path: str = "",
+    intro_frame_path: str = "",
+    intro_text_config: dict | None = None,
+    body_frame_path: str = "",
+) -> dict:
+    """
+    Dựng video chế độ "Sửa tiêu đề + kịch bản":
+    - Intro (nếu có voice tiêu đề): card frame kênh + chữ tiêu đề + voice đọc
+      tiêu đề mới, giống intro mode thường.
+    - Thân: hình gốc scale về 1080x1920, phủ frame kênh (nếu có), đốt phụ đề;
+      audio tách vocal khỏi audio gốc để lấy bed nhạc nền gốc — ưu tiên
+      Demucs, fallback FFmpeg L−R; voice AI đọc kịch bản mới làm tiếng chính,
+      bed duck xuống dưới.
+    - Thời lượng thân theo voice script: voice dài hơn video gốc thì lặp phần
+      thân cuối để lấp; voice ngắn hơn thì cắt video theo voice (+0.5s đuôi).
+    """
+    video_duration = get_media_duration(source_video)
+    if video_duration <= 0:
+        return {"final_path": "", "error": "Không đọc được thời lượng video nguồn."}
+
+    os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+    original_cwd = os.getcwd()
+    tmp_dir = work_dir or os.path.join(TEMP_REMIX_DIR, f"title_script_{uuid.uuid4().hex[:8]}")
+    os.makedirs(tmp_dir, exist_ok=True)
+    intro_bg_source = source_video
+
+    try:
+        valid_voice_paths = [p for p in (voice_paths or []) if p and os.path.exists(p)]
+        if not valid_voice_paths:
+            return {"final_path": "", "error": "Không có file voice AI hợp lệ để ghép."}
+
+        intro_path = ""
+        if intro_voice_path and os.path.exists(intro_voice_path):
+            intro_candidate = os.path.join(tmp_dir, f"intro_{uuid.uuid4().hex[:6]}.mp4")
+            intro_path = render_intro_card(
+                intro_bg_source,
+                intro_voice_path,
+                intro_frame_path,
+                intro_candidate,
+                text_config=intro_text_config,
+                work_dir=tmp_dir,
+            )
+        body_output = (
+            os.path.join(tmp_dir, f"body_{uuid.uuid4().hex[:6]}.mp4")
+            if intro_path else output_path
+        )
+
+        voice_duration = sum(
+            get_media_duration(p) for p in valid_voice_paths
+        )
+        if voice_duration > 0:
+            target_duration = voice_duration + 0.5
+            if voice_duration > video_duration + 0.2:
+                extended = _loop_tail_extend(
+                    source_video, tmp_dir, target_duration,
+                )
+                if extended:
+                    source_video = extended
+                    video_duration = target_duration
+            duration = min(target_duration, video_duration)
+        else:
+            duration = video_duration
+            print("   ⚠️ Không đo được thời lượng voice — giữ thời lượng video gốc.")
+
+        # Bed nhạc gốc: Demucs tách vocal trước (nhanh hơn retry sau khi render lỗi).
+        demucs_bed = separate_instrumental_demucs(source_video, tmp_dir)
+        if demucs_bed:
+            bed_input_file = demucs_bed
+        else:
+            channels = probe_audio_channel_count(source_video)
+            bed_input_file = ""
+            if channels < 2:
+                print(
+                    "   ⚠️ Audio nguồn mono và không có Demucs — "
+                    "duck mạnh bed gốc, voice gốc còn lẩn khuất."
+                )
+
+        # Input 0 = video nguồn; [1] = bed Demucs (nếu có); tiếp theo = voice.
+        cmd = [FFMPEG_BINARY, "-y", "-i", source_video]
+        filter_parts = []
+        input_index = 1
+        bed_label = ""
+        if bed_input_file:
+            cmd += ["-i", bed_input_file]
+            bed_label = f"{input_index}:a"
+            input_index += 1
+
+        voice_labels = []
+        for voice_path in valid_voice_paths:
+            cmd += ["-i", voice_path]
+            voice_labels.append(f"{input_index}:a")
+            input_index += 1
+
+        frame_label = ""
+        if body_frame_path and os.path.exists(body_frame_path):
+            cmd += ["-i", body_frame_path]
+            frame_label = f"{input_index}:v"
+            input_index += 1
+
+        if len(voice_labels) == 1:
+            filter_parts.append(f"[{voice_labels[0]}]anull[voice_raw]")
+        else:
+            concat_inputs = "".join(f"[{label}]" for label in voice_labels)
+            filter_parts.append(
+                f"{concat_inputs}concat=n={len(voice_labels)}:v=0:a=1[voice_raw]"
+            )
+
+        if bed_label:
+            bed_chain = f"[{bed_label}]aformat=sample_rates=48000:channel_layouts=stereo"
+        elif channels >= 2:
+            bed_chain = (
+                "[0:a]aformat=sample_rates=48000:channel_layouts=stereo,"
+                "pan=stereo|c0=FL-FR|c1=FR-FL"
+            )
+            print("   🎼 Bed nhạc gốc: tách vocal stereo (L−R).")
+        else:
+            bed_chain = "[0:a]aformat=sample_rates=48000:channel_layouts=stereo,volume=-14dB"
+
+        fade_out_start = max(0.0, duration - min(0.8, duration / 3))
+        filter_parts.append(
+            f"{bed_chain},atrim=start=0:duration={duration:.3f},asetpts=PTS-STARTPTS,"
+            f"afade=t=in:st=0:d={min(0.2, duration / 4):.3f},"
+            f"afade=t=out:st={fade_out_start:.3f}:d={duration - fade_out_start:.3f},"
+            f"volume={bed_gain_db:.2f}dB[bed]"
+        )
+        filter_parts.append(
+            "[voice_raw]aformat=sample_rates=48000:channel_layouts=stereo,"
+            f"volume={voice_volume_db:.2f}dB,asplit=2[voice_mix][voice_side]"
+        )
+        filter_parts.append(
+            "[bed][voice_side]sidechaincompress=threshold=0.02:ratio=6:attack=25:release=400[bed_duck]"
+        )
+        filter_parts.append(
+            "[voice_mix][bed_duck]amix=inputs=2:duration=longest:normalize=0,"
+            "alimiter=limit=0.84,aresample=48000,"
+            "aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo[a_final]"
+        )
+
+        video_head = "[0:v]"
+        if frame_label:
+            filter_parts.append(
+                "[0:v]scale=1080:1920:force_original_aspect_ratio=decrease,"
+                "pad=1080:1920:(ow-iw)/2:(oh-ih)/2[v_pad];"
+                f"[{frame_label}]scale=1080:1920[frame_b];"
+                "[v_pad][frame_b]overlay=0:0[v_frame]"
+            )
+            video_head = "[v_frame]"
+
+        video_map = "0:v:0"
+        if frame_label or (subtitle_ass_path and os.path.exists(subtitle_ass_path)):
+            if subtitle_ass_path and os.path.exists(subtitle_ass_path):
+                filter_parts.append(
+                    f"{video_head}ass={_escape_ass_filter_path(subtitle_ass_path)}[v_final]"
+                )
+            else:
+                filter_parts.append(f"{video_head}null[v_final]")
+            video_map = "[v_final]"
+
+        cmd += [
+            "-filter_complex", ";".join(filter_parts),
+            "-map", video_map,
+            "-map", "[a_final]",
+            *final_output_args(),
+            "-t", f"{duration:.3f}",
+            body_output,
+        ]
+        os.chdir(tmp_dir)
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            report = _record_render_failure(
+                body_output, cmd, result.stderr, tmp_dir,
+                error_type="TitleScriptModeError",
+            )
+            print(f"   🔁 Render mode title_script lỗi; retry giữ frame, bỏ phụ đề... Diagnostic: {report}")
+
+            # Retry an toàn: giữ nguyên audio graph VÀ overlay frame kênh,
+            # chỉ bỏ phụ đề. Trước đây retry map thẳng 0:v:0 nên body bị
+            # phát hành không có frame trong khi log vẫn báo thành công.
+            def build_retry_cmd(include_frame):
+                filters = [
+                    part for part in filter_parts
+                    if "[v_final]" not in part
+                    and (include_frame or not part.startswith("[0:v]"))
+                ]
+                retry_cmd = [FFMPEG_BINARY, "-y", "-i", source_video]
+                if bed_input_file:
+                    retry_cmd += ["-i", bed_input_file]
+                for voice_path in valid_voice_paths:
+                    retry_cmd += ["-i", voice_path]
+                if include_frame and frame_label:
+                    retry_cmd += ["-i", body_frame_path]
+                retry_cmd += [
+                    "-filter_complex", ";".join(filters),
+                    "-map", "[v_frame]" if include_frame and frame_label else "0:v:0",
+                    "-map", "[a_final]",
+                    *final_output_args(),
+                    "-t", f"{duration:.3f}",
+                    body_output,
+                ]
+                return retry_cmd
+
+            result = subprocess.run(build_retry_cmd(True), capture_output=True, text=True)
+            if result.returncode != 0 and frame_label:
+                _record_render_failure(
+                    body_output, build_retry_cmd(True), result.stderr, tmp_dir,
+                    error_type="TitleScriptModeRetryFrameError",
+                )
+                print("   ⚠️ Retry còn frame vẫn lỗi; lần cuối bỏ frame để cứu video.")
+                result = subprocess.run(build_retry_cmd(False), capture_output=True, text=True)
+            if result.returncode != 0:
+                _record_render_failure(
+                    body_output, build_retry_cmd(False), result.stderr, tmp_dir,
+                    error_type="TitleScriptModeRetryError",
+                )
+                return {
+                    "final_path": "",
+                    "error": f"Render thất bại sau retry: {result.stderr[-500:]}",
+                }
+
+        if not os.path.exists(body_output):
+            return {"final_path": "", "error": "FFmpeg báo thành công nhưng không có file đầu ra."}
+
+        if intro_path:
+            concat_list = os.path.join(tmp_dir, f"concat_{uuid.uuid4().hex[:6]}.txt")
+            with open(concat_list, "w", encoding="utf-8") as list_file:
+                list_file.write(f"file '{intro_path}'\n")
+                list_file.write(f"file '{body_output}'\n")
+            concat_cmd = [
+                FFMPEG_BINARY, "-y", "-f", "concat", "-safe", "0",
+                "-i", concat_list, "-c", "copy", "-movflags", "+faststart",
+                output_path,
+            ]
+            concat_result = subprocess.run(concat_cmd, capture_output=True, text=True)
+            if concat_result.returncode != 0 or not os.path.exists(output_path):
+                print("   ⚠️ Ghép intro thất bại — trả thân video (không intro).")
+                os.replace(body_output, output_path)
+        print(f"   ✅ Render mode title_script xong: {output_path}")
+        return {"final_path": output_path, "watermark_detected": False}
+    except Exception as e:
+        print(f"❌ ERROR title_script mode: {e}")
+        import traceback; traceback.print_exc()
+        return {"final_path": "", "error": f"{type(e).__name__}: {e}"}
+    finally:
+        os.chdir(original_cwd)
+        if not work_dir and os.path.exists(tmp_dir):
+            try:
+                shutil.rmtree(tmp_dir, ignore_errors=True)
+            except Exception:
+                pass
+
+
+# ==============================================================================
+#  CHUẨN HÓA VIDEO GỐC CHO MODE PASS-THROUGH (GIỮ NGUYÊN / CHỈ TIÊU ĐỀ)
+#  VideoQA đòi chuẩn cứng (h264, 1080x1920, 30fps, AAC 48kHz stereo) nên video
+#  nguồn tải về phải được đóng gói lại trước khi upload; nếu nguồn đã đạt chuẩn
+#  thì giữ nguyên bytes.
+# ==============================================================================
+def _probe_media_spec(file_path: str) -> dict:
+    """Đọc spec kỹ thuật của video nguồn (codec, kích thước, fps, audio)."""
+    spec = {
+        "container": "", "video_codec": "", "pix_fmt": "",
+        "width": 0, "height": 0, "fps": 0.0,
+        "has_audio": False, "audio_codec": "",
+        "audio_sample_rate": 0, "audio_channels": 0,
+    }
+    try:
+        probe = ffmpeg.probe(file_path, cmd=FFPROBE_BINARY)
+    except Exception:
+        return spec
+    spec["container"] = str((probe.get("format") or {}).get("format_name", "")).lower()
+    for stream in probe.get("streams", []):
+        if stream.get("codec_type") == "video" and not spec["video_codec"]:
+            spec["video_codec"] = str(stream.get("codec_name", "")).lower()
+            spec["pix_fmt"] = str(stream.get("pix_fmt", "")).lower()
+            spec["width"] = int(float(stream.get("width") or 0))
+            spec["height"] = int(float(stream.get("height") or 0))
+            rate = stream.get("avg_frame_rate") or stream.get("r_frame_rate") or "0"
+            try:
+                if "/" in rate:
+                    num, den = rate.split("/", 1)
+                    spec["fps"] = float(num) / float(den or 1)
+                else:
+                    spec["fps"] = float(rate)
+            except (TypeError, ValueError, ZeroDivisionError):
+                spec["fps"] = 0.0
+        elif stream.get("codec_type") == "audio" and not spec["has_audio"]:
+            spec["has_audio"] = True
+            spec["audio_codec"] = str(stream.get("codec_name", "")).lower()
+            spec["audio_sample_rate"] = int(float(stream.get("sample_rate") or 0))
+            spec["audio_channels"] = int(float(stream.get("channels") or 0))
+    return spec
+
+
+def _video_matches_qa_spec(spec: dict) -> bool:
+    return (
+        ("mp4" in spec["container"] or "mov" in spec["container"])
+        and spec["video_codec"] == "h264"
+        and spec["pix_fmt"] == "yuv420p"
+        and (spec["width"], spec["height"]) == (1080, 1920)
+        and abs(spec["fps"] - 30.0) <= 0.05
+        and spec["has_audio"]
+        and spec["audio_codec"] == "aac"
+        and spec["audio_sample_rate"] == 48000
+        and spec["audio_channels"] == 2
+    )
+
+
+def conform_video_passthrough(
+    source_video: str,
+    output_path: str,
+    work_dir: str = "",
+) -> dict:
+    """
+    Mode GIỮ NGUYÊN / CHỈ TIÊU ĐỀ: đưa video nguồn về đúng chuẩn VideoQA
+    (h264, 1080x1920, 30fps, yuv420p, AAC 48kHz stereo) mà không đổi nội dung.
+    Nguồn đã đạt chuẩn thì trả nguyên file; nguồn ngang (ratio > 1.2) dùng
+    nền blur giữ trọn khung hình y như pipeline biên tập thường.
+    """
+    try:
+        spec = _probe_media_spec(source_video)
+        if not spec["video_codec"]:
+            return {"final_path": "", "error": "Không đọc được stream video nguồn."}
+        if _video_matches_qa_spec(spec):
+            print("   ✅ Video gốc đã đạt chuẩn QA — giữ nguyên bytes.")
+            return {"final_path": source_video, "watermark_detected": False}
+
+        os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+        filter_parts = []
+        width, height = spec["width"], spec["height"]
+        if width > 0 and height > 0 and width / height > 1.20:
+            filter_parts.append("[0:v]split=2[bgsrc][mainsrc]")
+            filter_parts.append(
+                "[bgsrc]scale=1080:1920:force_original_aspect_ratio=increase,"
+                "crop=1080:1920,boxblur=luma_radius=40:luma_power=2[bg]"
+            )
+            filter_parts.append("[mainsrc]scale=1080:-2[main]")
+            filter_parts.append("[bg][main]overlay=(W-w)/2:(H-h)/2[vout]")
+            print("   🖼️ Nguồn ngang — dựng nền blur giữ trọn khung hình.")
+        else:
+            filter_parts.append(
+                "[0:v]scale=1080:1920:force_original_aspect_ratio=increase,"
+                "crop=1080:1920[vout]"
+            )
+
+        cmd = [FFMPEG_BINARY, "-y", "-i", source_video]
+        if spec["has_audio"]:
+            filter_parts.append(
+                "[0:a]aformat=sample_rates=48000:channel_layouts=stereo[aout]"
+            )
+        else:
+            # -shortest không dừng được nguồn lavfi vô hạn qua filter_complex,
+            # ép -t bằng đúng thời lượng video nguồn.
+            duration = get_media_duration(source_video)
+            cmd += [
+                "-f", "lavfi", "-i", "anullsrc=r=48000:cl=stereo",
+                "-t", f"{max(duration, 0.5):.3f}",
+            ]
+            filter_parts.append("[1:a]anull[aout]")
+
+        cmd += [
+            "-filter_complex", ";".join(filter_parts),
+            "-map", "[vout]",
+            "-map", "[aout]",
+            *final_output_args(),
+            output_path,
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            tmp_dir = work_dir or os.path.dirname(output_path) or "."
+            report = _record_render_failure(
+                output_path, cmd, result.stderr, tmp_dir,
+                error_type="PassthroughConformError",
+            )
+            print(f"   🔁 Chuẩn hóa pass-through lỗi. Diagnostic: {report}")
+            return {
+                "final_path": "",
+                "error": f"Chuẩn hóa video nguồn thất bại: {result.stderr[-400:]}",
+            }
+        if not os.path.exists(output_path):
+            return {"final_path": "", "error": "Chuẩn hóa xong nhưng thiếu file đầu ra."}
+        print(f"   ✅ Chuẩn hóa pass-through xong: {output_path}")
+        return {"final_path": output_path, "watermark_detected": False}
+    except Exception as e:
+        print(f"❌ ERROR conform passthrough: {e}")
+        import traceback; traceback.print_exc()
+        return {"final_path": "", "error": f"{type(e).__name__}: {e}"}
+

@@ -78,8 +78,11 @@ sys.path.insert(0, PROJECT_ROOT)
 from shared.core.experiment_manager import apply_experiment_metadata
 from shared.core.prompt_builder import build_prompt, resolve_prompt_experiment
 from apps.creator_facebook.facebook_pipeline.hook_mode import build_hook_prompt
+from apps.creator_facebook.facebook_pipeline.title_mode import build_title_only_prompt
 from apps.creator_facebook.facebook_pipeline.source_config import (
     EDIT_MODE_HOOK_THEN_ORIGINAL,
+    EDIT_MODE_TITLE_ONLY,
+    EDIT_MODE_TITLE_SCRIPT,
 )
 from shared.services.gemini_response_reader import (
     extract_json_from_text as extract_gemini_json,
@@ -511,6 +514,14 @@ def analyze_video_with_gemini_web(
             extra_content=extra_content,
             repair_instruction=repair_instruction,
         )
+    elif edit_mode == EDIT_MODE_TITLE_ONLY:
+        experiment_assignment = None
+        full_prompt = build_title_only_prompt(
+            caption=caption,
+            channel_id=clean_id,
+            extra_content=extra_content,
+            repair_instruction=repair_instruction,
+        )
     else:
         experiment_assignment = resolve_prompt_experiment(
             clean_id,
@@ -521,6 +532,23 @@ def analyze_video_with_gemini_web(
             ),
             task_input=task_input,
         )
+        # Mode 4: nguồn ngắn không được làm cớ bỏ script — thân video sẽ
+        # được lặp phần cuối để đủ voice, nên kịch bản chỉ cần ngắn gọn.
+        title_script_override = ""
+        if edit_mode == EDIT_MODE_TITLE_SCRIPT:
+            title_script_override = (
+                "MODE SỬA TIÊU ĐỀ + KỊCH BẢN — BẮT BUỘC CÓ KỊCH BẢN:\n"
+                "- Viết script_voice đầy đủ, TUYỆT ĐỐI KHÔNG để trống và KHÔNG "
+                "được từ chối với lý do 'nguồn ngắn', 'không đủ căn cứ cho bản "
+                "tin 50-55 giây' hoặc tương tự. Quy tắc thời lượng 50-55 giây "
+                "KHÔNG áp dụng cho mode này.\n"
+                "- Độ dài kịch bản linh hoạt theo độ dày thông tin của nguồn: "
+                "khoảng 60-120 từ. Thân video sẽ được lặp lại phần cuối để đủ "
+                "tiếng nên không cần lo kịch bản dài hơn video.\n"
+                "- Chỉ kể đúng những gì video/caption cho thấy; vật liệu ít thì "
+                "viết gọn nhưng vẫn đủ Mở đầu - Thân bài - Kết thúc.\n"
+                "- should_make_video bắt buộc là true vì người dùng đã duyệt video."
+            )
         full_prompt = build_prompt(
             prompt_text,
             clean_id,
@@ -529,6 +557,7 @@ def analyze_video_with_gemini_web(
             repair_instruction=repair_instruction,
             operator_profiles=(extra_content,) if extra_content else (),
             experiment_assignment=experiment_assignment,
+            edit_mode_override=title_script_override,
         )
 
     # Gemini occasionally interprets "sản xuất video" in the editorial role as
