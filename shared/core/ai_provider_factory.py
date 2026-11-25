@@ -57,6 +57,18 @@ def save_configured_ai_provider(provider: str) -> str:
     return clean_provider
 
 
+def _should_allow_gemini_fallback() -> bool:
+    """Chỉ cho phép fallback sang Gemini nếu cấu hình cho phép rõ ràng."""
+    if os.path.exists(CONFIG_FILE):
+        try:
+            with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                return bool(data.get("allow_gemini_fallback", False))
+        except Exception:
+            pass
+    return False
+
+
 def analyze_video_content(
     video_path: str,
     caption: str,
@@ -111,7 +123,7 @@ def analyze_video_content(
             whisper_transcript=whisper_transcript,
             hide_chrome=hide_chrome,
         )
-        if not result and enable_auto_fallback:
+        if not result and enable_auto_fallback and _should_allow_gemini_fallback():
             print("   ⚠️ ChatGPT gặp lỗi hoặc bận, tự động chuyển sang Gemini (Web/API) dự phòng...")
             result = analyze_video_with_gemini(
                 video_path=video_path,
@@ -188,7 +200,7 @@ def analyze_article_content(
         else:
             result = None
 
-        if not result and enable_auto_fallback:
+        if not result and enable_auto_fallback and _should_allow_gemini_fallback():
             print("   ⚠️ ChatGPT gặp lỗi, tự động chuyển sang Gemini làm dự phòng cho bài viết...")
             result = analyze_video_with_gemini(
                 video_path="",

@@ -9,6 +9,7 @@ from typing import Any, Mapping
 
 from shared.core.content_models import CLAIM_TYPES, STORY_TYPES
 from shared.core.evidence_guard import EVIDENCE_GUARD_ENABLED
+from shared.core.vietnamese_accent import is_vietnamese_accented_valid
 
 
 GENERIC_HOOK_PREFIXES = (
@@ -376,8 +377,33 @@ def validate_content(
             5,
         )
 
+    if selected_hook:
+        is_valid_hook, unacc_ratio_hook, hook_reason = is_vietnamese_accented_valid(
+            selected_hook, max_unaccented_ratio=0.30, min_words_to_check=15
+        )
+        if not is_valid_hook:
+            add_error(
+                "UNACCENTED_HOOK",
+                f"Hook không đạt chuẩn tiếng Việt có dấu: {hook_reason}. Bắt buộc 100% tiếng Việt có dấu chuẩn xác.",
+                "selected_hook",
+                "hook",
+                15,
+            )
+
     script = _compact(content.get("script_voice"))
     script_words = _words(script)
+
+    is_valid_script, unacc_ratio_script, script_reason = is_vietnamese_accented_valid(
+        script, max_unaccented_ratio=0.30, min_words_to_check=15
+    )
+    if not is_valid_script:
+        add_error(
+            "UNACCENTED_VIETNAMESE",
+            f"Kịch bản script_voice không đạt chuẩn tiếng Việt có dấu: {script_reason}. Bắt buộc 100% tiếng Việt có dấu chuẩn xác.",
+            "script_voice",
+            "clarity",
+            20,
+        )
     if len(script_words) < 120:
         add_error(
             "SCRIPT_TOO_SHORT",

@@ -11,6 +11,7 @@ from apps.creator_article.article_chatgpt_automator import (
     _extract_last_json_object,
     _looks_like_generated_result,
     build_article_plugin_package,
+    ensure_chat_mode_selected,
     ensure_work_mode_selected,
 )
 
@@ -96,8 +97,36 @@ class ChatGPTAutomatorPluginTests(unittest.TestCase):
                 return self.btn
 
         page = FakePage("false")
-        self.assertTrue(ensure_work_mode_selected(page, timeout_seconds=1.0))
+        self.assertTrue(ensure_chat_mode_selected(page, timeout_seconds=1.0))
         self.assertEqual(len(clicked), 1)
+
+    def test_ensure_chat_mode_already_pressed_does_not_click(self):
+        clicked = []
+
+        class FakeButton:
+            def count(self):
+                return 1
+
+            @property
+            def first(self):
+                return self
+
+            def is_visible(self, timeout=0):
+                return True
+
+            def get_attribute(self, name):
+                return "true"
+
+            def click(self, timeout=0, force=False):
+                clicked.append(True)
+
+        class FakePage:
+            def locator(self, selector: str):
+                return FakeButton()
+
+        page = FakePage()
+        self.assertTrue(ensure_chat_mode_selected(page, timeout_seconds=1.0))
+        self.assertEqual(len(clicked), 0)
 
 
 if __name__ == "__main__":

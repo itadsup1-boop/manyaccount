@@ -5,7 +5,10 @@ import time
 import re
 import sys
 import shutil
+import threading
 from playwright.sync_api import sync_playwright
+
+_PROMPT_INPUT_LOCK = threading.Lock()
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, PROJECT_ROOT)
@@ -25,6 +28,7 @@ NEWS_VIDEO_STUDIO_PLUGIN_NAME = os.environ.get(
 ).strip()
 NEWS_VIDEO_STUDIO_PROMPT = (
     "Đọc file đính kèm và chỉ trả Tool Media Article JSON v1. "
+    "BẮT BUỘC 100% TIẾNG VIỆT CÓ DẤU CHUẨN XÁC: Toàn bộ tiêu đề, hook, kịch bản (script_voice), visual_query bắt buộc phải viết bằng TIẾNG VIỆT CÓ ĐẦY ĐỦ DẤU THANH VÀ KÝ TỰ VIỆT (ă, â, đ, ê, ô, ơ, ư...). TUYỆT ĐỐI CẤM viết tiếng Việt không dấu. "
     "Bắt buộc có 3-5 beat B-roll: mỗi beat chỉ dùng duy nhất 1 biến visual_query "
     "mô tả chi tiết, chân thực, sát đúng nội dung bài báo; "
     "chỉ dùng DATA GRAPHIC: hoặc MAP GRAPHIC: cho các beat số liệu/bản đồ, không để visual_query rỗng ở mọi beat."
@@ -145,21 +149,23 @@ def _replace_prompt_text(page, text: str):
     page.keyboard.press(f"{modifier}+A")
     page.keyboard.press("Backspace")
     time.sleep(0.3)
-    try:
-        # Ưu tiên clipboard thật; insert_text chỉ là fallback khi trình duyệt
-        # chặn quyền clipboard.
-        page.evaluate(
-            """async (value) => {
-                await navigator.clipboard.writeText(value);
-            }""",
-            text,
-        )
-        page.keyboard.press(f"{modifier}+V")
-    except Exception:
+    with _PROMPT_INPUT_LOCK:
         try:
-            page.keyboard.insert_text(text)
+            # Ưu tiên clipboard thật; có lock đồng bộ để 3 kênh chạy song song không
+            # ghi đè clipboard của nhau khi Ctrl+V.
+            page.evaluate(
+                """async (value) => {
+                    await navigator.clipboard.writeText(value);
+                }""",
+                text,
+            )
+            page.keyboard.press(f"{modifier}+V")
         except Exception:
-            pass
+            try:
+                page.keyboard.insert_text(text)
+            except Exception:
+                pass
+        time.sleep(0.4)
 
     def current_length() -> int:
         try:
@@ -254,6 +260,7 @@ def build_article_plugin_package(
     blocks.extend(
         [
             "Thời lượng mục tiêu: 52 giây (7-9 beats; hook 10-16 từ + script_voice 140-150 từ).",
+            "Yêu cầu ngôn ngữ BẮT BUỘC: 100% Tiếng Việt có dấu chuẩn xác (không viết không dấu, không để mất dấu). Mọi trường văn bản từ hook, script_voice đến visual_query đều phải viết bằng tiếng Việt có đầy đủ dấu thanh.",
             "Yêu cầu B-roll bắt buộc: phải có ít nhất 3 và tối đa 5 beat B-roll. Mỗi beat chỉ dùng duy nhất 1 biến visual_query mô tả chi tiết, chân thực, sát đúng nội dung sự kiện/bối cảnh bài báo để tìm ảnh thực tế (không tạo biến phụ rườm rà). Chỉ dùng DATA GRAPHIC: hoặc MAP GRAPHIC: cho số liệu/so sánh/bản đồ; không để visual_query rỗng ở mọi beat.",
             "Đầu ra: chỉ trả duy nhất 1 object JSON hợp lệ theo Tool Media Article JSON v1, không Markdown, không giải thích.",
             f'Bắt buộc giữ đúng "id_tiktok": "{id_tiktok}" trong JSON.',
@@ -480,6 +487,19 @@ def dismiss_rate_limit_dialog(page) -> bool:
     return is_rate_limited(dismiss_blocking_dialog(page))
 
 
+CHAT_MODE_SELECTORS = (
+    'button:has-text("Chat")',
+    '[role="tab"]:has-text("Chat")',
+    '[role="radio"]:has-text("Chat")',
+    'button[class*="home-mode-toggle"][class*="col-start-1"]',
+    'button[class*="home-mode-toggle"]:has-text("Chat")',
+    'button[class*="mode-toggle"]:has-text("Chat")',
+    'button[aria-pressed]:has-text("Chat")',
+    'button:has(span:text-is("Chat"))',
+    'button:text-is("Chat")',
+    'div[class*="home-mode-toggle"] button:first-child',
+)
+
 WORK_MODE_SELECTORS = (
     'button[class*="home-mode-toggle"][class*="col-start-2"]',
     'button[class*="home-mode-toggle"]:has-text("Công việc")',
@@ -493,56 +513,159 @@ WORK_MODE_SELECTORS = (
 )
 
 
-def ensure_work_mode_selected(page, timeout_seconds: float = 10.0) -> bool:
-    """Đảm bảo nút chế độ 'Công việc' / 'Work' (home-mode-toggle) được chọn khi mở ChatGPT."""
+def ensure_chat_mode_selected(page, timeout_seconds: float = 6.0) -> bool:
+    """Đảm bảo ChatGPT luôn ở chế độ 'Chat' (tuyệt đối KHÔNG ở chế độ 'Work' / 'Công việc').
+
+    Nếu phát hiện đang ở chế độ 'Work', tự động click chuyển ngay về chế độ 'Chat' bằng cả
+    Playwright CDP click, pointerdown/mouseup events và tọa độ chuột, sau đó kiểm tra lại
+    để đảm bảo chế độ 'Chat' thực sự đã được kích hoạt.
+    """
     deadline = time.time() + max(1.0, float(timeout_seconds))
     while True:
-        for selector in WORK_MODE_SELECTORS:
+        # 1. Kiểm tra nhanh qua locator: nếu nút Chat đã active (aria-pressed/aria-selected="true")
+        for selector in CHAT_MODE_SELECTORS:
             try:
-                locator = page.locator(selector)
-                if locator.count() == 0:
+                loc = page.locator(selector)
+                if loc.count() > 0 and loc.first.is_visible(timeout=200):
+                    attr_pressed = str(loc.first.get_attribute("aria-pressed") or "").strip().lower()
+                    attr_selected = str(loc.first.get_attribute("aria-selected") or "").strip().lower()
+                    if attr_pressed == "true" or attr_selected == "true":
+                        return True
+            except Exception:
+                pass
+
+        # 2. Kiểm tra chi tiết qua DOM evaluate nếu có hỗ trợ
+        is_work_active = False
+        try:
+            if hasattr(page, "evaluate"):
+                status = page.evaluate(
+                    """() => {
+                        const text = (document.body ? document.body.innerText : '') || '';
+                        const isWorkHeadline = text.includes('What should we work on?');
+                        const promptArea = document.querySelector('#prompt-textarea');
+                        const placeholder = promptArea ? (promptArea.getAttribute('placeholder') || '') : '';
+                        const isWorkPlaceholder = placeholder.toLowerCase().includes('work with chatgpt');
+
+                        const allButtons = Array.from(document.querySelectorAll('button, [role="tab"], [role="radio"]'));
+                        const workBtn = allButtons.find(b => {
+                            const t = (b.innerText || '').trim().toLowerCase();
+                            return t === 'work' || t === 'công việc';
+                        });
+                        const chatBtn = allButtons.find(b => {
+                            const t = (b.innerText || '').trim().toLowerCase();
+                            return t === 'chat';
+                        });
+
+                        let workActive = isWorkHeadline || isWorkPlaceholder;
+                        if (workBtn) {
+                            const ariaSelected = workBtn.getAttribute('aria-selected');
+                            const ariaPressed = workBtn.getAttribute('aria-pressed');
+                            const dataState = workBtn.getAttribute('data-state');
+                            const cls = workBtn.className || '';
+                            if (ariaSelected === 'true' || ariaPressed === 'true' || dataState === 'active' || cls.includes('bg-')) {
+                                workActive = true;
+                            }
+                        }
+                        return { workActive, hasChatBtn: !!chatBtn, hasWorkBtn: !!workBtn };
+                    }"""
+                )
+                if isinstance(status, dict):
+                    is_work_active = bool(status.get("workActive"))
+        except Exception:
+            pass
+
+        # 3. Thực hiện click chuyển về 'Chat'
+        clicked_any = False
+        for selector in CHAT_MODE_SELECTORS:
+            try:
+                loc = page.locator(selector)
+                if loc.count() == 0:
                     continue
-                button = locator.first
+                button = loc.first
                 if not button.is_visible(timeout=500):
                     continue
-                aria_pressed = str(button.get_attribute("aria-pressed") or "").strip().lower()
-                if aria_pressed == "true":
-                    print("      💼 Chế độ 'Công việc' (Work) trên ChatGPT đã được bật sẵn.")
+                attr_pressed = str(button.get_attribute("aria-pressed") or "").strip().lower()
+                attr_selected = str(button.get_attribute("aria-selected") or "").strip().lower()
+                if attr_pressed == "true" or attr_selected == "true":
                     return True
 
-                clicked = False
-                for click_attempt in range(3):
-                    try:
-                        if click_attempt == 0:
-                            button.click(timeout=5000)
-                        elif click_attempt == 1:
-                            button.click(timeout=5000, force=True)
-                        else:
-                            handle = button.element_handle(timeout=2000)
-                            if handle:
-                                page.evaluate("(el) => el.click()", handle)
-                        clicked = True
-                    except Exception:
-                        continue
-                    time.sleep(1.0)
-                    new_pressed = str(button.get_attribute("aria-pressed") or "").strip().lower()
-                    if new_pressed == "true":
-                        break
+                print("      💬 Đang bấm nút 'Chat' để chuyển khỏi chế độ 'Work'...")
+                button.click(force=True)
+                clicked_any = True
 
-                if clicked:
-                    time.sleep(1.5)
-                    final_pressed = str(button.get_attribute("aria-pressed") or "").strip().lower()
-                    print(
-                        f"      💼 Đã chọn chế độ 'Công việc' (Work) trên ChatGPT "
-                        f"(aria-pressed={final_pressed})."
-                    )
+                # Kiểm tra lại ngay sau khi bấm
+                new_pressed = str(button.get_attribute("aria-pressed") or "").strip().lower()
+                new_selected = str(button.get_attribute("aria-selected") or "").strip().lower()
+                if new_pressed == "true" or new_selected == "true":
                     return True
+                break
             except Exception:
                 continue
+
+        # Thử click bằng tọa độ chuột và pointer events nếu có
+        if clicked_any:
+            try:
+                if hasattr(page, "mouse") and hasattr(page, "evaluate"):
+                    coords = page.evaluate(
+                        """() => {
+                            const allButtons = Array.from(document.querySelectorAll('button, [role="tab"], [role="radio"]'));
+                            const chatBtn = allButtons.find(b => (b.innerText || '').trim().toLowerCase() === 'chat');
+                            if (chatBtn) {
+                                const rect = chatBtn.getBoundingClientRect();
+                                return { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 };
+                            }
+                            return null;
+                        }"""
+                    )
+                    if coords and isinstance(coords, dict) and "x" in coords:
+                        page.mouse.click(coords["x"], coords["y"])
+            except Exception:
+                pass
+
+            try:
+                if hasattr(page, "evaluate"):
+                    page.evaluate(
+                        """() => {
+                            const allButtons = Array.from(document.querySelectorAll('button, [role="tab"], [role="radio"]'));
+                            const chatBtn = allButtons.find(b => (b.innerText || '').trim().toLowerCase() === 'chat');
+                            if (chatBtn) {
+                                ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click'].forEach(evtType => {
+                                    chatBtn.dispatchEvent(new MouseEvent(evtType, { bubbles: true, cancelable: true, view: window }));
+                                });
+                            }
+                        }"""
+                    )
+            except Exception:
+                pass
+
+            # Xác minh sau khi click
+            time.sleep(0.5)
+            try:
+                if hasattr(page, "evaluate"):
+                    verify = page.evaluate(
+                        """() => {
+                            const text = (document.body ? document.body.innerText : '') || '';
+                            const promptArea = document.querySelector('#prompt-textarea');
+                            const placeholder = promptArea ? (promptArea.getAttribute('placeholder') || '') : '';
+                            return text.includes('What should we work on?') || placeholder.toLowerCase().includes('work with chatgpt');
+                        }"""
+                    )
+                    if not verify:
+                        print("      ✅ Đã đảm bảo ChatGPT ở chế độ 'Chat' (không ở chế độ 'Work')!")
+                        return True
+            except Exception:
+                pass
+
+            return True
 
         if time.time() >= deadline:
             return False
         time.sleep(0.5)
+
+
+def ensure_work_mode_selected(page, timeout_seconds: float = 6.0) -> bool:
+    """Tương thích ngược: luôn đảm bảo chọn chế độ 'Chat' theo yêu cầu người dùng."""
+    return ensure_chat_mode_selected(page, timeout_seconds=timeout_seconds)
 
 
 
@@ -978,6 +1101,7 @@ def login_chatgpt_interactive(id_tiktok: str):
         )
         page = _use_single_browser_page(context)
         page.goto("https://chatgpt.com/", wait_until="domcontentloaded")
+        ensure_chat_mode_selected(page, timeout_seconds=4.0)
         print("🌐 Chrome đã mở. Hãy đăng nhập ChatGPT...")
         wait_for_login_finish(context)
         context.close()
@@ -1133,29 +1257,37 @@ def analyze_article_with_chatgpt(
         experiment_assignment=experiment_assignment,
     )
 
-    article_input_path, article_package_text = build_article_plugin_package(
-        id_tiktok=id_tiktok,
-        source_url=source_url,
-        source_title=source_title,
-        source_content=source_content,
-        source_name=source_name,
-        published_at=published_at,
-        source_author=source_author,
-        source_category=source_category,
-        source_hash=source_hash,
-        intro=str(sections.get("intro") or "").strip(),
-        conclusion=str(sections.get("conclusion") or "").strip(),
-        operator_instruction=operator_instruction,
+    use_plugin = (
+        os.environ.get("CHATGPT_ARTICLE_USE_PLUGIN", "false").strip().lower()
+        in {"1", "true", "yes"}
     )
-    plugin_instruction = NEWS_VIDEO_STUDIO_PROMPT
-    if str(repair_instruction or "").strip():
-        plugin_instruction = (
-            f"{NEWS_VIDEO_STUDIO_PROMPT}\n\n"
-            f"YÊU CẦU SỬA DUY NHẤT\n{str(repair_instruction).strip()}"
+    article_input_path = ""
+    plugin_instruction = ""
+    inline_plugin_instruction = ""
+    if use_plugin:
+        article_input_path, article_package_text = build_article_plugin_package(
+            id_tiktok=id_tiktok,
+            source_url=source_url,
+            source_title=source_title,
+            source_content=source_content,
+            source_name=source_name,
+            published_at=published_at,
+            source_author=source_author,
+            source_category=source_category,
+            source_hash=source_hash,
+            intro=str(sections.get("intro") or "").strip(),
+            conclusion=str(sections.get("conclusion") or "").strip(),
+            operator_instruction=operator_instruction,
         )
-    inline_plugin_instruction = (
-        f"{plugin_instruction}\n\n{article_package_text}"
-    )
+        plugin_instruction = NEWS_VIDEO_STUDIO_PROMPT
+        if str(repair_instruction or "").strip():
+            plugin_instruction = (
+                f"{NEWS_VIDEO_STUDIO_PROMPT}\n\n"
+                f"YÊU CẦU SỬA DUY NHẤT\n{str(repair_instruction).strip()}"
+            )
+        inline_plugin_instruction = (
+            f"{plugin_instruction}\n\n{article_package_text}"
+        )
 
     chrome_mode = "ẩn" if hide_chrome else "hiện"
     print(f"      🤖 Mở ChatGPT (Automator, Chrome {chrome_mode}) cho kênh {id_tiktok}...")
@@ -1207,8 +1339,14 @@ def analyze_article_with_chatgpt(
             ]
 
             for attempt in range(1, MAX_RESPONSE_RECOVERY_RETRIES + 1):
-                page.goto(chat_url, wait_until="domcontentloaded", timeout=60000)
-                time.sleep(5)
+                try:
+                    page.goto(chat_url, wait_until="domcontentloaded", timeout=45000)
+                except Exception as goto_err:
+                    print(f"      ⚠️ Tải ChatGPT chậm hoặc lỗi ({goto_err}); sẽ thử tải lại lần {attempt}...")
+                    time.sleep(3)
+                    continue
+                time.sleep(2)
+                ensure_chat_mode_selected(page, timeout_seconds=4.0)
                 chat_url = remember_active_chat_url(page, chat_url)
 
                 if dismiss_rate_limit_dialog(page):
@@ -1220,20 +1358,12 @@ def analyze_article_with_chatgpt(
                     time.sleep(RATE_LIMIT_RETRY_WAIT_SECONDS)
                     continue
 
-                ensure_work_mode_selected(page)
-
                 try:
                     page.wait_for_selector(
                         "#prompt-textarea, [contenteditable='true']", timeout=45000
                     )
+                    ensure_chat_mode_selected(page, timeout_seconds=4.0)
                 except Exception:
-                    if ensure_work_mode_selected(page, timeout_seconds=3.0):
-                        try:
-                            page.wait_for_selector(
-                                "#prompt-textarea, [contenteditable='true']", timeout=15000
-                            )
-                        except Exception:
-                            pass
                     if page.locator("#prompt-textarea, [contenteditable='true']").count() == 0:
                         if is_cloudflare_challenge(page):
                             print("      ❌ Cloudflare chặn! Cần login lại ChatGPT.")
@@ -1266,71 +1396,101 @@ def analyze_article_with_chatgpt(
                         break
 
                 previous_assistant_count = _assistant_message_count(page)
-                file_attached = False
-                if source_content and os.path.isfile(article_input_path):
+
+                if use_plugin:
+                    file_attached = False
+                    if source_content and os.path.isfile(article_input_path):
+                        try:
+                            print(
+                                f"      📎 Đính kèm file {os.path.basename(article_input_path)} "
+                                f"cho @{NEWS_VIDEO_STUDIO_PLUGIN_NAME}..."
+                            )
+                            file_input = page.locator("input[type='file']:not([accept*='image'])")
+                            if file_input.count() == 0:
+                                file_input = page.locator("input[type='file']")
+                            if file_input.count() > 0:
+                                file_input.last.set_input_files(article_input_path)
+                                upload_status = wait_for_article_file_upload(
+                                    page, article_input_path, timeout_seconds=12
+                                )
+                                chat_url = remember_active_chat_url(page, chat_url)
+                                if upload_status == UPLOAD_RATE_LIMITED:
+                                    print(
+                                        "      ⏳ ChatGPT báo 'Too many requests' khi đính kèm file; "
+                                        "đã bấm Got it, sẽ tải lại đúng chat."
+                                    )
+                                    time.sleep(RATE_LIMIT_RETRY_WAIT_SECONDS)
+                                    continue
+                                file_attached = upload_status == UPLOAD_READY
+                        except Exception as upload_error:
+                            print(
+                                f"      ⚠️ Không đính kèm được file article_input.txt ({upload_error}); "
+                                "chuyển sang gửi kèm các khối nội dung trực tiếp."
+                            )
+                            file_attached = False
+
+                    active_instruction = (
+                        plugin_instruction if file_attached else inline_plugin_instruction
+                    )
                     try:
                         print(
-                            f"      📎 Đính kèm file {os.path.basename(article_input_path)} "
-                            f"cho @{NEWS_VIDEO_STUDIO_PLUGIN_NAME}..."
+                            f"      ✍️ Gọi @{NEWS_VIDEO_STUDIO_PLUGIN_NAME} và nhập lệnh..."
                         )
-                        file_input = page.locator("input[type='file']:not([accept*='image'])")
-                        if file_input.count() == 0:
-                            file_input = page.locator("input[type='file']")
-                        if file_input.count() > 0:
-                            file_input.last.set_input_files(article_input_path)
-                            upload_status = wait_for_article_file_upload(
-                                page, article_input_path, timeout_seconds=12
+                        inserted_chars = _invoke_news_video_studio_plugin(
+                            page,
+                            active_instruction,
+                            plugin_name=NEWS_VIDEO_STUDIO_PLUGIN_NAME,
+                        )
+                        print(
+                            f"      ✅ Đã nhập lệnh @{NEWS_VIDEO_STUDIO_PLUGIN_NAME} "
+                            f"({inserted_chars} ký tự, đính kèm file={file_attached})."
+                        )
+                    except Exception as prompt_error:
+                        chat_url = remember_active_chat_url(page, chat_url)
+                        rate_limited = dismiss_rate_limit_dialog(page)
+                        if rate_limited:
+                            print(
+                                "      ⏳ Không nhập được nội dung vì 'Too many requests'; "
+                                "đã bấm Got it, sẽ tải lại đúng chat."
                             )
-                            chat_url = remember_active_chat_url(page, chat_url)
-                            if upload_status == UPLOAD_RATE_LIMITED:
-                                print(
-                                    "      ⏳ ChatGPT báo 'Too many requests' khi đính kèm file; "
-                                    "đã bấm Got it, sẽ tải lại đúng chat."
-                                )
-                                time.sleep(RATE_LIMIT_RETRY_WAIT_SECONDS)
-                                continue
-                            file_attached = upload_status == UPLOAD_READY
-                    except Exception as upload_error:
-                        print(
-                            f"      ⚠️ Không đính kèm được file article_input.txt ({upload_error}); "
-                            "chuyển sang gửi kèm các khối nội dung trực tiếp."
+                        else:
+                            print(
+                                f"      🔄 Không nhập được nội dung: {prompt_error}; "
+                                "sẽ tải lại đúng chat."
+                            )
+                        time.sleep(
+                            RATE_LIMIT_RETRY_WAIT_SECONDS
+                            if rate_limited else RECOVERY_RELOAD_WAIT_SECONDS
                         )
-                        file_attached = False
-
-                active_instruction = (
-                    plugin_instruction if file_attached else inline_plugin_instruction
-                )
-                try:
-                    print(
-                        f"      ✍️ Gọi @{NEWS_VIDEO_STUDIO_PLUGIN_NAME} và nhập lệnh..."
-                    )
-                    inserted_chars = _invoke_news_video_studio_plugin(
-                        page,
-                        active_instruction,
-                        plugin_name=NEWS_VIDEO_STUDIO_PLUGIN_NAME,
-                    )
-                    print(
-                        f"      ✅ Đã nhập lệnh @{NEWS_VIDEO_STUDIO_PLUGIN_NAME} "
-                        f"({inserted_chars} ký tự, đính kèm file={file_attached})."
-                    )
-                except Exception as prompt_error:
-                    chat_url = remember_active_chat_url(page, chat_url)
-                    rate_limited = dismiss_rate_limit_dialog(page)
-                    if rate_limited:
+                        continue
+                else:
+                    try:
                         print(
-                            "      ⏳ Không nhập được nội dung vì 'Too many requests'; "
-                            "đã bấm Got it, sẽ tải lại đúng chat."
+                            "      ✍️ Nhập prompt đầy đủ từ file prompt_article.txt và nội dung bài báo..."
                         )
-                    else:
+                        inserted_chars = _replace_prompt_text(page, full_prompt)
                         print(
-                            f"      🔄 Không nhập được nội dung: {prompt_error}; "
-                            "sẽ tải lại đúng chat."
+                            f"      ✅ Đã nhập đủ prompt "
+                            f"({inserted_chars}/{len(full_prompt)} ký tự)."
                         )
-                    time.sleep(
-                        RATE_LIMIT_RETRY_WAIT_SECONDS
-                        if rate_limited else RECOVERY_RELOAD_WAIT_SECONDS
-                    )
-                    continue
+                    except Exception as prompt_error:
+                        chat_url = remember_active_chat_url(page, chat_url)
+                        rate_limited = dismiss_rate_limit_dialog(page)
+                        if rate_limited:
+                            print(
+                                "      ⏳ Không nhập được nội dung vì 'Too many requests'; "
+                                "đã bấm Got it, sẽ tải lại đúng chat."
+                            )
+                        else:
+                            print(
+                                f"      🔄 Không nhập được nội dung: {prompt_error}; "
+                                "sẽ tải lại đúng chat."
+                            )
+                        time.sleep(
+                            RATE_LIMIT_RETRY_WAIT_SECONDS
+                            if rate_limited else RECOVERY_RELOAD_WAIT_SECONDS
+                        )
+                        continue
 
                 try:
                     print("      🚀 Gửi yêu cầu...")
@@ -1778,6 +1938,33 @@ def analyze_article_with_chatgpt(
                     result[key] = default_val
 
             result["id_tiktok"] = id_tiktok  # Ép cứng lại đề phòng AI quên
+
+            # Kiểm tra tiếng Việt có dấu: nếu >= 30% từ không dấu thì hủy bài ngay lập tức
+            hook_check = str(result.get("hook") or result.get("selected_hook") or "")
+            script_check = str(result.get("script_voice") or "")
+            combined_txt = f"{hook_check} {script_check}".strip()
+            if combined_txt:
+                from shared.core.vietnamese_accent import is_vietnamese_accented_valid
+                is_valid_acc, unacc_ratio, acc_reason = is_vietnamese_accented_valid(
+                    combined_txt, max_unaccented_ratio=0.30, min_words_to_check=15
+                )
+                if not is_valid_acc:
+                    print(
+                        f"      ❌ ChatGPT trả về tiếng Việt không dấu ({acc_reason}). "
+                        f"Bỏ bài báo này ngay từ bước đọc ChatGPT (không gửi sang tool voice, không dựng video)!"
+                    )
+                    save_chatgpt_log(
+                        prompt=full_prompt,
+                        raw_response=raw_text,
+                        parsed_result=result,
+                        id_tiktok=id_tiktok,
+                        source_url=article_url,
+                        source_type="article",
+                        status="UNACCENTED_VIETNAMESE",
+                        error_message=f"Tiếng Việt không đạt chuẩn có dấu: {acc_reason}",
+                    )
+                    context.close()
+                    return None
             if experiment_assignment:
                 result = apply_experiment_metadata(result, experiment_assignment)
             else:

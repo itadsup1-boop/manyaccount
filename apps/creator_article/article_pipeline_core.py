@@ -8,6 +8,14 @@ import shutil
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib.parse import urlsplit, urlunsplit
+from pathlib import Path
+
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+CURRENT_DIR = Path(__file__).resolve().parent
+if str(CURRENT_DIR) not in sys.path:
+    sys.path.insert(0, str(CURRENT_DIR))
 
 # Import các module vừa viết
 from category_crawler import CategoryCrawler
@@ -35,6 +43,7 @@ from shared.core.evidence_guard import (
     summarize_evidence,
 )
 from shared.core.rights_guard import guard_source_rights
+from shared.core.vietnamese_accent import is_vietnamese_accented_valid
 from shared.core.rights_guard import guard_image_assets
 from shared.core.visual_grounding import (
     guard_visual_grounding,
@@ -74,12 +83,12 @@ SUPABASE_KEY = ENV.get("SUPABASE_KEY", "")
 # 400 "not found") - da xac minh va doi sang ID con hoat dong that.
 VOICE_PROFILE_ID = ENV.get("VOICEBOX_PROFILE_ID", "3fb3db24-b0af-4db4-b75f-b897f0431843")
 
-# Khoảng nghỉ giữa hai bài trong cùng một kênh. ChatGPT chặn khi nhận quá
-# nhiều yêu cầu liên tiếp; nghỉ ngắn giữa các bài giúp giảm hẳn tình trạng đó.
+# Mặc định không nghỉ thêm giữa hai bài (0s) vì quá trình tải tư liệu, tạo TTS
+# và dựng video đã đủ tạo khoảng cách tự nhiên cho ChatGPT.
 try:
-    ARTICLE_DELAY_SECONDS = max(0, int(ENV.get("ARTICLE_DELAY_SECONDS", "25")))
+    ARTICLE_DELAY_SECONDS = max(0, int(ENV.get("ARTICLE_DELAY_SECONDS", "0")))
 except (TypeError, ValueError):
-    ARTICLE_DELAY_SECONDS = 25
+    ARTICLE_DELAY_SECONDS = 0
 
 # Mỗi lượt chỉ sản xuất từng này video thành công cho một kênh rồi chuyển
 # profile. Bài bị loại hoặc xử lý lỗi không được tính vào hạn mức này.
@@ -1136,24 +1145,43 @@ class ArticlePipelineCore:
                 if len(downloaded_imgs) < TARGET_IMAGES:
                     scenes = ai_result.get("scenes", [])
                     beats = ai_result.get("beats", [])
-                    search_prompts = [
-                        str(s.get("visual_description") or "").strip()
-                        for s in scenes
-                        if isinstance(s, dict) and len(str(s.get("visual_description") or "").strip()) > 10
-                    ]
-                    if not search_prompts and isinstance(beats, list):
+                    img_prompts = ai_result.get("image_prompts", [])
+                    search_prompts = []
+
+                    # Ưu tiên lấy từ beats (visual_query) do ChatGPT sinh chi tiết
+                    if isinstance(beats, list):
                         for beat in beats:
                             if not isinstance(beat, dict):
                                 continue
-                            vq = str(beat.get("visual_query") or "").strip()
+                            vq = str(beat.get("visual_query") or beat.get("visual_description") or "").strip()
                             if len(vq) > 8 and not vq.upper().startswith(("DATA GRAPHIC:", "MAP GRAPHIC:")):
-                                search_prompts.append(vq)
+                                if vq not in search_prompts:
+                                    search_prompts.append(vq)
+
+                    # Bổ sung từ image_prompts nếu có
+                    if isinstance(img_prompts, list):
+                        for ip in img_prompts:
+                            ip_str = str(ip or "").strip()
+                            if len(ip_str) > 8 and not ip_str.upper().startswith(("DATA GRAPHIC:", "MAP GRAPHIC:")):
+                                if ip_str not in search_prompts:
+                                    search_prompts.append(ip_str)
+
+                    # Bổ sung từ scenes nếu có
+                    if isinstance(scenes, list):
+                        for s in scenes:
+                            if not isinstance(s, dict):
+                                continue
+                            vd = str(s.get("visual_description") or "").strip()
+                            if len(vd) > 8 and not vd.upper().startswith(("DATA GRAPHIC:", "MAP GRAPHIC:")):
+                                if vd not in search_prompts:
+                                    search_prompts.append(vd)
+
                     needed = TARGET_IMAGES - len(downloaded_imgs)
                     if search_prompts:
                         # Ảnh gốc bài thường phủ phần đầu video; ảnh search đặt vào
                         # timeline sau nên lấy prompt của các scene CUỐI cho khớp.
                         search_prompts = search_prompts[-needed:]
-                        print(f"   [KÊNH {id_tiktok}] 🔎 Thiếu ảnh, đang tìm thêm {needed} ảnh từ DuckDuckGo...")
+                        print(f"   [KÊNH {id_tiktok}] 🔎 Thiếu ảnh, đang tìm thêm {needed} ảnh chất lượng cao (ưu tiên SerpApi)...")
                         extra_imgs = self.img_searcher.download_missing_images(
                             search_prompts, job_dir, channel_id=id_tiktok,
                         )
@@ -1221,7 +1249,7 @@ class ArticlePipelineCore:
                 # 4. Sinh Voice
                 print(f"   [KÊNH {id_tiktok}] 🗣️ Bắt đầu sinh Voice OmniVoice...")
                 _trace_pipeline_step(id_tiktok, article_url, "voice", "started")
-                hook_text = str(ai_result.get('hook', '') or '').strip()
+                hook_text = str(ai_result.get('hook') or ai_result.get('selected_hook') or ai_result.get('title_tiktok') or '').strip()
                 script_text = str(ai_result.get('script_voice', '') or '').strip()
                 print(
                     f"   [KÊNH {id_tiktok}] 📝 Hook voice: {len(hook_text.split())} từ, "
@@ -1259,6 +1287,33 @@ class ArticlePipelineCore:
                 channel_voice_speed = TARGET_VOICE_SPEED
 
                 print(f"   [KÊNH {id_tiktok}] 🎵 Tone: {tone} -> Voice ID: {channel_voice_id} | Speed: {channel_voice_speed}")
+
+                # Kiểm tra dấu tiếng Việt trước khi gửi sang tool voice (>= 30% từ không dấu là bỏ bài)
+                combined_voice_text = f"{hook_text} {script_text}".strip()
+                is_valid_accent, unacc_ratio, accent_reason = is_vietnamese_accented_valid(
+                    combined_voice_text, max_unaccented_ratio=0.30, min_words_to_check=15
+                )
+                if not is_valid_accent:
+                    print(
+                        f"   [KÊNH {id_tiktok}] ❌ PHÁT HIỆN LỖI TIẾNG VIỆT KHÔNG DẤU TRƯỚC KHI GỌI TOOL VOICE: {accent_reason} "
+                        f"-> BỎ BÀI BÁO NÀY (không gửi sang tool voice, không dựng video)!"
+                    )
+                    _trace_pipeline_step(
+                        id_tiktok,
+                        article_url,
+                        "voice",
+                        "skipped",
+                        message=f"Bỏ bài do tiếng Việt không dấu: {accent_reason}",
+                    )
+                    _append_quality_log(
+                        "article",
+                        id_tiktok,
+                        int(ai_result.get("quality_score", 0)),
+                        "skip",
+                        f"Bỏ bài do tiếng Việt không dấu: {accent_reason}",
+                        **source_metadata,
+                    )
+                    return "skipped"
 
                 voice_hook_path = None
                 voice_script_path = None
@@ -1621,19 +1676,14 @@ class ArticlePipelineCore:
             
         print(f"🌐 Tìm thấy {len(channels_map)} Kênh Tiktok cần chạy.")
         
-        # Mỗi kênh có một worker và một ArticlePipelineCore riêng. Điều này
-        # giữ crawler, thư mục tạm và vòng đời xử lý độc lập, đồng thời cho
-        # phép các Chrome Article profile chạy song song.
+        # Mỗi kênh có 1 worker độc lập (mỗi kênh 1 tác vụ) và chạy đồng thời tối đa 3 kênh cùng lúc.
         try:
-            configured_workers = int(ENV.get("ARTICLE_MAX_CHANNEL_WORKERS", "0"))
+            configured_workers = int(ENV.get("ARTICLE_MAX_CHANNEL_WORKERS", "3"))
         except (TypeError, ValueError):
-            configured_workers = 0
-        max_workers = min(
-            len(channels_map),
-            configured_workers if configured_workers > 0 else len(channels_map),
-        )
+            configured_workers = 3
+        max_workers = max(1, min(len(channels_map), configured_workers if configured_workers > 0 else 3))
         print(
-            f"⚙️ Chạy song song {max_workers}/{len(channels_map)} kênh; "
+            f"⚙️ Chạy song song {max_workers}/{len(channels_map)} kênh (mỗi kênh 1 tác vụ, tối đa {configured_workers} tác vụ cùng lúc); "
             f"mỗi kênh tối đa {ARTICLE_SUCCESS_BATCH_SIZE} video thành công."
         )
 

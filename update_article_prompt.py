@@ -1,3 +1,4 @@
+import os
 import json
 
 file_path = "config/prompts/prompt_article.txt"
@@ -5,7 +6,7 @@ file_path = "config/prompts/prompt_article.txt"
 with open(file_path, "r", encoding="utf-8") as f:
     content = f.read()
 
-json_start = content.find("{\n  \"schema_version\": 1")
+json_start = content.find('{\n  "schema_version": 1')
 
 if json_start != -1:
     json_part = content[json_start:]
@@ -24,7 +25,8 @@ Nếu đầu vào có HỒ SƠ KÊNH TIKTOK, coi đó là kim chỉ nam tối th
 Luật bắt buộc:
 - CHỈ trả về JSON thuần, tuyệt đối không giải thích ngoài JSON.
 - GIỮ NGUYÊN toàn bộ tên field và schema, không được tự ý bỏ hay đổi tên.
-- Tiếng Việt tự nhiên, có dấu; không emoji, viết tắt.
+- BẮT BUỘC 100% TIẾNG VIỆT CÓ DẤU CHUẨN XÁC: Tuyệt đối không viết tiếng Việt không dấu. Toàn bộ các trường nội dung: title_tiktok, hook, selected_hook, hook_variants, script_voice, main_angle, audience_payoff, visual_query, image_prompts PHẢI có đầy đủ dấu tiếng Việt chuẩn mực (dấu thanh sắc, huyền, hỏi, ngã, nặng và các ký tự ă, â, đ, ê, ô, ơ, ư). Nghiêm cấm hoàn toàn tiếng Việt không dấu. Nếu kịch bản có tỷ lệ từ không dấu >= 30%, bài viết sẽ bị loại bỏ ngay lập tức.
+- Không dùng emoji, icon, viết tắt.
 - Không sao chép nguyên văn dài, không bịa tình tiết.
 - Văn phong báo chí hiện đại, lôi cuốn: rõ sự kiện, có nhịp điệu nhanh, có điểm nhấn và cảm xúc. Không đọc rề rà như thông cáo báo chí.
 - Không lặp selected_hook trong script_voice.
@@ -69,19 +71,53 @@ Yêu cầu kịch bản (Script Voice - Thân bài & Kết thúc):
 - Nếu thiếu dữ kiện để viết 140 từ, đặt should_make_video=false; tuyệt đối không bôi chữ tả cảnh.
 
 Yêu cầu an toàn dữ kiện:
-- claim_register và evidence để [] vì EvidenceGuard đang tắt.
+- claim_register và evidence để [].
+- source_text: chép nguyên văn 3-6 câu từ bài nguồn chứa TOÀN BỘ con số/khoản tiền/thời gian dùng trong video. Tool đối chiếu số liệu trong kịch bản với source_text; thiếu hoặc lệch số sẽ bị đưa vào hàng chờ duyệt.
 - Chỉ dùng dữ kiện trong fact_sheet và bài nguồn; không bịa tên người, nguyên nhân, con số.
 
+QUY TẮC MÔ TẢ HÌNH ẢNH KHỚP 100% VỚI BÀI BÁO (BẮT BUỘC TUÂN THỦ NGHIÊM NGẶT):
+Hệ thống sử dụng các cụm từ trong visual_query và image_prompts để TÌM KIẾM ẢNH BÁO CHÍ THỜI SỰ THỰC TẾ trên Google Images / SerpApi.
+Do đó, đây là TỪ KHÓA TÌM KIẾM ẢNH BÁO CHÍ (Photo Journalism Search Queries), KHÔNG PHẢI LỜI VĂN TẢ CẢNH TRỪU TƯỢNG!
+
+1. NGUYÊN TẮC VÀNG VỀ TỪ KHÓA TÌM ẢNH:
+- Độ dài tối ưu: 5 đến 9 từ. Cụ thể, súc tích, đi thẳng vào người thật, vật thật, việc thật.
+- CẤU TRÚC BẮT BUỘC: [Chủ thể/Nhân vật/Tổ chức/Thương hiệu cụ thể từ bài báo] + [Hành động/Vật thể/Thiết bị nhìn thấy được] + [Bối cảnh/Địa danh/Bệnh viện/Hiện trường thực tế].
+- Ngôn ngữ: TIẾNG VIỆT CÓ DẤU CHUẨN XÁC, không dùng tiếng lóng, không dùng từ nối rườm rà ("khiến cho", "có thể dẫn đến", "giúp kích thích").
+
+2. CÁCH ĐẶT MÔ TẢ ẢNH THEO TỪNG CHỦ ĐỀ BÀI BÁO:
+- CHỦ ĐỀ SỨC KHỎE / Y TẾ / LÀM ĐẸP / ĐỜI SỐNG:
+  + Tìm ảnh: Bác sĩ chuyên khoa khám bệnh, máy đo huyết áp điện tử bắp tay, bác sĩ tư vấn người bệnh, phòng khám bệnh viện, bác sĩ phẫu thuật thẩm mỹ phòng mổ, người cao tuổi thăm khám sức khỏe, thuốc hoặc trang thiết bị y tế thực tế.
+  + TUYỆT ĐỐI CẤM: Cấm tìm "sự chênh lệch nhiệt độ" (sẽ ra ảnh nhiệt kế tuyết), cấm tìm "sơ đồ minh họa mạch máu" (sẽ ra tranh vẽ hoạt hình vector), cấm tìm "phòng ngủ lạnh giá", cấm tìm "mùa đông tuyết rơi".
+- CHỦ ĐỀ THỜI SỰ / PHÁP LUẬT / ĐIỀU TRA:
+  + Tìm ảnh: Chân dung bị can/đối tượng cụ thể từ bài báo, lực lượng công an làm việc, phiên tòa xét xử Tòa án nhân dân, tang vật vụ án, trụ sở cơ quan chức năng.
+- CHỦ ĐỀ TAI NẠN / CHÁY NỔ / CỨU HỘ:
+  + Tìm ảnh: Hiện trường vụ việc tại [tên đường/địa danh cụ thể], lực lượng Cảnh sát PCCC dập lửa, xe cứu hỏa xe cấp cứu, người dân và lực lượng chức năng tại hiện trường.
+- CHỦ ĐỀ KINH TẾ / DOANH NGHIỆP / TÀI CHÍNH:
+  + Tìm ảnh: Trụ sở/logo thương hiệu công ty cụ thể, cửa hàng vàng bạc ngân hàng giao dịch, nhà máy phân xưởng sản xuất, sản phẩm thật được đề cập trong bài báo.
+
+3. TUYỆT ĐỐI CẤM CÁC TỪ NGỮ GÂY LẠC ĐỀ SAU ĐÂY:
+- CẤM từ ngữ hình vẽ/đồ họa: "sơ đồ", "minh họa", "bản vẽ", "3D", "vector", "tranh vẽ", "clipart", "hoạt hình". Bắt buộc 100% là ẢNH CHỤP THẬT NGOÀI ĐỜI.
+- CẤM từ ngữ trừu tượng/khái niệm/cảm giác: "sự chênh lệch", "khái niệm", "tượng trưng", "nguy cơ", "suy nghĩ lo lắng", "tương lai", "không khí lạnh giá", "sức sống", "niềm vui".
+- CẤM câu văn dài lê thê chứa từ nối: "khiến cho", "có thể dẫn đến", "giúp kích thích", "nhằm mục đích".
+
+4. ĐỒ HỌA THỐNG KÊ & BẢN ĐỒ (Nếu có):
+- Đoạn nói về số liệu/tỉ lệ %/biến động: Bắt đầu bằng tiền tố: "DATA GRAPHIC: [mô tả biểu đồ/số liệu ngắn gọn]".
+- Đoạn nói về lộ trình/ranh giới/vị trí địa lý/tâm bão: Bắt đầu bằng tiền tố: "MAP GRAPHIC: [địa điểm/lộ trình]".
+
 Yêu cầu beats:
-- Có 7-9 beats khớp với script_voice.
+- Có 7-9 beats khớp hoàn hảo theo trình tự timeline của script_voice.
 - Beat đầu role=hook (voice_over chính là selected_hook); beat cuối role=payoff hoặc close.
 - role: hook, context, evidence, development, turn, payoff, close.
-- visual_query: Cụm tìm ảnh THẬT có tên người/đơn vị/mẫu xe/địa danh. Không dùng ảnh stock chung chung ("người buồn", "cảnh thành phố").
-- on_screen_text: 3-7 từ, ưu tiên tên riêng/con số, có thể trống.
+- visual_query: Câu tìm kiếm ảnh chụp báo chí thật (5-9 từ) bám sát trực tiếp dữ kiện của beat này theo quy tắc ở trên.
+- must_show: Mảng 2-4 chi tiết trực quan quan trọng nhất định phải có trong ảnh của beat này (VD: ["máy đo huyết áp", "bác sĩ"]).
+- on_screen_text: 3-7 từ ngắn gọn, ưu tiên tên riêng, con số, có thể trống.
 - motion: static, slow_push_in, slow_pull_out, pan_left, pan_right.
-- transition: cut (ưu tiên), fade.
+- transition: cut (ưu tiên để nhịp nhanh dứt khoát), fade.
 - sfx: trống nếu không cần thiết; bi kịch bắt buộc trống.
-- must_show: Liệt kê vật/người/con số bắt buộc hiện lên màn hình.
+
+Yêu cầu image_prompts (BẮT BUỘC):
+- image_prompts là một mảng gồm ĐÚNG 7 đến 9 câu truy vấn tìm kiếm ảnh chất lượng cao, tương ứng 1-1 với 7 đến 9 beats của video.
+- Mỗi câu trong image_prompts là một cụm từ khóa tìm kiếm ảnh báo chí thực tế (5-9 từ), chuẩn tiếng Việt có dấu, có nhân vật/vật thể/địa danh cụ thể từ bài báo để công cụ SerpApi / Google Images tải ảnh dự phòng chuẩn xác nhất.
 
 Yêu cầu field khác:
 - quality_score: 1-10.
@@ -99,4 +135,4 @@ Trả về đúng JSON:
 with open(file_path, "w", encoding="utf-8") as f:
     f.write(new_text + json_part)
 
-print("Prompt article updated successfully.")
+print("Prompt updated successfully.")

@@ -355,6 +355,30 @@ class TestRenderReal(unittest.TestCase):
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
 
+    def test_render_mismatched_png_with_trailing_nulls_as_jpg(self):
+        """Ảnh PNG RGBA kèm byte 0x00 cuối file nhưng lưu đuôi .jpg không làm treo ffmpeg -loop 1."""
+        if shutil.which("ffmpeg") is None:
+            self.skipTest("ffmpeg không có trong PATH")
+        tmp = tempfile.mkdtemp(prefix="render_png_as_jpg_test_")
+        try:
+            import io
+            from PIL import Image
+
+            img_path = os.path.join(tmp, "stock_001.jpg")
+            buf = io.BytesIO()
+            Image.new("RGBA", (800, 1200), (40, 80, 120, 255)).save(buf, format="PNG")
+            with open(img_path, "wb") as f:
+                f.write(buf.getvalue() + (b"\x00" * 512))
+
+            from apps.creator_article.video_renderer import _ensure_clean_still_image
+
+            cleaned = _ensure_clean_still_image(img_path)
+            with Image.open(cleaned) as check_img:
+                self.assertEqual(check_img.format, "JPEG")
+                self.assertEqual(check_img.mode, "RGB")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
 
 if __name__ == "__main__":
     unittest.main()

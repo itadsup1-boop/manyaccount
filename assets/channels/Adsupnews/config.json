@@ -1,8 +1,8 @@
 {
-    "text_y1": 0.6479,
-    "text_y2": 0.8,
+    "text_y1": 0.6417,
+    "text_y2": 0.7937,
     "text_w": 0.85,
-    "text_x": 95,
+    "text_x": -9,
     "text_size": 66,
     "text_color": "#ffffff",
     "text_stroke": 0,
@@ -16,5 +16,6 @@
     "has_frame_intro": true,
     "has_frame_content": false,
     "has_logo": false,
-    "logo_name": "logo.png"
+    "logo_name": "logo.png",
+    "sub_margin_v": 190
 }

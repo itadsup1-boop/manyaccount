@@ -397,6 +397,15 @@ def dismiss_rate_limit_dialog(page) -> bool:
     return is_rate_limited_text(_blocking_dialog_text(page))
 
 
+CHAT_MODE_SELECTORS = (
+    'button[class*="home-mode-toggle"][class*="col-start-1"]',
+    'button[class*="home-mode-toggle"]:has-text("Chat")',
+    'button[class*="mode-toggle"]:has-text("Chat")',
+    'button[aria-pressed]:has-text("Chat")',
+    'button:has(span:text-is("Chat"))',
+    'button:text-is("Chat")',
+)
+
 WORK_MODE_SELECTORS = (
     'button[class*="home-mode-toggle"][class*="col-start-2"]',
     'button[class*="home-mode-toggle"]:has-text("Công việc")',
@@ -410,56 +419,185 @@ WORK_MODE_SELECTORS = (
 )
 
 
-def ensure_work_mode_selected(page, timeout_seconds: float = 10.0) -> bool:
-    """Đảm bảo nút chế độ 'Công việc' / 'Work' (home-mode-toggle) được chọn khi mở ChatGPT."""
+CHAT_MODE_SELECTORS = (
+    'button:has-text("Chat")',
+    '[role="tab"]:has-text("Chat")',
+    '[role="radio"]:has-text("Chat")',
+    'button[class*="home-mode-toggle"][class*="col-start-1"]',
+    'button[class*="home-mode-toggle"]:has-text("Chat")',
+    'button[class*="mode-toggle"]:has-text("Chat")',
+    'button[aria-pressed]:has-text("Chat")',
+    'button:has(span:text-is("Chat"))',
+    'button:text-is("Chat")',
+    'div[class*="home-mode-toggle"] button:first-child',
+)
+
+WORK_MODE_SELECTORS = (
+    'button[class*="home-mode-toggle"][class*="col-start-2"]',
+    'button[class*="home-mode-toggle"]:has-text("Công việc")',
+    'button[class*="home-mode-toggle"]:has-text("Work")',
+    'button[class*="mode-toggle"]:has-text("Công việc")',
+    'button[class*="mode-toggle"]:has-text("Work")',
+    'button[aria-pressed]:has-text("Công việc")',
+    'button[aria-pressed]:has-text("Work")',
+    'button:has(span:text-is("Công việc"))',
+    'button:has(span:text-is("Work"))',
+)
+
+
+def ensure_chat_mode_selected(page, timeout_seconds: float = 6.0) -> bool:
+    """Đảm bảo ChatGPT luôn ở chế độ 'Chat' (tuyệt đối KHÔNG ở chế độ 'Work' / 'Công việc').
+
+    Nếu phát hiện đang ở chế độ 'Work', tự động click chuyển ngay về chế độ 'Chat' bằng cả
+    Playwright CDP click, pointerdown/mouseup events và tọa độ chuột, sau đó kiểm tra lại
+    để đảm bảo chế độ 'Chat' thực sự đã được kích hoạt.
+    """
     deadline = time.time() + max(1.0, float(timeout_seconds))
     while True:
-        for selector in WORK_MODE_SELECTORS:
+        # 1. Kiểm tra nhanh qua locator: nếu nút Chat đã active (aria-pressed/aria-selected="true")
+        for selector in CHAT_MODE_SELECTORS:
             try:
-                locator = page.locator(selector)
-                if locator.count() == 0:
+                loc = page.locator(selector)
+                if loc.count() > 0 and loc.first.is_visible(timeout=200):
+                    attr_pressed = str(loc.first.get_attribute("aria-pressed") or "").strip().lower()
+                    attr_selected = str(loc.first.get_attribute("aria-selected") or "").strip().lower()
+                    if attr_pressed == "true" or attr_selected == "true":
+                        return True
+            except Exception:
+                pass
+
+        # 2. Kiểm tra chi tiết qua DOM evaluate nếu có hỗ trợ
+        is_work_active = False
+        try:
+            if hasattr(page, "evaluate"):
+                status = page.evaluate(
+                    """() => {
+                        const text = (document.body ? document.body.innerText : '') || '';
+                        const isWorkHeadline = text.includes('What should we work on?');
+                        const promptArea = document.querySelector('#prompt-textarea');
+                        const placeholder = promptArea ? (promptArea.getAttribute('placeholder') || '') : '';
+                        const isWorkPlaceholder = placeholder.toLowerCase().includes('work with chatgpt');
+
+                        const allButtons = Array.from(document.querySelectorAll('button, [role="tab"], [role="radio"]'));
+                        const workBtn = allButtons.find(b => {
+                            const t = (b.innerText || '').trim().toLowerCase();
+                            return t === 'work' || t === 'công việc';
+                        });
+                        const chatBtn = allButtons.find(b => {
+                            const t = (b.innerText || '').trim().toLowerCase();
+                            return t === 'chat';
+                        });
+
+                        let workActive = isWorkHeadline || isWorkPlaceholder;
+                        if (workBtn) {
+                            const ariaSelected = workBtn.getAttribute('aria-selected');
+                            const ariaPressed = workBtn.getAttribute('aria-pressed');
+                            const dataState = workBtn.getAttribute('data-state');
+                            const cls = workBtn.className || '';
+                            if (ariaSelected === 'true' || ariaPressed === 'true' || dataState === 'active' || cls.includes('bg-')) {
+                                workActive = true;
+                            }
+                        }
+                        return { workActive, hasChatBtn: !!chatBtn, hasWorkBtn: !!workBtn };
+                    }"""
+                )
+                if isinstance(status, dict):
+                    is_work_active = bool(status.get("workActive"))
+        except Exception:
+            pass
+
+        # 3. Thực hiện click chuyển về 'Chat'
+        clicked_any = False
+        for selector in CHAT_MODE_SELECTORS:
+            try:
+                loc = page.locator(selector)
+                if loc.count() == 0:
                     continue
-                button = locator.first
+                button = loc.first
                 if not button.is_visible(timeout=500):
                     continue
-                aria_pressed = str(button.get_attribute("aria-pressed") or "").strip().lower()
-                if aria_pressed == "true":
-                    print("      💼 Chế độ 'Công việc' (Work) trên ChatGPT đã được bật sẵn.")
+                attr_pressed = str(button.get_attribute("aria-pressed") or "").strip().lower()
+                attr_selected = str(button.get_attribute("aria-selected") or "").strip().lower()
+                if attr_pressed == "true" or attr_selected == "true":
                     return True
 
-                clicked = False
-                for click_attempt in range(3):
-                    try:
-                        if click_attempt == 0:
-                            button.click(timeout=5000)
-                        elif click_attempt == 1:
-                            button.click(timeout=5000, force=True)
-                        else:
-                            handle = button.element_handle(timeout=2000)
-                            if handle:
-                                page.evaluate("(el) => el.click()", handle)
-                        clicked = True
-                    except Exception:
-                        continue
-                    time.sleep(1.0)
-                    new_pressed = str(button.get_attribute("aria-pressed") or "").strip().lower()
-                    if new_pressed == "true":
-                        break
+                print("      💬 Đang bấm nút 'Chat' để chuyển khỏi chế độ 'Work'...")
+                button.click(force=True)
+                clicked_any = True
 
-                if clicked:
-                    time.sleep(1.5)
-                    final_pressed = str(button.get_attribute("aria-pressed") or "").strip().lower()
-                    print(
-                        f"      💼 Đã chọn chế độ 'Công việc' (Work) trên ChatGPT "
-                        f"(aria-pressed={final_pressed})."
-                    )
+                # Kiểm tra lại ngay sau khi bấm
+                new_pressed = str(button.get_attribute("aria-pressed") or "").strip().lower()
+                new_selected = str(button.get_attribute("aria-selected") or "").strip().lower()
+                if new_pressed == "true" or new_selected == "true":
                     return True
+                break
             except Exception:
                 continue
+
+        # Thử click bằng tọa độ chuột và pointer events nếu có
+        if clicked_any:
+            try:
+                if hasattr(page, "mouse") and hasattr(page, "evaluate"):
+                    coords = page.evaluate(
+                        """() => {
+                            const allButtons = Array.from(document.querySelectorAll('button, [role="tab"], [role="radio"]'));
+                            const chatBtn = allButtons.find(b => (b.innerText || '').trim().toLowerCase() === 'chat');
+                            if (chatBtn) {
+                                const rect = chatBtn.getBoundingClientRect();
+                                return { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 };
+                            }
+                            return null;
+                        }"""
+                    )
+                    if coords and isinstance(coords, dict) and "x" in coords:
+                        page.mouse.click(coords["x"], coords["y"])
+            except Exception:
+                pass
+
+            try:
+                if hasattr(page, "evaluate"):
+                    page.evaluate(
+                        """() => {
+                            const allButtons = Array.from(document.querySelectorAll('button, [role="tab"], [role="radio"]'));
+                            const chatBtn = allButtons.find(b => (b.innerText || '').trim().toLowerCase() === 'chat');
+                            if (chatBtn) {
+                                ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click'].forEach(evtType => {
+                                    chatBtn.dispatchEvent(new MouseEvent(evtType, { bubbles: true, cancelable: true, view: window }));
+                                });
+                            }
+                        }"""
+                    )
+            except Exception:
+                pass
+
+            # Xác minh sau khi click
+            time.sleep(0.5)
+            try:
+                if hasattr(page, "evaluate"):
+                    verify = page.evaluate(
+                        """() => {
+                            const text = (document.body ? document.body.innerText : '') || '';
+                            const promptArea = document.querySelector('#prompt-textarea');
+                            const placeholder = promptArea ? (promptArea.getAttribute('placeholder') || '') : '';
+                            return text.includes('What should we work on?') || placeholder.toLowerCase().includes('work with chatgpt');
+                        }"""
+                    )
+                    if not verify:
+                        print("      ✅ Đã đảm bảo ChatGPT ở chế độ 'Chat' (không ở chế độ 'Work')!")
+                        return True
+            except Exception:
+                pass
+
+            return True
 
         if time.time() >= deadline:
             return False
         time.sleep(0.5)
+
+
+def ensure_work_mode_selected(page, timeout_seconds: float = 6.0) -> bool:
+    """Tương thích ngược: luôn đảm bảo chọn chế độ 'Chat' theo yêu cầu người dùng."""
+    return ensure_chat_mode_selected(page, timeout_seconds=timeout_seconds)
 
 
 
@@ -1434,8 +1572,14 @@ def analyze_video_with_chatgpt(
             raw_text = ""
             chat_url = CHATGPT_HOME_URL
             for attempt in range(1, MAX_RATE_LIMIT_RETRIES + 1):
-                page.goto(chat_url, wait_until="domcontentloaded", timeout=60000)
-                time.sleep(5)
+                try:
+                    page.goto(chat_url, wait_until="domcontentloaded", timeout=45000)
+                except Exception as goto_err:
+                    print(f"      ⚠️ Tải ChatGPT chậm hoặc lỗi ({goto_err}); sẽ thử tải lại lần {attempt}...")
+                    time.sleep(3)
+                    continue
+                time.sleep(2)
+                ensure_chat_mode_selected(page, timeout_seconds=4.0)
                 chat_url = remember_active_chat_url(page, chat_url)
 
                 # Popup "Too many requests" phủ lên ô chat khiến mọi thao tác
@@ -1446,17 +1590,10 @@ def analyze_video_with_chatgpt(
                     time.sleep(RATE_LIMIT_RETRY_WAIT_SECONDS)
                     continue
 
-                ensure_work_mode_selected(page)
-
                 # Chờ ô nhập xuất hiện
                 try:
                     page.wait_for_selector("#prompt-textarea, [contenteditable='true']", timeout=45000)
                 except Exception:
-                    if ensure_work_mode_selected(page, timeout_seconds=3.0):
-                        try:
-                            page.wait_for_selector("#prompt-textarea, [contenteditable='true']", timeout=15000)
-                        except Exception:
-                            pass
                     if page.locator("#prompt-textarea, [contenteditable='true']").count() == 0:
                         if is_cloudflare_challenge(page):
                             print("      ❌ Cloudflare chặn! Cần login lại.")
@@ -1659,6 +1796,33 @@ def analyze_video_with_chatgpt(
                 parsed_dict,
                 experiment_assignment,
             )
+
+            # Kiểm tra tiếng Việt có dấu: nếu >= 30% từ không dấu thì hủy bài ngay lập tức
+            hook_check = str(result.get("hook") or result.get("selected_hook") or "")
+            script_check = str(result.get("script_voice") or "")
+            combined_txt = f"{hook_check} {script_check}".strip()
+            if combined_txt:
+                from shared.core.vietnamese_accent import is_vietnamese_accented_valid
+                is_valid_acc, unacc_ratio, acc_reason = is_vietnamese_accented_valid(
+                    combined_txt, max_unaccented_ratio=0.30, min_words_to_check=15
+                )
+                if not is_valid_acc:
+                    print(
+                        f"      ❌ ChatGPT trả về tiếng Việt không dấu ({acc_reason}). "
+                        f"Bỏ video này ngay từ bước đọc ChatGPT (không gửi sang tool voice, không dựng video)!"
+                    )
+                    save_chatgpt_log(
+                        prompt=full_prompt,
+                        raw_response=raw_text,
+                        parsed_result=result,
+                        id_tiktok=clean_id or "general",
+                        source_url=video_path or caption[:100],
+                        source_type=source_type or "facebook",
+                        status="UNACCENTED_VIETNAMESE",
+                        error_message=f"Tiếng Việt không đạt chuẩn có dấu: {acc_reason}",
+                    )
+                    context.close()
+                    return None
 
             print("      ✅ Nhận JSON thành công từ ChatGPT!")
             print(f"         Hook: {result.get('hook', '')[:60]}...")

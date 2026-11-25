@@ -106,6 +106,15 @@ def create_voice_full_pipeline(
     """
     Gọi API Voicebox Full Pipeline với cơ chế tự động thử lại 3 lần.
     """
+    # Kiểm tra dấu tiếng Việt trước khi gửi sang API voice.adsup.vn (>= 30% từ không dấu là từ chối)
+    from shared.core.vietnamese_accent import is_vietnamese_accented_valid
+    is_valid_acc, unacc_ratio, acc_reason = is_vietnamese_accented_valid(
+        text, max_unaccented_ratio=0.30, min_words_to_check=15
+    )
+    if not is_valid_acc:
+        print(f"❌ [TTS_API] TỪ CHỐI GỬI SANG TOOL VOICE VÌ TIẾNG VIỆT KHÔNG DẤU: {acc_reason}", flush=True)
+        return None
+
     save_path = os.path.join(save_dir, filename)
     # Never replace a previously good file until the new response has been
     # completely downloaded and decoded successfully.

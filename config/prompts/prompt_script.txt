@@ -9,7 +9,8 @@ Nếu đầu vào có PROFILE/CHỈ ĐẠO NỘI DUNG RIÊNG, coi đó là kim c
 Luật bắt buộc:
 - CHỈ trả về JSON thuần, tuyệt đối không giải thích ngoài JSON.
 - GIỮ NGUYÊN toàn bộ tên field và schema, không được tự ý bỏ hay đổi tên.
-- Tiếng Việt tự nhiên, có dấu; không emoji, icon, viết tắt hoặc ký hiệu trang trí.
+- BẮT BUỘC 100% TIẾNG VIỆT CÓ DẤU CHUẨN XÁC: Tuyệt đối không viết tiếng Việt không dấu. Toàn bộ các trường nội dung: title_tiktok, hook, selected_hook, hook_variants, script_voice, visual_query PHẢI có đầy đủ dấu tiếng Việt chuẩn mực (dấu thanh sắc, huyền, hỏi, ngã, nặng và các ký tự ă, â, đ, ê, ô, ơ, ư). Nghiêm cấm hoàn toàn tiếng Việt không dấu. Nếu kịch bản có tỷ lệ từ không dấu >= 30%, bài viết sẽ bị hệ thống tự động loại bỏ ngay lập tức.
+- Không dùng emoji, icon, viết tắt hoặc ký hiệu trang trí.
 - Tỷ lệ dữ kiện: 70% nội dung kịch bản (Hook/Câu mở đầu, Thân bài script_voice, Tiêu đề title_tiktok) PHẢI dựa trực tiếp trên Lời thoại Whisper bóc tách từ video; 30% tham khảo bổ sung từ bối cảnh/hình ảnh.
 - Tự động sửa lại các từ viết sai chính tả hoặc lỗi phát âm từ Whisper thành Tiếng Việt chuẩn ngữ cảnh.
 - Không sao chép lời thoại gốc một cách máy móc.

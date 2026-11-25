@@ -35,7 +35,8 @@ from apps.creator_article.video_renderer import (
     probe_video,
     render_segment_files,
 )
-from shared.core.beat_timeline import plan_beat_timeline
+from shared.core.beat_timeline import plan_beat_timeline, resolve_intro_overlay_text
+from shared.core.safe_zone import plan_text_layout
 from shared.core.channel_editorial import TARGET_VOICE_SPEED
 from shared.core.video_encoding import CLEAN_METADATA_ARGS, FINAL_AUDIO_ARGS
 from shared.core.video_qa import run_video_qa
@@ -103,36 +104,94 @@ def resolve_channel_overlay_config(id_tiktok: str) -> dict[str, Any]:
         except (OSError, ValueError):
             pass
 
-    frame_intro = os.path.join(channel_dir, "frame_intro.png")
-    if (
-        custom_config.get("frame_intro_disabled")
+    # Bổ sung đọc từ apps/telegram_bot/channels_config.json nếu có dữ liệu kênh
+    tele_config_path = os.path.join(PROJECT_ROOT, "apps", "telegram_bot", "channels_config.json")
+    if os.path.isfile(tele_config_path):
+        try:
+            with open(tele_config_path, "r", encoding="utf-8") as f:
+                tele_all = json.load(f)
+            if isinstance(tele_all, dict) and channel_id in tele_all:
+                tele_cfg = tele_all[channel_id]
+                for k, v in tele_cfg.items():
+                    if k not in custom_config or custom_config[k] is None or custom_config[k] == "" or custom_config[k] == "-- Trống --":
+                        custom_config[k] = v
+        except Exception:
+            pass
+
+    # Xác định frame_intro: nếu bị disable thì luôn là rỗng
+    is_intro_disabled = (
+        custom_config.get("frame_intro_disabled") is True
         or custom_config.get("has_frame_intro") is False
-        or not os.path.isfile(frame_intro)
-    ):
-        frame_intro = ""
+    )
+    frame_intro = ""
+    if not is_intro_disabled:
+        fi_candidate = os.path.join(channel_dir, "frame_intro.png")
+        if os.path.isfile(fi_candidate):
+            frame_intro = fi_candidate
+        elif custom_config.get("title_frame_path") and custom_config.get("title_frame_path") != "-- Trống --":
+            tfp = os.path.join(PROJECT_ROOT, "assets", "frame", str(custom_config["title_frame_path"]))
+            if os.path.isfile(tfp):
+                frame_intro = tfp
 
-    frame_content = os.path.join(channel_dir, "frame_content.png")
-    if (
-        custom_config.get("frame_content_disabled")
+    # Xác định frame_content: nếu bị disable thì luôn là rỗng
+    is_content_disabled = (
+        custom_config.get("frame_content_disabled") is True
         or custom_config.get("has_frame_content") is False
-        or not os.path.isfile(frame_content)
-    ):
-        frame_content = ""
+    )
+    frame_content = ""
+    if not is_content_disabled:
+        fc_candidate = os.path.join(channel_dir, "frame_content.png")
+        if os.path.isfile(fc_candidate):
+            frame_content = fc_candidate
+        elif custom_config.get("content_frame_path") and custom_config.get("content_frame_path") != "-- Trống --":
+            cfp = os.path.join(PROJECT_ROOT, "assets", "frame", str(custom_config["content_frame_path"]))
+            if os.path.isfile(cfp):
+                frame_content = cfp
 
-    logo_path = os.path.join(channel_dir, "logo.png")
-    if (
-        custom_config.get("logo_disabled")
+    # Xác định logo: nếu bị disable thì luôn là rỗng
+    is_logo_disabled = (
+        custom_config.get("logo_disabled") is True
         or custom_config.get("has_logo") is False
-        or not os.path.isfile(logo_path)
-    ):
-        logo_path = ""
+    )
+    logo_path = ""
+    if not is_logo_disabled:
+        lp_candidate = os.path.join(channel_dir, "logo.png")
+        if os.path.isfile(lp_candidate):
+            logo_path = lp_candidate
+        elif custom_config.get("logo_path") and custom_config.get("logo_path") != "-- Trống --":
+            lp = os.path.join(PROJECT_ROOT, "assets", "logo", str(custom_config["logo_path"]))
+            if os.path.isfile(lp):
+                logo_path = lp
+
+    default_logo_x = 50
+    default_logo_y = 50
+    if logo_path:
+        try:
+            from PIL import Image
+
+            with Image.open(logo_path) as limg:
+                if limg.size == (1080, 1920):
+                    default_logo_x = 0
+                    default_logo_y = 0
+        except Exception:
+            pass
 
     return {
         "frame_intro_path": frame_intro,
         "frame_content_path": frame_content,
         "logo_path": logo_path,
-        "logo_x": int(custom_config.get("logo_x", 50) or 50),
-        "logo_y": int(custom_config.get("logo_y", 50) or 50),
+        "logo_x": int(custom_config.get("logo_x", default_logo_x) if custom_config.get("logo_x") is not None else default_logo_x),
+        "logo_y": int(custom_config.get("logo_y", default_logo_y) if custom_config.get("logo_y") is not None else default_logo_y),
+        "text_y1": float(custom_config.get("text_y1", 0.73) if custom_config.get("text_y1") is not None else 0.73),
+        "text_y2": float(custom_config.get("text_y2", 0.83) if custom_config.get("text_y2") is not None else 0.83),
+        "text_w": float(custom_config.get("text_w", 0.75) if custom_config.get("text_w") is not None else 0.75),
+        "text_x": int(custom_config.get("text_x", 0) if custom_config.get("text_x") is not None else 0),
+        "text_size": int(custom_config.get("text_size", 50) if custom_config.get("text_size") is not None else 50),
+        "text_color": str(custom_config.get("text_color") or "#ffffff").strip() or "#ffffff",
+        "text_stroke": int(custom_config.get("text_stroke", 0) if custom_config.get("text_stroke") is not None else 0),
+        "text_font": str(custom_config.get("text_font") or "RobotoCondensed-Bold.ttf").strip() or "RobotoCondensed-Bold.ttf",
+        "text_position_mode": str(custom_config.get("text_position_mode") or "manual").strip(),
+        "has_frame_intro": bool(frame_intro),
     }
 
 
@@ -159,6 +218,12 @@ def produce_voice(
         if duration <= 0:
             if not text:
                 raise ValueError(f"TTS_FAILED: thiếu nội dung {name} trong kịch bản khoá.")
+            from shared.core.vietnamese_accent import is_vietnamese_accented_valid
+            is_valid_acc, unacc_ratio, acc_reason = is_vietnamese_accented_valid(
+                text, max_unaccented_ratio=0.30, min_words_to_check=15
+            )
+            if not is_valid_acc:
+                raise ValueError(f"TTS_FAILED: Tiếng Việt không đạt chuẩn có dấu ({acc_reason}).")
             path = tts_fn(text, voice_dir, name, profile_id, speed=TARGET_VOICE_SPEED)
             duration = probe_audio_duration(path) if path else 0.0
         if not path or duration <= 0:
@@ -346,6 +411,7 @@ def render_final_video(
     apply_real_timeline(segments, timeline)
 
     # 3) Render segment (tái dùng renderer Giai đoạn 3) + nối không âm thanh
+    print(f"   🎞️ Đang dựng {len(segments)} phân cảnh hình ảnh (segments)...", flush=True)
     render_dir = os.path.join(directory, "render")
     os.makedirs(render_dir, exist_ok=True)
     concat_path = os.path.join(directory, "final_silent.mp4")
@@ -427,35 +493,16 @@ def render_final_video(
     hook_dur = float(voice["hook_duration"])
     cur_v = "0:v"
 
-    if frame_intro_path and frame_content_path:
-        tf_idx = next_input_idx
-        cf_idx = next_input_idx + 1
-        next_input_idx += 2
-        args += [
-            "-loop", "1", "-t", f"{total_duration:.3f}", "-i", frame_intro_path,
-            "-loop", "1", "-t", f"{total_duration:.3f}", "-i", frame_content_path,
-        ]
-        filter_parts.append(
-            f"[{cur_v}][{tf_idx}:v]overlay=0:0:shortest=1:enable='between(t,0,{hook_dur:.3f})'[v_tf]"
-        )
-        filter_parts.append(
-            f"[v_tf][{cf_idx}:v]overlay=0:0:shortest=1:enable='gt(t,{hook_dur:.3f})'[v_cf]"
-        )
-        cur_v = "v_cf"
-    elif frame_intro_path:
+    # ── Frame: Chỉ xuất hiện khi voice đọc title (Hook), chuyển sang thân bài thì bỏ frame ──
+    frame_to_use = frame_intro_path or frame_content_path
+    if frame_to_use and hook_dur > 0:
         tf_idx = next_input_idx
         next_input_idx += 1
-        args += ["-loop", "1", "-t", f"{total_duration:.3f}", "-i", frame_intro_path]
+        args += ["-loop", "1", "-t", f"{total_duration:.3f}", "-i", frame_to_use]
         filter_parts.append(
             f"[{cur_v}][{tf_idx}:v]overlay=0:0:shortest=1:enable='between(t,0,{hook_dur:.3f})'[v_tf]"
         )
         cur_v = "v_tf"
-    elif frame_content_path:
-        cf_idx = next_input_idx
-        next_input_idx += 1
-        args += ["-loop", "1", "-t", f"{total_duration:.3f}", "-i", frame_content_path]
-        filter_parts.append(f"[{cur_v}][{cf_idx}:v]overlay=0:0:shortest=1[v_cf]")
-        cur_v = "v_cf"
 
     if logo_path:
         logo_idx = next_input_idx
@@ -465,6 +512,88 @@ def render_final_video(
         args += ["-loop", "1", "-t", f"{total_duration:.3f}", "-i", logo_path]
         filter_parts.append(f"[{cur_v}][{logo_idx}:v]overlay={lx}:{ly}:shortest=1[v_logo]")
         cur_v = "v_logo"
+
+    # ── Vẽ Title / Hook text trên Frame Intro ──
+    hook_text_raw = str(storyboard.get("hook") or "").strip()
+    title_raw = str(storyboard.get("title_frame") or storyboard.get("title_tiktok") or "").strip()
+    intro_title = resolve_intro_overlay_text(hook_text_raw or title_raw, timeline)
+    if not intro_title:
+        intro_title = hook_text_raw or title_raw
+
+    # Chỉ vẽ title khi có frame intro và hook_dur > 0
+    if intro_title and hook_dur > 0 and frame_intro_path:
+        font_name = overlay_cfg.get("text_font", "RobotoCondensed-Bold.ttf")
+        font_path = os.path.join(PROJECT_ROOT, "assets", "font", font_name)
+        if not os.path.isfile(font_path):
+            font_path = os.path.join(PROJECT_ROOT, "assets", "font", "RobotoCondensed-Bold.ttf")
+        if not os.path.isfile(font_path):
+            font_path = os.path.join(PROJECT_ROOT, "assets", "font", "font.ttf")
+
+        if os.path.isfile(font_path):
+            safe_font_path = font_path.replace("\\", "/").replace(":", "\\:")
+            font_size = int(overlay_cfg.get("text_size", 50))
+            max_width_px = int(1080 * float(overlay_cfg.get("text_w", 0.75)))
+            text_x_offset = int(overlay_cfg.get("text_x", 0))
+            preferred_x = int((1080 - max_width_px) / 2) + text_x_offset
+            preferred_y = int(1920 * float(overlay_cfg.get("text_y1", 0.73)))
+            text_color = str(overlay_cfg.get("text_color") or "#ffffff").strip() or "#ffffff"
+            stroke = int(overlay_cfg.get("text_stroke", 0))
+
+            clamp_to_safe_zone = (
+                str(overlay_cfg.get("text_position_mode", "manual")).lower() != "manual"
+            )
+
+            safe_text = (
+                str(intro_title)
+                .replace("'", "")
+                .replace(":", "\\:")
+                .replace("%", "\\%")
+                .strip()
+            )
+
+            layout = plan_text_layout(
+                safe_text,
+                font_size=font_size,
+                preferred_x=preferred_x,
+                preferred_y=preferred_y,
+                max_width=max_width_px,
+                clamp_to_safe_zone=clamp_to_safe_zone,
+                allow_extra_lines=True,
+            )
+
+            text_y1_val = float(overlay_cfg.get("text_y1", 0.73))
+            text_y2_val = float(overlay_cfg.get("text_y2", text_y1_val + 0.10))
+            box_h = int(1920 * (text_y2_val - text_y1_val))
+            if box_h > layout.height:
+                start_y = preferred_y + (box_h - layout.height) // 2
+            else:
+                start_y = preferred_y
+
+            print(
+                f"   🧭 Title trên frame intro: '{safe_text[:50]}...' | "
+                f"x={preferred_x}px y={start_y}px size={layout.font_size}px "
+                f"color={text_color} stroke={stroke} | {len(layout.lines)} lines"
+            )
+
+            for i, line in enumerate(layout.lines):
+                escaped_line = (
+                    line.replace("\\", "\\\\")
+                    .replace("'", "'\\''")
+                    .replace(":", "\\:")
+                    .replace("%", "\\%")
+                )
+                y_pos = start_y + (i * layout.line_spacing)
+                stroke_part = f":bordercolor=black:borderw={stroke}" if stroke > 0 else ":borderw=0"
+                shadow_part = ":shadowcolor=black@0.6:shadowx=2:shadowy=2"
+                x_expr = f"{preferred_x}+({max_width_px}-text_w)/2"
+                draw_filter = (
+                    f"drawtext=fontfile='{safe_font_path}':text='{escaped_line}':"
+                    f"fontsize={layout.font_size}:fontcolor={text_color}{stroke_part}{shadow_part}:"
+                    f"x='{x_expr}':y={y_pos}:"
+                    f"enable='between(t,0,{hook_dur:.3f})'"
+                )
+                filter_parts.append(f"[{cur_v}]{draw_filter}[v_title{i}]")
+                cur_v = f"v_title{i}"
 
     if subtitle_path:
         filter_parts.append(f"[{cur_v}]ass={_escape_ass_path(subtitle_path)}[vout]")
@@ -481,6 +610,7 @@ def render_final_video(
         *CLEAN_METADATA_ARGS,
         output_path,
     ]
+    print("   🎬 Đang ghép phụ đề, nhạc nền và xuất video hoàn chỉnh...", flush=True)
     _run_ffmpeg(args, what="dựng video hoàn chỉnh")
 
     try:
@@ -489,6 +619,7 @@ def render_final_video(
         pass
 
     # 7) VideoQA bắt buộc — ghi kết quả vào report trước, không đạt thì chặn.
+    print("   🔎 Đang kiểm định chất lượng VideoQA...", flush=True)
     qa = run_video_qa(output_path, subtitle_ass_path=subtitle_path or "")
     report = {
         "output": out_name,
@@ -526,9 +657,17 @@ def render_final_video(
 
 def _run_ffmpeg(args: list[str], *, what: str) -> None:
     binary = os.getenv("FFMPEG_BINARY", "ffmpeg")
-    result = subprocess.run(
-        [binary, "-y", *args], stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True
-    )
+    timeout_sec = int(os.getenv("FFMPEG_FINAL_TIMEOUT_SECONDS", "240"))
+    try:
+        result = subprocess.run(
+            [binary, "-y", *args],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=timeout_sec,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(f"FFmpeg quá thời gian ({timeout_sec}s) khi {what}") from exc
     if result.returncode != 0:
         tail = "\n".join(result.stderr.strip().splitlines()[-8:])
         raise RuntimeError(f"FFmpeg lỗi khi {what}: {tail}")

@@ -120,12 +120,12 @@ def _candidate_text(candidate: Mapping[str, Any]) -> str:
 def score_relevance(query: str, candidate: Mapping[str, Any]) -> float:
     """Điểm lexical 0..1: tỷ lệ token của query xuất hiện trong mô tả asset."""
 
-    if candidate.get("provider") == "serpapi_google":
+    if candidate.get("provider") in {"serpapi_google", "bing_highres"}:
         query_tokens = _tokens(query)
         text_tokens = _tokens(_candidate_text(candidate))
         if query_tokens and text_tokens and (query_tokens & text_tokens):
-            return 0.95
-        return 0.85
+            return 0.98
+        return 0.90
 
     query_tokens = _tokens(query)
     if not query_tokens:
@@ -148,7 +148,7 @@ def relevance_threshold() -> float:
 
 def _technically_ok(candidate: Mapping[str, Any]) -> bool:
     width, height = int(candidate.get("width") or 0), int(candidate.get("height") or 0)
-    if candidate.get("provider") == "serpapi_google":
+    if candidate.get("provider") in {"serpapi_google", "bing_highres"}:
         return width >= 300 and height >= 300
     if min(width, height) < MIN_DIMENSION or max(width, height) < MAX_DIMENSION:
         return False
@@ -328,8 +328,8 @@ def _pick_beat_asset(
         score = score_relevance(chosen_query, candidate)
         if score < threshold:
             continue
-        # Video thắng ảnh khi relevance bằng nhau; index ổn định kết quả.
-        media_preference = 1 if candidate.get("media_type") == "video" else 0
+        # Ảnh báo chí thời sự (SerpApi / Bing HighRes) được ưu tiên số 1; Video thắng ảnh stock thông thường khi relevance bằng nhau.
+        media_preference = 2 if candidate.get("provider") in {"serpapi_google", "bing_highres"} else (1 if candidate.get("media_type") == "video" else 0)
         eligible.append((score, media_preference, -index, candidate))
     entry["candidates_evaluated"] = len(candidates)
 
@@ -361,6 +361,40 @@ def _pick_beat_asset(
     return entry
 
 
+def _normalize_downloaded_photo(path: str) -> None:
+    """Chuẩn hóa ảnh tải về thành RGB chuẩn theo đúng đuôi file (.jpg/.png).
+
+    Nhiều CDN báo chí/Bing/MSN trả về file PNG (RGBA) hoặc WebP kèm hàng trăm
+    byte 0x00 ở cuối file dưới URL .jpg/.img. Nếu giữ nguyên, demuxer png_pipe
+    của FFmpeg khi chạy với ``-loop 1`` sẽ lặp vô hạn ở thông báo
+    ``Invalid PNG signature 0x00000000`` làm treo cứng tiến trình render.
+    """
+    if not path or not os.path.isfile(path):
+        return
+    ext = os.path.splitext(path)[1].lower()
+    if ext not in {".jpg", ".jpeg", ".png", ".webp"}:
+        return
+    try:
+        from PIL import Image
+
+        with Image.open(path) as img:
+            img.load()
+            if img.mode in ("RGBA", "LA") or (img.mode == "P" and "transparency" in img.info):
+                bg = Image.new("RGB", img.size, (24, 36, 64))
+                rgba = img.convert("RGBA")
+                bg.paste(rgba, mask=rgba.split()[3])
+                rgb = bg
+            else:
+                rgb = img.convert("RGB")
+            tmp_path = path + ".norm.tmp"
+            target_fmt = "PNG" if ext == ".png" else "JPEG"
+            save_kwargs = {"quality": 92} if target_fmt == "JPEG" else {}
+            rgb.save(tmp_path, format=target_fmt, **save_kwargs)
+        os.replace(tmp_path, path)
+    except Exception:
+        pass
+
+
 def _download_beat_asset(
     entry: dict[str, Any], directory: str, asset_id: str, http_download: HttpDownload | None
 ) -> dict[str, Any] | None:
@@ -370,7 +404,8 @@ def _download_beat_asset(
     url = str(selected.get("asset_url") or "")
     if not url:
         return None
-    ext = _ext_from_url(url, str(selected.get("media_type") or "video"))
+    media_type = str(selected.get("media_type") or "video")
+    ext = _ext_from_url(url, media_type)
     dest_path = os.path.join(directory, "assets", f"{asset_id}.{ext}")
     downloader = http_download or _default_http_download
     size = 0
@@ -387,6 +422,8 @@ def _download_beat_asset(
                 size = 0
     if not size or not os.path.isfile(dest_path):
         return None
+    if media_type != "video":
+        _normalize_downloaded_photo(dest_path)
     return {
         "asset_id": asset_id,
         "beat_number": entry.get("beat_number"),

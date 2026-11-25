@@ -398,6 +398,8 @@ def build_text_overlay(beat: Mapping[str, Any], safe: Mapping[str, int]) -> Any:
     from PIL import Image, ImageDraw
 
     overlay = Image.new("RGBA", (CANVAS_W, CANVAS_H), (0, 0, 0, 0))
+    if beat.get("role") == "hook" or beat.get("beat_number") == 1:
+        return overlay
     draw = ImageDraw.Draw(overlay)
     headline = str(beat.get("on_screen_text") or "")
     if not headline:
@@ -520,6 +522,7 @@ def build_render_plan(
         segments.append(
             {
                 "beat_number": beat_number,
+                "role": str(beat.get("role") or ""),
                 "kind": kind if kind != KIND_BROLL else KIND_BROLL,
                 "visual": visual,
                 "duration": _segment_duration(beat),
@@ -565,12 +568,60 @@ def concat_segments(seg_paths: list[str], output_path: str, *, list_path: str) -
 
 def _run_ffmpeg(args: list[str], *, what: str) -> None:
     binary = os.getenv("FFMPEG_BINARY", "ffmpeg")
-    result = subprocess.run(
-        [binary, "-y", *args], stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True
-    )
+    timeout_sec = int(os.getenv("FFMPEG_TIMEOUT_SECONDS", "180"))
+    try:
+        result = subprocess.run(
+            [binary, "-y", *args],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=timeout_sec,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(f"FFmpeg quá thời gian ({timeout_sec}s) khi {what}") from exc
     if result.returncode != 0:
         tail = "\n".join(result.stderr.strip().splitlines()[-8:])
         raise RuntimeError(f"FFmpeg lỗi khi {what}: {tail}")
+
+
+def _ensure_clean_still_image(path: str) -> str:
+    """Đảm bảo ảnh tĩnh đưa vào ``ffmpeg -loop 1`` đúng định dạng RGB và không có byte rác.
+
+    Khắc phục triệt để lỗi ảnh PNG/WebP đội lốt ``.jpg`` kèm byte ``0x00`` ở cuối file
+    (ví dụ từ CDN MSN/Bing) khiến demuxer ``png_pipe`` của FFmpeg lặp vô hạn.
+    """
+    if not path or not os.path.isfile(path):
+        return path
+    ext = os.path.splitext(path)[1].lower()
+    if ext not in {".jpg", ".jpeg", ".png", ".webp"}:
+        return path
+    try:
+        from PIL import Image
+
+        with open(path, "rb") as f:
+            raw = f.read()
+        expected_fmt = "PNG" if ext == ".png" else "JPEG"
+        has_trailing_nulls = raw.endswith(b"\x00\x00\x00\x00")
+        with Image.open(path) as img:
+            actual_fmt = (img.format or "").upper()
+            actual_mode = img.mode
+            if actual_fmt == expected_fmt and actual_mode == "RGB" and not has_trailing_nulls:
+                return path
+            img.load()
+            if actual_mode in ("RGBA", "LA") or (actual_mode == "P" and "transparency" in img.info):
+                bg = Image.new("RGB", img.size, COLOR_BG)
+                rgba = img.convert("RGBA")
+                bg.paste(rgba, mask=rgba.split()[3])
+                rgb = bg
+            else:
+                rgb = img.convert("RGB")
+            tmp_path = path + ".clean.tmp"
+            save_kwargs = {"quality": 92} if expected_fmt == "JPEG" else {}
+            rgb.save(tmp_path, format=expected_fmt, **save_kwargs)
+        os.replace(tmp_path, path)
+    except Exception:
+        pass
+    return path
 
 
 def _still_chain(motion: str, num_frames: int) -> str:
@@ -601,34 +652,82 @@ def _render_segment(
     fade_filter = f",fade=t=in:st=0:d={FADE_DURATION}" if fade_in else ""
 
     args: list[str] = []
-    if visual["type"] == "video":
-        args += ["-ss", "0", "-t", f"{duration:.3f}", "-i", visual["path"]]
+    # Kiểm tra nguồn visual: ưu tiên ảnh/video thật, tái dùng ảnh từ job assets nếu thiếu asset
+    job_dir = os.path.dirname(os.path.abspath(render_dir))
+    assets_dir = os.path.join(job_dir, "assets")
+
+    resolved_visual_type = visual.get("type")
+    resolved_path = visual.get("path") or ""
+
+    # Nếu segment là card hoặc file không tồn tại, tìm asset thực tế có sẵn trong job để fallback
+    if resolved_visual_type not in {"video", "photo"} or not (resolved_path and os.path.isfile(resolved_path)):
+        if os.path.isdir(assets_dir):
+            candidate_photos = sorted([
+                os.path.join(assets_dir, f)
+                for f in os.listdir(assets_dir)
+                if f.lower().endswith((".jpg", ".jpeg", ".png", ".webp"))
+                and os.path.isfile(os.path.join(assets_dir, f))
+                and not f.startswith("card_")
+                and not f.startswith("text_")
+                and not f.startswith("logo")
+                and not f.startswith("frame")
+            ])
+            if candidate_photos:
+                resolved_visual_type = "photo"
+                resolved_path = candidate_photos[index % len(candidate_photos)]
+            else:
+                candidate_videos = sorted([
+                    os.path.join(assets_dir, f)
+                    for f in os.listdir(assets_dir)
+                    if f.lower().endswith((".mp4", ".mov"))
+                    and os.path.isfile(os.path.join(assets_dir, f))
+                    and not f.startswith("seg_")
+                    and not f.startswith("preview")
+                    and not f.startswith("final")
+                ])
+                if candidate_videos:
+                    resolved_visual_type = "video"
+                    resolved_path = candidate_videos[index % len(candidate_videos)]
+
+    if resolved_visual_type == "video" and resolved_path and os.path.isfile(resolved_path):
+        args += ["-ss", "0", "-t", f"{duration:.3f}", "-i", resolved_path]
         video_chain = (
             f"[0:v]scale=1080:1920:force_original_aspect_ratio=increase,"
             f"crop=1080:1920,setsar=1,fps=30{fade_filter}[vbase]"
         )
-    else:
-        if visual["type"] == "photo":
-            source = visual["path"]
-        else:
-            source = os.path.join(render_dir, f"card_{index:03d}.png")
-            card = (
-                build_data_graphic_card(segment, safe)
-                if segment["kind"] == KIND_DATA_GRAPHIC
-                else build_map_graphic_card(segment, safe)
-                if segment["kind"] == KIND_MAP_GRAPHIC
-                else build_quote_card(segment, safe)
-                if segment["kind"] == KIND_QUOTE_CARD
-                else build_fact_card(segment, safe)
-                if segment["kind"] == KIND_FACT_CARD
-                else build_typography_card(segment, safe)
-            )
-            card.save(source)
+    elif resolved_visual_type == "photo" and resolved_path and os.path.isfile(resolved_path):
+        source = _ensure_clean_still_image(resolved_path)
         args += ["-loop", "1", "-t", f"{duration:.3f}", "-i", source]
         num_frames = max(1, int(duration * FPS))
-        video_chain = f"[0:v]{_still_chain(visual['motion'], num_frames)}{fade_filter}[vbase]"
+        motion = visual.get("motion") or "slow_push_in"
+        video_chain = f"[0:v]{_still_chain(motion, num_frames)}{fade_filter}[vbase]"
+    else:
+        # Fallback card chỉ sinh khi không có bất kỳ ảnh/video nào trong toàn bộ job (ví dụ trong mock unit test)
+        source = os.path.join(render_dir, f"card_{index:03d}.png")
+        card = (
+            build_data_graphic_card(segment, safe)
+            if segment["kind"] == KIND_DATA_GRAPHIC
+            else build_map_graphic_card(segment, safe)
+            if segment["kind"] == KIND_MAP_GRAPHIC
+            else build_quote_card(segment, safe)
+            if segment["kind"] == KIND_QUOTE_CARD
+            else build_fact_card(segment, safe)
+            if segment["kind"] == KIND_FACT_CARD
+            else build_typography_card(segment, safe)
+        )
+        card.save(source)
+        args += ["-loop", "1", "-t", f"{duration:.3f}", "-i", source]
+        num_frames = max(1, int(duration * FPS))
+        motion = visual.get("motion") or "slow_push_in"
+        video_chain = f"[0:v]{_still_chain(motion, num_frames)}{fade_filter}[vbase]"
 
-    overlay = build_text_overlay(segment, safe) if visual["type"] in {"video", "photo"} else None
+    # Theo yêu cầu người dùng: Video chỉ gồm ảnh, frame, logo, lyric và title.
+    # Không đè chữ headline lơ lửng trên từng beat.
+    overlay = (
+        build_text_overlay(segment, safe)
+        if segment.get("enable_text_overlay", False) and resolved_visual_type in {"video", "photo"}
+        else None
+    )
     if overlay is not None and overlay.getbbox():
         overlay_path = os.path.join(render_dir, f"text_{index:03d}.png")
         overlay.save(overlay_path)

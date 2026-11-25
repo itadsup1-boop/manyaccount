@@ -25,6 +25,7 @@ WIKIMEDIA_API_BASE = "https://commons.wikimedia.org/w/api.php"
 DEFAULT_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 
 REQUEST_TIMEOUT_SECONDS = 20
+_SERPAPI_DISABLED_UNTIL_RESET = False
 
 HttpGet = Callable[[str, Mapping[str, str]], Mapping[str, Any] | None]
 
@@ -710,6 +711,8 @@ def search_serpapi_google_images(
         }
         results = client.search(params)
         res_dict = results if isinstance(results, Mapping) else dict(results)
+        if isinstance(res_dict, Mapping) and "error" in res_dict:
+            raise RuntimeError(f"SERPAPI_ERROR: {res_dict['error']}")
         return normalize_serpapi_response(res_dict)
     except Exception as exc:
         # Fallback HTTP requests
@@ -728,7 +731,132 @@ def search_serpapi_google_images(
             timeout=REQUEST_TIMEOUT_SECONDS,
         )
         resp.raise_for_status()
-        return normalize_serpapi_response(resp.json())
+        resp_json = resp.json()
+        if isinstance(resp_json, Mapping) and "error" in resp_json:
+            raise RuntimeError(f"SERPAPI_ERROR: {resp_json['error']}")
+        return normalize_serpapi_response(resp_json)
+
+
+JUNK_IMAGE_PATTERNS = (
+    "logo", "icon", "avatar", "banner", "/header", "footer",
+    "placeholder", "no-image", "noimage", "loading",
+    "dantri-logo", "vne-logo", "tuoitre-logo", "thanhnien-logo",
+    "adserver", "/ads/", "quangcao", "sponsor", "share-fb",
+    "og-default", "facebook-share", "default-thumbnail",
+    "watermark", "button", "badge", "nav-",
+)
+
+
+def _is_junk_image_url(url: str) -> bool:
+    """Kiểm tra và loại bỏ các ảnh là logo, banner, thumbnail rác hoặc icon trang báo."""
+    low = str(url or "").lower()
+    return any(pat in low for pat in JUNK_IMAGE_PATTERNS)
+
+
+def search_bing_highres_images(
+    query: str,
+    *,
+    per_page: int = 15,
+    http_get: HttpGet | None = None,
+) -> list[dict[str, Any]]:
+    """Tìm ảnh báo chí, thời sự độ phân giải cao trực tiếp từ Bing Images (100% FREE, không cần API key)."""
+    import html
+    import json
+    import re
+    from urllib.parse import quote_plus
+    import requests
+
+    clean_query = str(query or "").strip()
+    if not clean_query:
+        return []
+
+    if http_get is not None:
+        url = f"https://www.bing.com/images/async?q={quote_plus(clean_query)}&count={per_page}"
+        payload = http_get(url, {}) or {}
+        if isinstance(payload, Mapping):
+            return normalize_serpapi_response(payload)
+        return []
+
+    headers = {
+        "User-Agent": DEFAULT_USER_AGENT,
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+        "Accept-Language": "vi-VN,vi;q=0.9,en-US;q=0.8,en;q=0.7",
+        "Referer": "https://www.bing.com/",
+    }
+
+    url = (
+        f"https://www.bing.com/images/async?q={quote_plus(clean_query)}"
+        f"&first=0&count={max(15, min(int(per_page) * 2, 35))}&scenario=ImageBasicHover&datsrc=N_I&layout=RowBased"
+    )
+
+    text = ""
+    try:
+        resp = requests.get(url, headers=headers, timeout=10)
+        if resp.status_code == 200 and resp.text:
+            text = resp.text
+    except Exception as exc:
+        pass
+
+    if not text or "iusc" not in text:
+        try:
+            url_std = f"https://www.bing.com/images/search?q={quote_plus(clean_query)}&form=HDRSC2&first=1"
+            resp = requests.get(url_std, headers=headers, timeout=12)
+            if resp.status_code == 200 and resp.text:
+                text = resp.text
+        except Exception:
+            pass
+
+    if not text:
+        return []
+
+    matches = re.findall(r'class="iusc"[^>]*?m="([^"]+)"', text)
+    if not matches:
+        matches = re.findall(r'm="({&quot;[^"]+})"', text)
+    if not matches:
+        matches = re.findall(r'm=\'([^\']+)\'', text)
+
+    results: list[dict[str, Any]] = []
+    seen_urls: set[str] = set()
+    for index, raw_m in enumerate(matches):
+        try:
+            unescaped = html.unescape(raw_m)
+            data = json.loads(unescaped)
+            murl = str(data.get("murl") or "").strip()
+            if not murl or murl in seen_urls:
+                continue
+            if _is_junk_image_url(murl):
+                continue
+            seen_urls.add(murl)
+
+            width = int(data.get("w") or data.get("width") or 1200)
+            height = int(data.get("h") or data.get("height") or 800)
+            title = str(data.get("desc") or data.get("t") or "").strip()
+            page_url = str(data.get("purl") or "").strip()
+            photo_id = str(data.get("cid") or index + 1)
+            asset_id = f"bing_highres_{photo_id}_{abs(hash(murl)) % 100000}"
+
+            results.append(
+                {
+                    "provider": "bing_highres",
+                    "provider_asset_id": asset_id,
+                    "media_type": "photo",
+                    "asset_url": murl,
+                    "thumbnail_url": str(data.get("turl") or ""),
+                    "page_url": page_url,
+                    "width": width,
+                    "height": height,
+                    "duration_seconds": 0.0,
+                    "author": "Bing HighRes Images",
+                    "description": f"{title} {clean_query}".strip(),
+                    "tags": [],
+                    "license_source": "bing_editorial_photo",
+                }
+            )
+            if len(results) >= per_page:
+                break
+        except Exception:
+            continue
+    return results
 
 
 def search_stock(
@@ -740,7 +868,7 @@ def search_stock(
     api_key: str | None = None,
     http_get: HttpGet | None = None,
 ) -> list[dict[str, Any]]:
-    """Router tìm tư liệu stock theo provider khả dụng (SerpApi -> Unsplash -> Pexels -> Pixabay -> Wikimedia)."""
+    """Router tìm tư liệu stock theo provider khả dụng (Bing HighRes / SerpApi -> Unsplash -> Pexels -> Pixabay -> Wikimedia)."""
 
     clean_query = str(query or "").strip()
     if not clean_query:
@@ -756,15 +884,58 @@ def search_stock(
             http_get=http_get,
         )
 
+    global _SERPAPI_DISABLED_UNTIL_RESET
     serpapi_key = get_serpapi_api_key()
-    if serpapi_key and media_type == "photo":
-        results = search_serpapi_google_images(
-            clean_query,
-            per_page=per_page,
-            api_key=serpapi_key,
-        )
-        if results:
-            return results
+    if serpapi_key and not _SERPAPI_DISABLED_UNTIL_RESET and media_type == "photo":
+        try:
+            results = search_serpapi_google_images(
+                clean_query,
+                per_page=per_page,
+                api_key=serpapi_key,
+            )
+            if results:
+                return results
+        except Exception as exc:
+            err_msg = str(exc).lower()
+            if "429" in err_msg or "run out" in err_msg or "serpapi_error" in err_msg:
+                _SERPAPI_DISABLED_UNTIL_RESET = True
+                print("   ℹ️ [SerpApi] Tài khoản đã hết lượt miễn phí (429/quota). Tự động chuyển 100% sang Bing HighRes Miễn Phí!")
+            else:
+                print(f"   ⚠️ SerpApi lỗi ({exc}), chuyển sang Bing HighRes Miễn Phí...")
+
+    # Ưu tiên Bing HighRes trực tiếp (100% FREE, không cần key, ảnh gốc báo chí sắc nét)
+    if media_type == "photo":
+        bing_results = search_bing_highres_images(clean_query, per_page=per_page)
+        if bing_results:
+            return bing_results
+        try:
+            from duckduckgo_search import DDGS
+            ddgs = DDGS()
+            ddg_raw = list(ddgs.images(clean_query, max_results=per_page))
+            if ddg_raw:
+                ddg_norm = []
+                for idx, item in enumerate(ddg_raw):
+                    img_u = str(item.get("image") or "").strip()
+                    if img_u and not _is_junk_image_url(img_u):
+                        ddg_norm.append({
+                            "provider": "duckduckgo",
+                            "provider_asset_id": f"ddg_{idx}_{abs(hash(img_u)) % 100000}",
+                            "media_type": "photo",
+                            "asset_url": img_u,
+                            "thumbnail_url": str(item.get("thumbnail") or ""),
+                            "page_url": str(item.get("url") or ""),
+                            "width": int(item.get("width") or 1080),
+                            "height": int(item.get("height") or 1080),
+                            "duration_seconds": 0.0,
+                            "author": "DuckDuckGo Images",
+                            "description": clean_query,
+                            "tags": [],
+                            "license_source": "web_editorial",
+                        })
+                if ddg_norm:
+                    return ddg_norm
+        except Exception:
+            pass
 
     unsplash_key = get_unsplash_access_key()
     pexels_key = get_pexels_api_key()

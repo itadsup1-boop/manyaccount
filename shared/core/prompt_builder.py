@@ -24,6 +24,8 @@ TARGET_VIDEO_LENGTH = (
 
 NEWSROOM_SCRIPT_STANDARD = """QUY CHUẨN LỜI DẪN BẢN TIN — ƯU TIÊN CAO
 - Viết như một biên tập viên đang dẫn bản tin hiện đại, không viết như người đang xem và mô tả từng khung hình.
+- BẮT BUỘC 100% TIẾNG VIỆT CÓ DẤU CHUẨN XÁC: Toàn bộ tiêu đề, hook, kịch bản (script_voice), visual_query bắt buộc phải viết bằng tiếng Việt có dấu chuẩn mực, đúng chính tả. TUYỆT ĐỐI CẤM viết tiếng Việt không dấu (như "Vat the bang go..."). Nếu kịch bản có >= 30% từ không dấu sẽ bị loại bỏ ngay lập tức.
+- MÔ TẢ ẢNH BÁO CHÍ THỰC TẾ: Mọi visual_query và image_prompts phải là từ khóa tìm kiếm ảnh báo chí thật ngoài đời (5-9 từ, có nhân vật/vật thể/địa danh cụ thể từ bài báo). Tuyệt đối cấm từ ngữ trừu tượng ("sự chênh lệch", "khái niệm", "không khí lạnh") hoặc hình vẽ minh họa ("sơ đồ", "vector", "3D").
 - Mục tiêu 50-55 giây: hook 10-16 từ, script_voice 140-150 từ. Quy chuẩn này ưu tiên hơn mọi mô tả thời lượng cũ còn sót trong hồ sơ kênh.
 - Hình ảnh chỉ là bằng chứng hỗ trợ. Tối đa 20% lời thoại dùng để tả chi tiết nhìn thấy; không kể tuần tự máy quay, góc quay hoặc cảnh tiếp theo.
 - Không lặp các cách dẫn như “video cho thấy”, “phần mô tả”, “hình ảnh cho thấy”, “máy quay”, “góc quay”, “xuất hiện”. Nếu dữ kiện chỉ có trong caption, ghi nguồn một lần thật tự nhiên rồi tiếp tục dẫn tin.
@@ -453,6 +455,11 @@ def build_output_schema(
         schema["have_frame"] = False
         schema["detected_competitor_frame_end_sec"] = None
     if source_type == "article":
+        schema["image_prompts"] = [
+            "mô tả cảnh ảnh 1 (5-9 từ, ảnh báo chí chụp thực tế nhân vật/vật thể/sự kiện từ bài báo)",
+            "mô tả cảnh ảnh 2 (5-9 từ, cận cảnh vật thể hoặc hiện trường thực tế có thể nhìn thấy)",
+            "mô tả cảnh ảnh 3 (5-9 từ, bối cảnh hành động cụ thể không dùng từ trừu tượng)",
+        ]
         schema["fact_sheet"] = {
             "who": [],
             "what": "",

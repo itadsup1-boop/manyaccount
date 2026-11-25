@@ -110,22 +110,24 @@ def get_channel_config(id_tiktok: str) -> dict:
             print(f"⚠️ Lỗi đọc {config_path}: {e}")
 
     # Fallback về default ở assets/ nếu kênh riêng chưa có VÀ không bị disable
-    if not os.path.exists(frame_intro_path) and not custom_config.get("frame_intro_disabled"):
+    if custom_config.get("frame_intro_disabled") or custom_config.get("has_frame_intro") is False:
+        frame_intro_path = ""
+    elif not os.path.exists(frame_intro_path):
         default_frame_intro = os.path.join(PROJECT_ROOT, "assets", "frame_intro.png")
         if os.path.exists(default_frame_intro):
             frame_intro_path = default_frame_intro
-    elif custom_config.get("frame_intro_disabled"):
-        frame_intro_path = ""
             
-    if not os.path.exists(frame_content_path) and not custom_config.get("frame_content_disabled"):
+    if custom_config.get("frame_content_disabled") or custom_config.get("has_frame_content") is False:
+        frame_content_path = ""
+    elif not os.path.exists(frame_content_path):
         default_frame_content = os.path.join(PROJECT_ROOT, "assets", "frame_content.png")
         if os.path.exists(default_frame_content):
             frame_content_path = default_frame_content
-    elif custom_config.get("frame_content_disabled"):
-        frame_content_path = ""
             
     # Bỏ fallback logo_path theo yêu cầu: nếu không set logo thì không chèn gì cả
-    if custom_config.get("logo_disabled"):
+    if custom_config.get("logo_disabled") or custom_config.get("has_logo") is False:
+        logo_path = ""
+    elif not os.path.exists(logo_path):
         logo_path = ""
 
     config = {
@@ -489,29 +491,21 @@ def create_article_video(
 
     out_pad = "[v_scaled]"
     
-    # ═══ THÊM KHUNG (FRAME): Intro cho phần Hook, Content cho phần Thân bài ═══
-    has_tf = has_frame_intro and os.path.exists(cfg["frame_intro_path"])
-    has_cf = has_frame_content and os.path.exists(cfg["frame_content_path"])
-    
-    if has_tf and has_cf:
-        inputs.extend(["-loop", "1", "-i", cfg["frame_intro_path"]])
-        tf_idx = curr_idx
-        curr_idx += 1
-        inputs.extend(["-loop", "1", "-i", cfg["frame_content_path"]])
-        cf_idx = curr_idx
-        curr_idx += 1
-        
-        filter_complex_parts.append(f"{out_pad}[{tf_idx}:v]overlay=0:0:shortest=1:enable='between(t,0,{hook_dur})'[with_tf]")
-        filter_complex_parts.append(f"[with_tf][{cf_idx}:v]overlay=0:0:shortest=1:enable='gt(t,{hook_dur})'[v_frame]")
-        out_pad = "[v_frame]"
-    elif has_tf:
-        inputs.extend(["-loop", "1", "-i", cfg["frame_intro_path"]])
-        filter_complex_parts.append(f"{out_pad}[{curr_idx}:v]overlay=0:0:shortest=1:enable='between(t,0,{hook_dur})'[v_frame]")
-        out_pad = "[v_frame]"
-        curr_idx += 1
-    elif has_cf:
-        inputs.extend(["-loop", "1", "-i", cfg["frame_content_path"]])
-        filter_complex_parts.append(f"{out_pad}[{curr_idx}:v]overlay=0:0:shortest=1[v_frame]")
+    # ═══ THÊM KHUNG (FRAME): Chỉ xuất hiện khi voice đọc title (Hook), chuyển sang thân bài thì bỏ frame ═══
+    # Theo yêu cầu người dùng: Frame CHỈ xuất hiện khi voice đọc title (0 đến hook_dur).
+    # Khi chuyển cảnh sang thân bài đọc script thì bỏ hoàn toàn frame đi, không overlay khung nội dung.
+    frame_to_use = ""
+    if has_frame_intro and os.path.exists(cfg["frame_intro_path"]):
+        frame_to_use = cfg["frame_intro_path"]
+    elif has_frame_content and os.path.exists(cfg["frame_content_path"]):
+        # Dự phòng nếu kênh chỉ cấu hình 1 file frame
+        frame_to_use = cfg["frame_content_path"]
+
+    if frame_to_use and hook_dur > 0:
+        inputs.extend(["-loop", "1", "-i", frame_to_use])
+        filter_complex_parts.append(
+            f"{out_pad}[{curr_idx}:v]overlay=0:0:shortest=1:enable='between(t,0,{hook_dur:.3f})'[v_frame]"
+        )
         out_pad = "[v_frame]"
         curr_idx += 1
         
@@ -519,58 +513,99 @@ def create_article_video(
     if has_logo:
         inputs.extend(["-loop", "1", "-i", cfg["logo_path"]])
         lx, ly = cfg.get("logo_x", 50), cfg.get("logo_y", 50)
+        # Nếu file logo là full frame (1080x1920) thì overlay tại 0:0 để không bị lệch 50px
+        try:
+            from PIL import Image
+            with Image.open(cfg["logo_path"]) as limg:
+                if limg.size == (1080, 1920):
+                    lx, ly = 0, 0
+        except Exception:
+            pass
         filter_complex_parts.append(f"{out_pad}[{curr_idx}:v]overlay={lx}:{ly}:shortest=1[v_final]")
         out_pad = "[v_final]"
         curr_idx += 1
         
-    # ═══ Hook Text: chỉ hiện đúng thời lượng hook thật (không xuyên suốt) ═══
-    font_name = cfg.get("text_font", "RobotoCondensed-Bold.ttf")
+    # ═══ Hook / Title Text: hiển thị chuẩn vị trí, kích thước và căn giữa trong box đã lưu ═══
+    intro_title = str(hook_text or "").strip()
+    if not intro_title and beats and isinstance(beats, list) and len(beats) > 0:
+        first_beat = beats[0]
+        if isinstance(first_beat, dict):
+            intro_title = str(first_beat.get("on_screen_text") or first_beat.get("hook") or "").strip()
+
+    font_name = str(cfg.get("text_font") or "RobotoCondensed-Bold.ttf").strip()
     font_path = os.path.join(PROJECT_ROOT, "assets", "font", font_name)
-    has_font = os.path.exists(font_path)
+    if not os.path.isfile(font_path):
+        font_path = os.path.join(PROJECT_ROOT, "assets", "font", "RobotoCondensed-Bold.ttf")
+    if not os.path.isfile(font_path):
+        font_path = os.path.join(PROJECT_ROOT, "assets", "font", "font.ttf")
+    has_font = os.path.isfile(font_path)
     
-    if has_font and hook_text:
+    if has_font and intro_title:
         # Giữ nguyên chính tả gốc, không viết hoa toàn bộ
-        safe_text = str(hook_text).replace("'", "").replace(":", "\\:").replace("%", "\\%").strip()
-        font_size = int(cfg.get("text_size", 65))
+        safe_font_path = font_path.replace("\\", "/").replace(":", "\\:")
+        font_size = int(cfg.get("text_size", 50))
         max_width_px = int(1080 * float(cfg.get("text_w", 0.75)))
-        preferred_y = int(1920 * float(cfg.get("text_y1", 0.73)))
-        text_color = cfg.get("text_color", "#ffffff")
-        stroke = int(cfg.get("text_stroke", 3))
+        text_x_offset = int(cfg.get("text_x", 0))
+        preferred_x = int((1080 - max_width_px) / 2) + text_x_offset
+        text_y1_val = float(cfg.get("text_y1", 0.73))
+        text_y2_val = float(cfg.get("text_y2", text_y1_val + 0.10))
+        preferred_y = int(1920 * text_y1_val)
+        text_color = str(cfg.get("text_color") or "#ffffff").strip() or "#ffffff"
+        stroke = int(cfg.get("text_stroke", 0))
         
         # Chỉ hiển thị text trong khoảng hook (0 → hook_dur giây)
         hook_show_dur = hook_dur if hook_dur > 0 else 5.0
         
-        # Calculate left margin to align left based on the max_width_px + text_x offset
-        text_x_offset = int(cfg.get("text_x", 0))
-        preferred_x = int((1080 - max_width_px) / 2) + text_x_offset
+        clamp_to_safe_zone = (
+            str(cfg.get("text_position_mode", "manual")).lower() != "manual"
+        )
+
+        safe_text = (
+            str(intro_title)
+            .replace("'", "")
+            .replace(":", "\\:")
+            .replace("%", "\\%")
+            .strip()
+        )
+
         layout = plan_text_layout(
             safe_text,
             font_size=font_size,
             preferred_x=preferred_x,
             preferred_y=preferred_y,
             max_width=max_width_px,
-            clamp_to_safe_zone=(
-                str(cfg.get("text_position_mode", "manual")).lower() != "manual"
-            ),
+            clamp_to_safe_zone=clamp_to_safe_zone,
+            allow_extra_lines=True,
         )
+
+        box_h = int(1920 * (text_y2_val - text_y1_val))
+        if box_h > layout.height:
+            start_y = preferred_y + (box_h - layout.height) // 2
+        else:
+            start_y = preferred_y
+
         print(
-            f"   🧭 Hook text position: configured x={text_x_offset}px "
-            f"y={float(cfg.get('text_y1', 0.73)):.4f} "
-            f"→ rendered x={layout.x}px y={layout.y}px width={layout.width}px"
+            f"   🧭 Title trên frame: '{safe_text[:50]}...' | "
+            f"x={preferred_x}px y={start_y}px size={layout.font_size}px "
+            f"color={text_color} stroke={stroke} | {len(layout.lines)} lines"
         )
         
-        # FFmpeg coi "\" là ký tự escape trong filtergraph, nên đường dẫn
-        # Windows (D:\...\font.ttf) làm hỏng cả chuỗi filter. Dùng dấu "/" và
-        # escape dấu hai chấm sau tên ổ đĩa, giống cách filter subtitles xử lý.
-        safe_font_path = font_path.replace("\\", "/").replace(":", "\\:")
         for i, line in enumerate(layout.lines):
-            y_pos = layout.y + (i * layout.line_spacing)
+            escaped_line = (
+                line.replace("\\", "\\\\")
+                .replace("'", "'\\''")
+                .replace(":", "\\:")
+                .replace("%", "\\%")
+            )
+            y_pos = start_y + (i * layout.line_spacing)
+            stroke_part = f":bordercolor=black:borderw={stroke}" if stroke > 0 else ":borderw=0"
+            shadow_part = ":shadowcolor=black@0.6:shadowx=2:shadowy=2"
+            x_expr = f"{preferred_x}+({max_width_px}-text_w)/2"
             draw_filter = (
-                f"drawtext=fontfile='{safe_font_path}':text='{line}':"
-                f"fontsize={layout.font_size}:fontcolor={text_color}:bordercolor=black:borderw={stroke}:"
-                f"shadowcolor=black:shadowx=3:shadowy=3:"
-                f"x={layout.x}:y={y_pos}:"
-                f"enable='between(t,0,{hook_show_dur:.2f})'"
+                f"drawtext=fontfile='{safe_font_path}':text='{escaped_line}':"
+                f"fontsize={layout.font_size}:fontcolor={text_color}{stroke_part}{shadow_part}:"
+                f"x='{x_expr}':y={y_pos}:"
+                f"enable='between(t,0,{hook_show_dur:.3f})'"
             )
             filter_complex_parts.append(f"{out_pad}{draw_filter}[v_text{i}]")
             out_pad = f"[v_text{i}]"
